@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# بارگذاری متغیر��ای محیطی
+# بارگذاری متغیرهای محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 
@@ -134,6 +134,8 @@ def get_shamsi_date(days_offset=0):
 
 def get_shamsi_date_formatted(shamsi_str):
     """تبدیل تاریخ شمسی YYYY/MM/DD به نام فارسی"""
+    if not shamsi_str:
+        return "نامعلوم"
     months = {
         '01': 'فروردین', '02': 'اردیبهشت', '03': 'خرداد',
         '04': 'تیر', '05': 'مرداد', '06': 'شهریور',
@@ -142,6 +144,10 @@ def get_shamsi_date_formatted(shamsi_str):
     }
     parts = shamsi_str.split('/')
     return f"{parts[2]} {months[parts[1]]} {parts[0]}"
+
+def safe_format(value, default="0"):
+    """تبدیل مقدار None به مقدار پیش‌فرض"""
+    return value if value is not None else default
 
 def send_message(chat_id, text, reply_markup=None):
     """ارسال پیام به پیام‌رسان بله"""
@@ -164,7 +170,7 @@ def get_deputy_keyboard():
     """کیبورد برای معاونین شعب"""
     return {
         "keyboard": [
-            [{"text": "💰 ثبت وصولی روزانه"}, {"text": "📊 گزارش وصو��ی"}],
+            [{"text": "💰 ثبت وصولی روزانه"}, {"text": "📊 گزارش وصولی"}],
             [{"text": "📈 مقایسه عملکرد"}, {"text": "🔙 خروج"}]
         ],
         "resize_keyboard": True
@@ -472,333 +478,365 @@ def get_deputy_vs_others_ratio():
 # --- موتور پردازش پیام‌ها (Handlers) ---
 
 def handle_message(message):
-    chat_id = message['chat']['id']
-    text = message.get('text', '').strip()
-    
-    # شناسایی و احراز هویت کاربر
-    user = find_user_by_telegram_id(chat_id)
-    
-    # الف) مرحله ورود کاربر جدید
-    if not user:
-        user_state = user_states.get(chat_id, {})
-        if user_state.get("state") == "WAITING_FOR_EMP_NUM":
-            emp_user = find_user_by_employee_number(text)
-            if emp_user:
-                db_id, emp_num, name, role, title, branch_id, branch_name = emp_user
-                update_user_telegram_id(db_id, chat_id)
+    try:
+        chat_id = message['chat']['id']
+        text = message.get('text', '').strip()
+        
+        # شناسایی و احراز هویت کاربر
+        user = find_user_by_telegram_id(chat_id)
+        
+        # الف) مرحله ورود کاربر جدید
+        if not user:
+            user_state = user_states.get(chat_id, {})
+            if user_state.get("state") == "WAITING_FOR_EMP_NUM":
+                emp_user = find_user_by_employee_number(text)
+                if emp_user:
+                    db_id, emp_num, name, role, title, branch_id, branch_name = emp_user
+                    update_user_telegram_id(db_id, chat_id)
+                    
+                    user_states[chat_id] = {"state": "LOGGED_IN"}
+                    
+                    welcome_msg = (
+                        f"✅ هویت شما تایید شد.\n\n"
+                        f"👤 {name}\n"
+                        f"🏢 {title}\n"
+                        f"🏭 واحد: {branch_name or 'ستاد استان'}\n"
+                        f"🔑 شماره کارمندی: {emp_num}\n"
+                        f"⏰ زمان ورود: {get_shamsi_date_formatted(get_shamsi_date())}\n"
+                        f"🕐 ساعت: {get_iran_time().strftime('%H:%M:%S')}\n\n"
+                        f"خوش آمدید! 👋"
+                    )
+                    keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
+                    send_message(chat_id, welcome_msg, keyboard)
+                else:
+                    send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
+                return
+            else:
+                user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
+                send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 جهت دسترسی، لطفاً شماره کارمندی خود را ارسال کنید:")
+                return
+
+        # استخراج اطلاعات کاربر تایید شده
+        user_db_id, employee_number, full_name, role, title, branch_id, branch_name = user
+        user_state = user_states.setdefault(chat_id, {"state": "LOGGED_IN"})
+        current_state = user_state.get("state")
+
+        # ب) بخش ثبت مبالغ وصولی روزانه (مرحله اول: مبلغ معاون)
+        if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
+            if text == "🔙 انصراف":
+                user_states[chat_id] = {"state": "LOGGED_IN"}
+                send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard())
+                return
+            try:
+                amount = int(text.replace(',', '').replace('،', ''))
+                if amount < 0:
+                    raise ValueError
+                user_states[chat_id] = {
+                    "state": "WAITING_FOR_OTHERS_AMOUNT",
+                    "deputy_amount": amount,
+                    "edit_mode": user_state.get("edit_mode", False)
+                }
+                cancel_keyboard = {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, "✏️ اکنون میزان وصولی سایر همکاران شعبه را وارد کنید (برحسب ریال):", cancel_keyboard)
+            except ValueError:
+                send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت وارد کنید.")
+            return
+
+        # ج) بخش ثبت مبالغ وصولی روزانه (مرحله دوم: سایر همکاران و ذخیره نهایی)
+        elif current_state == "WAITING_FOR_OTHERS_AMOUNT":
+            if text == "🔙 انصراف":
+                user_states[chat_id] = {"state": "LOGGED_IN"}
+                send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard())
+                return
+            try:
+                others_amount = int(text.replace(',', '').replace('،', ''))
+                if others_amount < 0:
+                    raise ValueError
+                
+                deputy_amount = user_state.get("deputy_amount", 0)
+                shamsi_today = get_shamsi_date()
+                is_edit = user_state.get("edit_mode", False)
+                
+                # ذخیره یا بروزرسانی در دیتابیس
+                success = save_or_update_collection(
+                    branch_id=branch_id,
+                    deputy_amount=deputy_amount,
+                    others_amount=others_amount,
+                    shamsi_date=shamsi_today,
+                    user_id=user_db_id,
+                    update_existing=is_edit
+                )
                 
                 user_states[chat_id] = {"state": "LOGGED_IN"}
                 
-                welcome_msg = (
-                    f"✅ هویت شما تایید شد.\n\n"
-                    f"👤 {name}\n"
-                    f"🏢 {title}\n"
-                    f"🏭 واحد: {branch_name or 'ستاد استان'}\n"
-                    f"🔑 شماره کارمندی: {emp_num}\n"
-                    f"⏰ زمان ورود: {get_shamsi_date_formatted(get_shamsi_date())}\n"
-                    f"🕐 ساعت: {get_iran_time().strftime('%H:%M:%S')}\n\n"
-                    f"خوش آمدید! 👋"
-                )
-                keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
-                send_message(chat_id, welcome_msg, keyboard)
-            else:
-                send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
+                if success:
+                    total = deputy_amount + others_amount
+                    status_text = "✏️ بروزرسانی" if is_edit else "✅ ثبت"
+                    success_msg = (
+                        f"{status_text} شد.\n\n"
+                        f"📊 خلاصه ثبت:\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🏢 شعبه: {branch_name}\n"
+                        f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
+                        f"👤 وصولی معاون: {deputy_amount:,.0f} ریال\n"
+                        f"👥 وصولی سایر همکاران: {others_amount:,.0f} ریال\n"
+                        f"💰 جمع کل: {total:,.0f} ریال\n"
+                        f"━━━━━━━━━━━━━━━"
+                    )
+                    keyboard = get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard()
+                    send_message(chat_id, success_msg, keyboard)
+                else:
+                    send_message(chat_id, "❌ خطا در ثبت اطلاعات. لطفا مجدداً تلاش کنید.", get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard())
+            except ValueError:
+                send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت وارد کنید.")
             return
-        else:
-            user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
-            send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 جهت دسترسی، لطفاً شماره کارمندی خود را ارسال کنید:")
-            return
 
-    # استخراج اطلاعات کاربر تایید شده
-    user_db_id, employee_number, full_name, role, title, branch_id, branch_name = user
-    user_state = user_states.setdefault(chat_id, {"state": "LOGGED_IN"})
-    current_state = user_state.get("state")
-
-    # ب) بخش ثبت مبالغ وصولی روزانه (مرحله اول: مبلغ معاون)
-    if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
-        if text == "🔙 انصراف":
-            user_states[chat_id] = {"state": "LOGGED_IN"}
-            send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard())
-            return
-        try:
-            amount = int(text.replace(',', '').replace('،', ''))
-            if amount < 0:
-                raise ValueError
-            user_states[chat_id] = {
-                "state": "WAITING_FOR_OTHERS_AMOUNT",
-                "deputy_amount": amount,
-                "edit_mode": user_state.get("edit_mode", False)
-            }
-            cancel_keyboard = {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
-            send_message(chat_id, "✏️ اکنون میزان وصولی سایر همکاران شعبه را وارد کنید (برحسب ریال):", cancel_keyboard)
-        except ValueError:
-            send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت وارد کنید.")
-        return
-
-    # ج) بخش ثبت مبالغ وصولی روزانه (مرحله دوم: سایر همکاران و ذخیره نهایی)
-    elif current_state == "WAITING_FOR_OTHERS_AMOUNT":
-        if text == "🔙 انصراف":
-            user_states[chat_id] = {"state": "LOGGED_IN"}
-            send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard())
-            return
-        try:
-            others_amount = int(text.replace(',', '').replace('،', ''))
-            if others_amount < 0:
-                raise ValueError
-            
-            deputy_amount = user_state.get("deputy_amount", 0)
-            shamsi_today = get_shamsi_date()
-            is_edit = user_state.get("edit_mode", False)
-            
-            # ذخیره یا بروزرسانی در دیتابیس
-            success = save_or_update_collection(
-                branch_id=branch_id,
-                deputy_amount=deputy_amount,
-                others_amount=others_amount,
-                shamsi_date=shamsi_today,
-                user_id=user_db_id,
-                update_existing=is_edit
-            )
-            
-            user_states[chat_id] = {"state": "LOGGED_IN"}
-            
-            if success:
-                total = deputy_amount + others_amount
-                status_text = "✏️ بروزرسانی" if is_edit else "✅ ثبت"
-                success_msg = (
-                    f"{status_text} شد.\n\n"
-                    f"📊 خلاصه ثبت:\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"🏢 شعبه: {branch_name}\n"
-                    f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
-                    f"👤 وصولی معاون: {deputy_amount:,.0f} ریال\n"
-                    f"👥 وصولی سایر همکاران: {others_amount:,.0f} ریال\n"
-                    f"💰 جمع کل: {total:,.0f} ریال\n"
-                    f"━━━━━━━━━━━━━━━"
-                )
-                keyboard = get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard()
-                send_message(chat_id, success_msg, keyboard)
-            else:
-                send_message(chat_id, "❌ خطا در ثبت اطلاعات. لطفا مجدداً تلاش کنید.", get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard())
-        except ValueError:
-            send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت وارد کنید.")
-        return
-
-    # د) پردازش ویرایش رکورد موجود در صورت تایید کاربر
-    elif current_state == "WAITING_FOR_EDIT_CONFIRMATION":
-        if text == "📝 بله، ویرایش شود":
-            user_states[chat_id] = {"state": "WAITING_FOR_DEPUTY_AMOUNT", "edit_mode": True}
-            cancel_keyboard = {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
-            send_message(chat_id, "✏️ لطفاً مبلغ جدید وصولی خود (معاون) را وارد کنید:", cancel_keyboard)
-        else:
-            user_states[chat_id] = {"state": "LOGGED_IN"}
-            keyboard = get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard()
-            send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
-        return
-
-    # هـ) خروج از سیستم
-    if text == "🔙 خروج":
-        user_states[chat_id] = {"state": "LOGGED_OUT"}
-        send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.")
-        user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
-        return
-
-    # و) پردازش منوهای معاونین شعبه (Deputy)
-    if role == 'deputy':
-        if text == "💰 ثبت وصولی روزانه":
-            shamsi_today = get_shamsi_date()
-            existing = check_existing_collection(branch_id, shamsi_today)
-            
-            if existing:
-                col_id, dep_val, oth_val = existing
-                user_states[chat_id] = {"state": "WAITING_FOR_EDIT_CONFIRMATION"}
-                confirm_keyboard = {
-                    "keyboard": [[{"text": "📝 بله، ویرایش شود"}, {"text": "❌ خیر، لغو شود"}]],
-                    "resize_keyboard": True
-                }
-                msg = (
-                    f"⚠️ اطلاعات امروز قبلاً ثبت شده است.\n\n"
-                    f"📋 وضعیت فعلی:\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"🏢 شعبه: {branch_name}\n"
-                    f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
-                    f"👤 وصولی معاون: {dep_val:,.0f} ریال\n"
-                    f"👥 وصولی همکاران: {oth_val:,.0f} ریال\n"
-                    f"💰 جمع کل: {(dep_val+oth_val):,.0f} ریال\n"
-                    f"━━━━━━━━━━━━━━━\n\n"
-                    f"❓ آیا مایل به ویرایش هستید؟"
-                )
-                send_message(chat_id, msg, confirm_keyboard)
-            else:
-                user_states[chat_id] = {"state": "WAITING_FOR_DEPUTY_AMOUNT", "edit_mode": False}
+        # د) پردازش ویرایش رکورد موجود در صورت تایید کاربر
+        elif current_state == "WAITING_FOR_EDIT_CONFIRMATION":
+            if text == "📝 بله، ویرایش شود":
+                user_states[chat_id] = {"state": "WAITING_FOR_DEPUTY_AMOUNT", "edit_mode": True}
                 cancel_keyboard = {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
-                send_message(chat_id, "📝 لطفاً میزان وصولی خود (معاون) را وارد کنید:", cancel_keyboard)
-
-        elif text == "📊 گزارش وصولی":
-            report = get_branch_10_day_report(branch_id)
-            if report:
-                msg = f"📊 گزارش وصول شعبه {branch_name}\n"
-                msg += f"(۱۰ روز اخیر)\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                total_sum = 0
-                for i, row in enumerate(report, 1):
-                    msg += (
-                        f"{i}. 📅 {get_shamsi_date_formatted(row[0])}\n"
-                        f"   👤 معاون: {row[1]:,.0f}\n"
-                        f"   👥 همکاران: {row[2]:,.0f}\n"
-                        f"   💰 جمع: {row[3]:,.0f} ریال\n\n"
-                    )
-                    total_sum += row[3]
-                msg += f"━━━━━━━━━━��━━━━━━━\n"
-                msg += f"📈 جمع ۱۰ روز: {total_sum:,.0f} ریال\n"
-                msg += f"📊 میانگین روزانه: {total_sum//len(report):,.0f} ریال"
-                send_message(chat_id, msg)
+                send_message(chat_id, "✏️ لطفاً مبلغ جدید وصولی خود (معاون) را وارد کنید:", cancel_keyboard)
             else:
-                send_message(chat_id, "📊 هیچ سابقه وصولی برای شعبه شما یافت نشد.")
+                user_states[chat_id] = {"state": "LOGGED_IN"}
+                keyboard = get_deputy_keyboard() if role == 'deputy' else get_admin_keyboard()
+                send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
+            return
 
-        elif text == "📈 مقایسه عملکرد":
-            perf = get_branch_performance(branch_id, 7)
-            if perf:
-                msg = f"📈 تحلیل عملکرد شعبه {branch_name}\n"
-                msg += f"(۷ روز اخیر)\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                for i, row in enumerate(perf, 1):
-                    trend = "📈" if i < len(perf) and perf[i-1][1] > row[1] else "📉"
-                    msg += (
-                        f"{trend} {get_shamsi_date_formatted(row[0])}\n"
-                        f"   جمع روزانه: {row[1]:,.0f} ریال\n"
-                        f"   میانگین متحرک: {row[2]:,.0f} ریال\n\n"
+        # هـ) خروج از سیستم
+        if text == "🔙 خروج":
+            user_states[chat_id] = {"state": "LOGGED_OUT"}
+            send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.")
+            user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
+            return
+
+        # و) پردازش منوهای معاونین شعبه (Deputy)
+        if role == 'deputy':
+            if text == "💰 ثبت وصولی روزانه":
+                shamsi_today = get_shamsi_date()
+                existing = check_existing_collection(branch_id, shamsi_today)
+                
+                if existing:
+                    col_id, dep_val, oth_val = existing
+                    user_states[chat_id] = {"state": "WAITING_FOR_EDIT_CONFIRMATION"}
+                    confirm_keyboard = {
+                        "keyboard": [[{"text": "📝 بله، ویرایش شود"}, {"text": "❌ خیر، لغو شود"}]],
+                        "resize_keyboard": True
+                    }
+                    msg = (
+                        f"⚠️ اطلاعات امروز قبلاً ثبت شده است.\n\n"
+                        f"📋 وضعیت فعلی:\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🏢 شعبه: {branch_name}\n"
+                        f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
+                        f"👤 وصولی معاون: {int(safe_format(dep_val)):,.0f} ریال\n"
+                        f"👥 وصولی همکاران: {int(safe_format(oth_val)):,.0f} ریال\n"
+                        f"💰 جمع کل: {int(safe_format(dep_val)) + int(safe_format(oth_val)):,.0f} ریال\n"
+                        f"━━━━━━━━━━━━━━━\n\n"
+                        f"❓ آیا مایل به ویرایش هستید؟"
                     )
-                send_message(chat_id, msg)
+                    send_message(chat_id, msg, confirm_keyboard)
+                else:
+                    user_states[chat_id] = {"state": "WAITING_FOR_DEPUTY_AMOUNT", "edit_mode": False}
+                    cancel_keyboard = {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                    send_message(chat_id, "📝 لطفاً میزان وصولی خود (معاون) را وارد کنید:", cancel_keyboard)
+
+            elif text == "📊 گزارش وصولی":
+                report = get_branch_10_day_report(branch_id)
+                if report:
+                    msg = f"📊 گزارش وصول شعبه {branch_name}\n"
+                    msg += f"(۱۰ روز اخیر)\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    total_sum = 0
+                    for i, row in enumerate(report, 1):
+                        dep = int(safe_format(row[1]))
+                        oth = int(safe_format(row[2]))
+                        tot = int(safe_format(row[3]))
+                        msg += (
+                            f"{i}. 📅 {get_shamsi_date_formatted(row[0])}\n"
+                            f"   👤 معاون: {dep:,.0f}\n"
+                            f"   👥 همکاران: {oth:,.0f}\n"
+                            f"   💰 جمع: {tot:,.0f} ریال\n\n"
+                        )
+                        total_sum += tot
+                    msg += f"━━━━━━━━━━━━━━━━━━\n"
+                    msg += f"📈 جمع ۱۰ روز: {total_sum:,.0f} ریال\n"
+                    msg += f"📊 میانگین روزانه: {total_sum//len(report):,.0f} ریال"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "📊 هیچ سابقه وصولی برای شعبه شما یافت نشد.")
+
+            elif text == "📈 مقایسه عملکرد":
+                perf = get_branch_performance(branch_id, 7)
+                if perf:
+                    msg = f"📈 تحلیل عملکرد شعبه {branch_name}\n"
+                    msg += f"(۷ روز اخیر)\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    for i, row in enumerate(perf, 1):
+                        daily = int(safe_format(row[1]))
+                        avg = int(safe_format(row[2]))
+                        trend = "📈" if i < len(perf) and perf[i-1][1] and row[1] and perf[i-1][1] > row[1] else "📉"
+                        msg += (
+                            f"{trend} {get_shamsi_date_formatted(row[0])}\n"
+                            f"   جمع روزانه: {daily:,.0f} ریال\n"
+                            f"   میانگین متحرک: {avg:,.0f} ریال\n\n"
+                        )
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "📈 داده کافی برای تحلیل وجود ندارد.")
+
             else:
-                send_message(chat_id, "📈 داده کافی برای تحلیل وجود ندارد.")
+                send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_deputy_keyboard())
+
+        # ز) پردازش منوهای کاربران ارشد (Admin)
+        elif role == 'admin':
+            if text == "📊 گزارش امروز":
+                shamsi_today = get_shamsi_date()
+                report = get_today_province_report(shamsi_today)
+                stats = get_today_statistics()
+                
+                if report:
+                    msg = f"📊 گزارش وصول امروز\n"
+                    msg += f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    
+                    total_province = 0
+                    for idx, row in enumerate(report, 1):
+                        dep = int(safe_format(row[1]))
+                        oth = int(safe_format(row[2]))
+                        tot = int(safe_format(row[3]))
+                        msg += f"{idx}. 🏢 {row[0]}\n"
+                        msg += f"   👤 معاون: {dep:,.0f}\n"
+                        msg += f"   👥 همکاران: {oth:,.0f}\n"
+                        msg += f"   💰 جمع: {tot:,.0f} ریال\n\n"
+                        total_province += tot
+                    
+                    msg += f"━━━━━━━━━━━━━━━━━━\n"
+                    if stats:
+                        s0 = int(safe_format(stats[0]))
+                        s1 = int(safe_format(stats[1]))
+                        s2 = int(safe_format(stats[2]))
+                        msg += f"📈 خلاصه:\n"
+                        msg += f"   تعداد شعب ثبت شده: {s0}\n"
+                        msg += f"   کل وصولی معاونین: {s1:,.0f}\n"
+                        msg += f"   کل وصولی همکاران: {s2:,.0f}\n"
+                        msg += f"   💰 جمع کل استان: {total_province:,.0f} ریال"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, f"📊 امروز ({shamsi_today}) هنوز هیچ شعبه‌ای اطلاعات ثبت نکرده است.")
+
+            elif text == "📈 گزارش ۱۰ روز اخیر":
+                report = get_province_10_day_report()
+                if report:
+                    msg = f"📈 گزارش ۱۰ روز اخیر استان زنجان\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    total_all = 0
+                    for row in report:
+                        r1 = int(safe_format(row[1]))
+                        r2 = int(safe_format(row[2]))
+                        r3 = int(safe_format(row[3]))
+                        msg += (
+                            f"📅 {get_shamsi_date_formatted(row[0])}\n"
+                            f"   👤 معاونین: {r1:,.0f}\n"
+                            f"   👥 سایر همکاران: {r2:,.0f}\n"
+                            f"   💰 جمع: {r3:,.0f} ریال\n\n"
+                        )
+                        total_all += r3
+                    msg += f"━━━━━━━━━━━━━━━━━━\n"
+                    msg += f"📊 کل ۱۰ روز: {total_all:,.0f} ریال"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "📈 دیتابیس خالی است.")
+
+            elif text == "🏆 رتبه‌بندی شعب":
+                report = get_top_5_branches()
+                if report:
+                    msg = f"🏆 ۵ شعبه برتر استان زنجان\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+                    for idx, row in enumerate(report):
+                        tot = int(safe_format(row[1]))
+                        cnt = int(safe_format(row[2]))
+                        msg += f"{medals[idx]} {row[0]}\n"
+                        msg += f"    💰 کل وصولی: {tot:,.0f} ریال\n"
+                        msg += f"    📊 تعداد ثبت: {cnt} روز\n\n"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "🏆 داده کافی برای رتبه‌بندی وجود ندارد.")
+
+            elif text == "💹 آمار مفصل":
+                shamsi_today = get_shamsi_date()
+                report = get_detailed_report(shamsi_today)
+                if report:
+                    msg = f"💹 آمار مفصل امروز\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    for idx, row in enumerate(report, 1):
+                        dep = int(safe_format(row[1]))
+                        oth = int(safe_format(row[2]))
+                        tot = int(safe_format(row[3]))
+                        msg += f"{idx}. 🏢 {row[0]}\n"
+                        msg += f"   👤 معاون ({row[4]}): {dep:,.0f} ریال\n"
+                        msg += f"   👥 سایرین: {oth:,.0f} ریال\n"
+                        msg += f"   💰 جمع: {tot:,.0f} ریال\n\n"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "💹 برای امروز اطلاعاتی وجود ندارد.")
+
+            elif text == "📉 مقایسه روزانه":
+                comparison = get_daily_comparison()
+                if comparison:
+                    msg = f"📉 مقایسه روزانه (۷ روز اخیر)\n"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                    for row in comparison:
+                        br = int(safe_format(row[1]))
+                        tot = int(safe_format(row[2]))
+                        msg += f"📅 {get_shamsi_date_formatted(row[0])}\n"
+                        msg += f"    🏢 شعب ثبت‌کننده: {br}\n"
+                        msg += f"    💰 کل وصولی: {tot:,.0f} ریال\n\n"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "📉 داده کافی وجود ندارد.")
+
+            elif text == "🎯 تحلیل عملکرد":
+                ratio = get_deputy_vs_others_ratio()
+                yesterday_today = get_yesterday_vs_today()
+                
+                msg = f"🎯 تحلیل عملکرد استان\n"
+                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                
+                if ratio:
+                    r0 = int(safe_format(ratio[0]))
+                    r1 = int(safe_format(ratio[1]))
+                    r2 = float(safe_format(ratio[2], "0"))
+                    msg += f"📊 نسبت امروز:\n"
+                    msg += f"   👤 وصولی معاونین: {r0:,.0f} ریال ({r2:.1f}%)\n"
+                    msg += f"   👥 وصولی سایرین: {r1:,.0f} ریال ({100-r2:.1f}%)\n\n"
+                
+                if yesterday_today:
+                    today = int(safe_format(yesterday_today[0]))
+                    yesterday = int(safe_format(yesterday_today[1]))
+                    change = ((today - yesterday) / yesterday * 100) if yesterday > 0 else 0
+                    trend = "📈 افزایش" if change > 0 else "📉 کاهش" if change < 0 else "➡️ ثابت"
+                    
+                    msg += f"📅 مقایسه امروز/دیروز:\n"
+                    msg += f"   امروز: {today:,.0f} ریال\n"
+                    msg += f"   دیروز: {yesterday:,.0f} ریال\n"
+                    msg += f"   {trend}: {abs(change):.1f}%\n"
+                
+                send_message(chat_id, msg)
+
+            else:
+                send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_admin_keyboard())
 
         else:
-            send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_deputy_keyboard())
-
-    # ز) پردازش منوهای کاربران ارشد (Admin)
-    elif role == 'admin':
-        if text == "📊 گزارش امروز":
-            shamsi_today = get_shamsi_date()
-            report = get_today_province_report(shamsi_today)
-            stats = get_today_statistics()
-            
-            if report:
-                msg = f"📊 گزارش وصول امروز\n"
-                msg += f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                
-                total_province = 0
-                for idx, row in enumerate(report, 1):
-                    msg += f"{idx}. 🏢 {row[0]}\n"
-                    msg += f"   👤 معاون: {row[1]:,.0f}\n"
-                    msg += f"   👥 همکاران: {row[2]:,.0f}\n"
-                    msg += f"   💰 جمع: {row[3]:,.0f} ریال\n\n"
-                    total_province += row[3]
-                
-                msg += f"━━━━━━━━━━━━━━━━━━\n"
-                if stats:
-                    msg += f"📈 خلاصه:\n"
-                    msg += f"   تعداد شعب ثبت شده: {stats[0]}\n"
-                    msg += f"   کل وصولی معاونین: {stats[1]:,.0f}\n"
-                    msg += f"   کل وصولی همکاران: {stats[2]:,.0f}\n"
-                    msg += f"   💰 جمع کل استان: {total_province:,.0f} ریال"
-                send_message(chat_id, msg)
-            else:
-                send_message(chat_id, f"📊 امروز ({shamsi_today}) هنوز هیچ شعبه‌ای اطلاعات ثبت نکرده است.")
-
-        elif text == "📈 گزارش ۱۰ روز اخیر":
-            report = get_province_10_day_report()
-            if report:
-                msg = f"📈 گزارش ۱۰ روز اخیر استان زنجان\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                total_all = 0
-                for row in report:
-                    msg += (
-                        f"📅 {get_shamsi_date_formatted(row[0])}\n"
-                        f"   👤 معاونین: {row[1]:,.0f}\n"
-                        f"   👥 سایر همکاران: {row[2]:,.0f}\n"
-                        f"   💰 جمع: {row[3]:,.0f} ریال\n\n"
-                    )
-                    total_all += row[3]
-                msg += f"━━━━━━━━━━━━━━━━━━\n"
-                msg += f"📊 کل ۱۰ روز: {total_all:,.0f} ریال"
-                send_message(chat_id, msg)
-            else:
-                send_message(chat_id, "📈 دیتابیس خالی است.")
-
-        elif text == "🏆 رتبه‌بندی شعب":
-            report = get_top_5_branches()
-            if report:
-                msg = f"🏆 ۵ شعبه برتر استان زنجان\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-                for idx, row in enumerate(report):
-                    msg += f"{medals[idx]} {row[0]}\n"
-                    msg += f"    💰 کل وصولی: {row[1]:,.0f} ریال\n"
-                    msg += f"    📊 تعداد ثبت: {row[2]} روز\n\n"
-                send_message(chat_id, msg)
-            else:
-                send_message(chat_id, "🏆 داده کافی برای رتبه‌بندی وجود ندارد.")
-
-        elif text == "💹 آمار مفصل":
-            shamsi_today = get_shamsi_date()
-            report = get_detailed_report(shamsi_today)
-            if report:
-                msg = f"💹 آمار مفصل امروز\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                for idx, row in enumerate(report, 1):
-                    msg += f"{idx}. 🏢 {row[0]}\n"
-                    msg += f"   👤 معاون ({row[4]}): {row[1]:,.0f} ریال\n"
-                    msg += f"   👥 سایرین: {row[2]:,.0f} ریال\n"
-                    msg += f"   💰 جمع: {row[3]:,.0f} ریال\n\n"
-                send_message(chat_id, msg)
-            else:
-                send_message(chat_id, "💹 برای امروز اطلاعاتی وجود ندارد.")
-
-        elif text == "📉 مقایسه روزانه":
-            comparison = get_daily_comparison()
-            if comparison:
-                msg = f"📉 مقایسه روزانه (۷ روز اخیر)\n"
-                msg += f"━━━━━━━━━━━━━━━━���━\n\n"
-                for row in comparison:
-                    msg += f"📅 {get_shamsi_date_formatted(row[0])}\n"
-                    msg += f"    🏢 شعب ثبت‌کننده: {row[1]}\n"
-                    msg += f"    💰 کل وصولی: {row[2]:,.0f} ریال\n\n"
-                send_message(chat_id, msg)
-            else:
-                send_message(chat_id, "📉 داده کافی وجود ندارد.")
-
-        elif text == "🎯 تحلیل عملکرد":
-            ratio = get_deputy_vs_others_ratio()
-            yesterday_today = get_yesterday_vs_today()
-            
-            msg = f"🎯 تحلیل عملکرد استان\n"
-            msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-            
-            if ratio:
-                msg += f"📊 نسبت امروز:\n"
-                msg += f"   👤 وصولی معاونین: {ratio[0]:,.0f} ریال ({ratio[2]:.1f}%)\n"
-                msg += f"   👥 وصولی سایرین: {ratio[1]:,.0f} ریال ({100-ratio[2]:.1f}%)\n\n"
-            
-            if yesterday_today:
-                today = yesterday_today[0] or 0
-                yesterday = yesterday_today[1] or 0
-                change = ((today - yesterday) / yesterday * 100) if yesterday > 0 else 0
-                trend = "📈 افزایش" if change > 0 else "📉 کاهش" if change < 0 else "➡️ ثابت"
-                
-                msg += f"📅 مقایسه امروز/دیروز:\n"
-                msg += f"   امروز: {today:,.0f} ریال\n"
-                msg += f"   دیروز: {yesterday:,.0f} ریال\n"
-                msg += f"   {trend}: {abs(change):.1f}%\n"
-            
-            send_message(chat_id, msg)
-
-        else:
-            send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_admin_keyboard())
-
-    else:
-        send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید.", get_admin_keyboard() if role == 'admin' else get_deputy_keyboard())
+            send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید.", get_admin_keyboard() if role == 'admin' else get_deputy_keyboard())
+    
+    except Exception as e:
+        logger.error(f"❌ Error in handle_message: {e}")
+        try:
+            send_message(message['chat']['id'], "❌ خطایی در پردازش پیام رخ داد. لطفا مجدداً تلاش کنید.")
+        except:
+            pass
 
 
 # --- چرخه پولینگ اصلی ربات (Polling Loop) ---
