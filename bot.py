@@ -14,8 +14,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # بارگذاری متغیرهای محیطی
-BOT_TOKEN = os.getenv("160966979:s3cnOPW18kZcUJRSpIUp8r68jnuvjUK72wQ")
-DB_URL = os.getenv("postgresql://postgres.uvpwvhmwuklqqmhgdorx:Farhad35667900@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DB_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN or not DB_URL:
     logger.error("BOT_TOKEN and DB_URL environment variables are required!")
