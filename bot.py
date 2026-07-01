@@ -34,7 +34,7 @@ logger.info(f"✅ Bale API URL: {BASE_URL}")
 # ============================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/3.0'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/3.1'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -60,7 +60,8 @@ except Exception as e:
 # ============================================
 # State Management
 # ============================================
-user_states = {}  # {chat_id: {"state": ..., "data": {...}}}
+user_states = {}  # {chat_id: {"state": ..., "user_data": {...}}}
+processed_updates = set()  # برای جلوگیری از پردازش دوبله
 
 def get_db_connection():
     if db_pool:
@@ -127,12 +128,14 @@ def safe_format(value, default="0"):
     return value if value is not None else default
 
 # ============================================
-# ارسال پیام
+# ارسال پیام (با پشتیبانی از حذف کیبورد)
 # ============================================
-def send_message(chat_id, text, reply_markup=None):
+def send_message(chat_id, text, reply_markup=None, remove_keyboard=False):
     url = f"{BASE_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
-    if reply_markup:
+    if remove_keyboard:
+        payload["reply_markup"] = {"remove_keyboard": True}
+    elif reply_markup:
         payload["reply_markup"] = reply_markup
     try:
         res = requests_session.post(url, json=payload, timeout=15)
@@ -175,10 +178,8 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================
-# توابع دیتابیس (همه توابع قبلی + توابع جدید)
+# توابع دیتابیس (همانند قبل، بدون تغییر)
 # ============================================
-
-# --- توابع موجود (با همان نام) ---
 def find_user_by_employee_number(emp_num):
     conn = get_db_connection()
     try:
@@ -453,10 +454,7 @@ def get_deputy_vs_others_ratio():
     finally:
         return_db_connection(conn)
 
-# ========== توابع جدید ==========
-
 def get_report_by_date(shamsi_date):
-    """گزارش کل استان برای یک تاریخ خاص"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -476,7 +474,6 @@ def get_report_by_date(shamsi_date):
         return_db_connection(conn)
 
 def get_branch_report_by_date(branch_id, shamsi_date):
-    """گزارش یک شعبه برای یک تاریخ خاص"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -493,7 +490,6 @@ def get_branch_report_by_date(branch_id, shamsi_date):
         return_db_connection(conn)
 
 def get_branch_full_history(branch_id):
-    """تاریخچه کامل یک شعبه (همه روزها)"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -511,7 +507,6 @@ def get_branch_full_history(branch_id):
         return_db_connection(conn)
 
 def get_best_worst_days(limit=5):
-    """بهترین و بدترین روزهای استان از نظر کل وصولی"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -538,50 +533,28 @@ def get_best_worst_days(limit=5):
     finally:
         return_db_connection(conn)
 
-def get_total_summary():
-    """مجموع کل وصولی هر شعبه از ابتدا"""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT b.name, SUM(c.total_amount) as total
-                FROM collections c
-                JOIN branches b ON c.branch_id = b.id
-                GROUP BY b.name
-                ORDER BY total DESC
-            """)
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_total_summary: {e}")
-        return []
-    finally:
-        return_db_connection(conn)
-
 # ============================================
-# پردازش پیام‌ها (با منطق بهبودیافته)
+# پردازش پیام‌ها
 # ============================================
 def handle_message(message):
     try:
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
         
-        # وضعیت فعلی کاربر
         user_state = user_states.get(chat_id, {"state": "LOGGED_OUT"})
         current_state = user_state.get("state", "LOGGED_OUT")
 
-        # اگر کاربر لاگین نکرده باشد یا state خروج باشد
+        # ===== حالت خروج یا عدم احراز هویت =====
         if current_state == "LOGGED_OUT" or current_state == "WAITING_FOR_EMP_NUM":
-            # اگر پیام "/start" یا هر چیز دیگری باشد، شماره کارمندی می‌خواهیم
             if current_state != "WAITING_FOR_EMP_NUM":
                 user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
-                send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 لطفاً شماره کارمندی خود را ارسال کنید:")
+                send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 لطفاً شماره کارمندی خود را ارسال کنید:", remove_keyboard=True)
                 return
             # در حالت WAITING_FOR_EMP_NUM
             emp_user = find_user_by_employee_number(text)
             if emp_user:
                 db_id, emp_num, name, role, title, branch_id, branch_name = emp_user
                 update_user_telegram_id(db_id, chat_id)
-                # ذخیره اطلاعات کاربر در state برای دسترسی سریع
                 user_states[chat_id] = {
                     "state": "LOGGED_IN",
                     "user_data": {
@@ -609,15 +582,13 @@ def handle_message(message):
                 send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
             return
 
-        # کاربر لاگین کرده است
+        # ===== کاربر لاگین کرده =====
         user_data = user_state.get("user_data", {})
         if not user_data:
-            # اگر اطلاعات کاربر در state نباشد، از دیتابیس می‌خوانیم
             user = find_user_by_telegram_id(chat_id)
             if not user:
-                # اگر کاربر در دیتابیس نباشد (احتمالاً حذف شده)، او را به حالت ورود می‌فرستیم
                 user_states[chat_id] = {"state": "LOGGED_OUT"}
-                send_message(chat_id, "⚠️ نشست شما منقضی شده است. لطفاً شماره کارمندی خود را وارد کنید.")
+                send_message(chat_id, "⚠️ نشست شما منقضی شده است. لطفاً شماره کارمندی خود را وارد کنید.", remove_keyboard=True)
                 return
             db_id, emp_num, name, role, title, branch_id, branch_name = user
             user_data = {
@@ -636,7 +607,7 @@ def handle_message(message):
         branch_name = user_data["branch_name"]
         user_db_id = user_data["db_id"]
 
-        # مدیریت وضعیت‌های ورودی (ثبت مبلغ)
+        # ===== مدیریت وضعیت‌های ورودی (ثبت مبلغ) =====
         if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
             if text == "🔙 انصراف":
                 user_states[chat_id]["state"] = "LOGGED_IN"
@@ -711,7 +682,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
             return
 
-        # ====== دستورات جدید: گزارش تاریخ خاص برای معاونین ======
+        # ===== دستورات جدید: گزارش تاریخ خاص برای معاونین =====
         if role == 'deputy' and current_state == "WAITING_FOR_BRANCH_DATE":
             if text == "🔙 انصراف":
                 user_states[chat_id]["state"] = "LOGGED_IN"
@@ -739,7 +710,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ====== دستورات جدید: گزارش تاریخ خاص برای ادمین ======
+        # ===== دستورات جدید: گزارش تاریخ خاص برای ادمین =====
         if role == 'admin' and current_state == "WAITING_FOR_ADMIN_DATE":
             if text == "🔙 انصراف":
                 user_states[chat_id]["state"] = "LOGGED_IN"
@@ -771,13 +742,14 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ====== خروج ======
+        # ===== خروج =====
         if text == "🔙 خروج":
-            user_states[chat_id] = {"state": "LOGGED_OUT"}  # پاک کردن کامل state
-            send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.")
+            # حذف کامل state و ارسال پیام با حذف کیبورد
+            user_states[chat_id] = {"state": "LOGGED_OUT"}
+            send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.", remove_keyboard=True)
             return
 
-        # ====== راهنما ======
+        # ===== راهنما =====
         if text == "❓ راهنما":
             help_text = (
                 "📌 **راهنمای ربات وصول مطالبات**\n\n"
@@ -804,7 +776,7 @@ def handle_message(message):
             send_message(chat_id, help_text, keyboard)
             return
 
-        # ====== منوی معاونین ======
+        # ===== منوی معاونین =====
         if role == 'deputy':
             if text == "💰 ثبت وصولی روزانه":
                 shamsi_today = get_shamsi_date()
@@ -913,7 +885,7 @@ def handle_message(message):
             else:
                 send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_deputy_keyboard())
 
-        # ====== منوی ادمین ======
+        # ===== منوی ادمین =====
         elif role == 'admin':
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
@@ -1067,12 +1039,12 @@ def handle_message(message):
             pass
 
 # ============================================
-# Keep-Alive Thread
+# Keep-Alive Thread (هر ۳۰ ثانیه)
 # ============================================
 def keep_alive_loop():
     while True:
         try:
-            time.sleep(60)
+            time.sleep(30)
             url = f"{BASE_URL}/getMe"
             res = requests_session.get(url, timeout=10)
             if res.status_code == 200:
@@ -1096,14 +1068,21 @@ def main():
     while True:
         try:
             url = f"{BASE_URL}/getUpdates"
-            params = {"offset": offset, "timeout": 50}
-            res = requests_session.get(url, params=params, timeout=65)
+            params = {"offset": offset, "timeout": 30}  # کاهش timeout برای پاسخ‌دهی سریع‌تر
+            res = requests_session.get(url, params=params, timeout=45)
 
             if res.status_code == 200:
                 data = res.json()
                 if data.get("ok") and data.get("result"):
                     for update in data["result"]:
                         update_id = update["update_id"]
+                        # جلوگیری از پردازش دوبله
+                        if update_id in processed_updates:
+                            continue
+                        processed_updates.add(update_id)
+                        # محدود کردن size set برای جلوگیری از افزایش بی‌نهایت
+                        if len(processed_updates) > 1000:
+                            processed_updates.clear()
                         if "message" in update:
                             handle_message(update["message"])
                         offset = update_id + 1
