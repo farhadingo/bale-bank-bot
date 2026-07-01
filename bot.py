@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import threading
 
 # ============================================
-# تنظیمات پیشرفته لاگین
+# تنظیمات لاگین
 # ============================================
 logging.basicConfig(
     level=logging.INFO,
@@ -18,39 +18,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# بارگذاری متغیرهای محیطی
+# متغیرهای محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN or not DB_URL:
-    logger.error("❌ BOT_TOKEN and DATABASE_URL environment variables are required!")
-    logger.error("❌ Please add them in Render Environment Variables section")
+    logger.error("❌ BOT_TOKEN and DATABASE_URL are required!")
     exit(1)
 
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
-logger.info(f"✅ Environment variables loaded")
 logger.info(f"✅ Bale API URL: {BASE_URL}")
 
 # ============================================
-# 🔧 Setup Session with Keep-Alive & Retry
+# Session با Keep-Alive
 # ============================================
 def create_session():
     session = requests.Session()
-    session.headers.update({
-        'Connection': 'keep-alive',
-        'User-Agent': 'Bale-Bank-Bot/2.0'
-    })
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/3.0'})
     retry_strategy = Retry(
-        total=5,
-        backoff_factor=1,
+        total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
     )
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=20,
-        pool_maxsize=20
-    )
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -58,26 +48,25 @@ def create_session():
 requests_session = create_session()
 
 # ============================================
-# 🗄️ Database Connection Pool
+# Connection Pool دیتابیس
 # ============================================
 try:
     db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DB_URL)
-    logger.info("✅ Database connection pool created.")
+    logger.info("✅ Database pool created.")
 except Exception as e:
-    logger.error(f"❌ Failed to create pool: {e}")
+    logger.error(f"❌ Pool error: {e}")
     db_pool = None
 
 # ============================================
-# 📦 State Management & Helpers
+# State Management
 # ============================================
-user_states = {}          # {chat_id: {state, data}}
-last_activity = {}        # برای Keep-Alive هوشمند
+user_states = {}  # {chat_id: {"state": ..., "data": {...}}}
 
 def get_db_connection():
     if db_pool:
         try:
             return db_pool.getconn()
-        except psycopg2.OperationalError:
+        except:
             return psycopg2.connect(DB_URL)
     return psycopg2.connect(DB_URL)
 
@@ -85,27 +74,29 @@ def return_db_connection(conn):
     if db_pool:
         try:
             db_pool.putconn(conn)
-        except Exception:
+        except:
             conn.close()
     else:
         conn.close()
 
+# ============================================
+# توابع کمکی تاریخ و زمان
+# ============================================
 def get_iran_time():
-    iran_timezone = timezone(timedelta(hours=3, minutes=30))
-    return datetime.now(iran_timezone)
+    return datetime.now(timezone(timedelta(hours=3, minutes=30)))
 
 def get_shamsi_date(days_offset=0):
-    now_iran = get_iran_time() + timedelta(days=days_offset)
-    g_y, g_m, g_d = now_iran.year, now_iran.month, now_iran.day
-    g_days_in_month = [31,28,31,30,31,30,31,31,30,31,30,31]
+    now = get_iran_time() + timedelta(days=days_offset)
+    g_y, g_m, g_d = now.year, now.month, now.day
+    g_days = [31,28,31,30,31,30,31,31,30,31,30,31]
     if (g_y%4==0 and g_y%100!=0) or (g_y%400==0):
-        g_days_in_month[1]=29
+        g_days[1]=29
     gy = g_y - 1600
     gm = g_m - 1
     gd = g_d - 1
     g_day_no = 365*gy + gy//4 - gy//100 + gy//400
     for i in range(gm):
-        g_day_no += g_days_in_month[i]
+        g_day_no += g_days[i]
     g_day_no += gd
     jy = 979 + 33*(g_day_no//12053) + 4*((g_day_no%12053)//1461)
     g_day_no %= 1461
@@ -135,13 +126,12 @@ def get_shamsi_date_formatted(shamsi_str):
 def safe_format(value, default="0"):
     return value if value is not None else default
 
+# ============================================
+# ارسال پیام
+# ============================================
 def send_message(chat_id, text, reply_markup=None):
-    """ارسال پیام با مدیریت خطا و جلوگیری از ارسال دوباره"""
     url = f"{BASE_URL}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text
-    }
+    payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
@@ -149,20 +139,21 @@ def send_message(chat_id, text, reply_markup=None):
         if res.status_code == 200:
             return res.json()
         else:
-            logger.error(f"❌ sendMessage failed: {res.status_code} - {res.text}")
+            logger.error(f"sendMessage failed: {res.status_code}")
             return None
     except Exception as e:
-        logger.error(f"❌ Error sending message to {chat_id}: {e}")
+        logger.error(f"sendMessage error: {e}")
         return None
 
 # ============================================
-# ⌨️ Keyboards
+# کیبوردها
 # ============================================
 def get_deputy_keyboard():
     return {
         "keyboard": [
             [{"text": "💰 ثبت وصولی روزانه"}, {"text": "📊 گزارش وصولی"}],
             [{"text": "📈 مقایسه عملکرد"}, {"text": "📋 مشاهده ثبت امروز"}],
+            [{"text": "📅 گزارش تاریخ خاص"}, {"text": "📊 تاریخچه کامل"}],
             [{"text": "🔙 خروج"}, {"text": "❓ راهنما"}]
         ],
         "resize_keyboard": True
@@ -172,9 +163,9 @@ def get_admin_keyboard():
     return {
         "keyboard": [
             [{"text": "📊 گزارش امروز"}, {"text": "📈 گزارش ۱۰ روز اخیر"}],
-            [{"text": "🏆 رتبه‌بندی شعب"}, {"text": "💹 آمار مفصل"}],
+            [{"text": "🏆 رتبه‌بندی شعب"}, {"text": "💹 آمار مفصل امروز"}],
             [{"text": "📉 مقایسه روزانه"}, {"text": "🎯 تحلیل عملکرد"}],
-            [{"text": "📅 گزارش تاریخ خاص"}, {"text": "🗑 حذف رکورد"}],
+            [{"text": "📅 گزارش تاریخ خاص"}, {"text": "📊 بهترین/بدترین روز"}],
             [{"text": "🔙 خروج"}, {"text": "❓ راهنما"}]
         ],
         "resize_keyboard": True
@@ -184,9 +175,10 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================
-# 📊 Database Functions
+# توابع دیتابیس (همه توابع قبلی + توابع جدید)
 # ============================================
 
+# --- توابع موجود (با همان نام) ---
 def find_user_by_employee_number(emp_num):
     conn = get_db_connection()
     try:
@@ -199,7 +191,7 @@ def find_user_by_employee_number(emp_num):
             """, (emp_num,))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"❌ find_user_by_employee_number: {e}")
+        logger.error(f"find_user_by_employee_number: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -211,7 +203,7 @@ def update_user_telegram_id(user_db_id, chat_id):
             cur.execute("UPDATE users SET telegram_id = %s WHERE id = %s", (chat_id, user_db_id))
             conn.commit()
     except Exception as e:
-        logger.error(f"❌ update_user_telegram_id: {e}")
+        logger.error(f"update_user_telegram_id: {e}")
     finally:
         return_db_connection(conn)
 
@@ -227,7 +219,7 @@ def find_user_by_telegram_id(chat_id):
             """, (chat_id,))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"❌ find_user_by_telegram_id: {e}")
+        logger.error(f"find_user_by_telegram_id: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -243,7 +235,7 @@ def check_existing_collection(branch_id, shamsi_date):
             """, (branch_id, shamsi_date))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"❌ check_existing_collection: {e}")
+        logger.error(f"check_existing_collection: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -267,20 +259,7 @@ def save_or_update_collection(branch_id, deputy_amount, others_amount, shamsi_da
             conn.commit()
             return True
     except Exception as e:
-        logger.error(f"❌ save_or_update_collection: {e}")
-        return False
-    finally:
-        return_db_connection(conn)
-
-def delete_collection(collection_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM collections WHERE id = %s", (collection_id,))
-            conn.commit()
-            return True
-    except Exception as e:
-        logger.error(f"❌ delete_collection: {e}")
+        logger.error(f"save_or_update_collection: {e}")
         return False
     finally:
         return_db_connection(conn)
@@ -298,7 +277,7 @@ def get_branch_10_day_report(branch_id):
             """, (branch_id,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_branch_10_day_report: {e}")
+        logger.error(f"get_branch_10_day_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -316,7 +295,7 @@ def get_today_province_report(shamsi_date):
             """, (shamsi_date,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_today_province_report: {e}")
+        logger.error(f"get_today_province_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -334,7 +313,7 @@ def get_province_10_day_report():
             """)
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_province_10_day_report: {e}")
+        logger.error(f"get_province_10_day_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -353,7 +332,7 @@ def get_top_5_branches():
             """)
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_top_5_branches: {e}")
+        logger.error(f"get_top_5_branches: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -370,7 +349,7 @@ def get_today_statistics():
             """, (shamsi_today,))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"❌ get_today_statistics: {e}")
+        logger.error(f"get_today_statistics: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -388,7 +367,7 @@ def get_yesterday_vs_today():
             """, (shamsi_today, shamsi_yesterday))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"❌ get_yesterday_vs_today: {e}")
+        logger.error(f"get_yesterday_vs_today: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -407,7 +386,7 @@ def get_detailed_report(shamsi_date):
             """, (shamsi_date,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_detailed_report: {e}")
+        logger.error(f"get_detailed_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -429,7 +408,7 @@ def get_branch_performance(branch_id, days=10):
             """, (branch_id, days))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_branch_performance: {e}")
+        logger.error(f"get_branch_performance: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -450,7 +429,7 @@ def get_daily_comparison():
             """)
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_daily_comparison: {e}")
+        logger.error(f"get_daily_comparison: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -469,30 +448,15 @@ def get_deputy_vs_others_ratio():
             """, (get_shamsi_date(),))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"❌ get_deputy_vs_others_ratio: {e}")
+        logger.error(f"get_deputy_vs_others_ratio: {e}")
         return None
     finally:
         return_db_connection(conn)
 
-def get_collection_by_id(collection_id):
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT c.id, b.name, c.shamsi_date, c.deputy_amount, c.others_amount, c.total_amount, u.full_name
-                FROM collections c
-                JOIN branches b ON c.branch_id = b.id
-                JOIN users u ON c.recorded_by = u.id
-                WHERE c.id = %s
-            """, (collection_id,))
-            return cur.fetchone()
-    except Exception as e:
-        logger.error(f"❌ get_collection_by_id: {e}")
-        return None
-    finally:
-        return_db_connection(conn)
+# ========== توابع جدید ==========
 
 def get_report_by_date(shamsi_date):
+    """گزارش کل استان برای یک تاریخ خاص"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -506,59 +470,176 @@ def get_report_by_date(shamsi_date):
             """, (shamsi_date,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"❌ get_report_by_date: {e}")
+        logger.error(f"get_report_by_date: {e}")
+        return []
+    finally:
+        return_db_connection(conn)
+
+def get_branch_report_by_date(branch_id, shamsi_date):
+    """گزارش یک شعبه برای یک تاریخ خاص"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT deputy_amount, others_amount, total_amount
+                FROM collections
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"get_branch_report_by_date: {e}")
+        return None
+    finally:
+        return_db_connection(conn)
+
+def get_branch_full_history(branch_id):
+    """تاریخچه کامل یک شعبه (همه روزها)"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT shamsi_date, deputy_amount, others_amount, total_amount
+                FROM collections
+                WHERE branch_id = %s
+                ORDER BY shamsi_date DESC
+            """, (branch_id,))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_branch_full_history: {e}")
+        return []
+    finally:
+        return_db_connection(conn)
+
+def get_best_worst_days(limit=5):
+    """بهترین و بدترین روزهای استان از نظر کل وصولی"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT shamsi_date, SUM(total_amount) as total
+                FROM collections
+                GROUP BY shamsi_date
+                ORDER BY total DESC
+                LIMIT %s
+            """, (limit,))
+            best = cur.fetchall()
+            cur.execute("""
+                SELECT shamsi_date, SUM(total_amount) as total
+                FROM collections
+                GROUP BY shamsi_date
+                ORDER BY total ASC
+                LIMIT %s
+            """, (limit,))
+            worst = cur.fetchall()
+            return best, worst
+    except Exception as e:
+        logger.error(f"get_best_worst_days: {e}")
+        return [], []
+    finally:
+        return_db_connection(conn)
+
+def get_total_summary():
+    """مجموع کل وصولی هر شعبه از ابتدا"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT b.name, SUM(c.total_amount) as total
+                FROM collections c
+                JOIN branches b ON c.branch_id = b.id
+                GROUP BY b.name
+                ORDER BY total DESC
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_total_summary: {e}")
         return []
     finally:
         return_db_connection(conn)
 
 # ============================================
-# 📨 Message Handlers
+# پردازش پیام‌ها (با منطق بهبودیافته)
 # ============================================
-
 def handle_message(message):
     try:
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
-        last_activity[chat_id] = time.time()
-
-        user = find_user_by_telegram_id(chat_id)
+        
+        # وضعیت فعلی کاربر
         user_state = user_states.get(chat_id, {"state": "LOGGED_OUT"})
+        current_state = user_state.get("state", "LOGGED_OUT")
 
-        # ------------------- ورود کاربر جدید -------------------
-        if not user:
-            if user_state.get("state") == "WAITING_FOR_EMP_NUM":
-                emp_user = find_user_by_employee_number(text)
-                if emp_user:
-                    db_id, emp_num, name, role, title, branch_id, branch_name = emp_user
-                    update_user_telegram_id(db_id, chat_id)
-                    user_states[chat_id] = {"state": "LOGGED_IN"}
-                    welcome_msg = (
-                        f"✅ هویت شما تایید شد.\n\n"
-                        f"👤 {name}\n"
-                        f"🏢 {title}\n"
-                        f"🏭 واحد: {branch_name or 'ستاد استان'}\n"
-                        f"🔑 شماره کارمندی: {emp_num}\n"
-                        f"⏰ زمان ورود: {get_shamsi_date_formatted(get_shamsi_date())} {get_iran_time().strftime('%H:%M:%S')}\n\n"
-                        f"خوش آمدید! 👋"
-                    )
-                    keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
-                    send_message(chat_id, welcome_msg, keyboard)
-                else:
-                    send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
-                return
-            else:
+        # اگر کاربر لاگین نکرده باشد یا state خروج باشد
+        if current_state == "LOGGED_OUT" or current_state == "WAITING_FOR_EMP_NUM":
+            # اگر پیام "/start" یا هر چیز دیگری باشد، شماره کارمندی می‌خواهیم
+            if current_state != "WAITING_FOR_EMP_NUM":
                 user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
-                send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 جهت دسترسی، لطفاً شماره کارمندی خود را ارسال کنید:")
+                send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 لطفاً شماره کارمندی خود را ارسال کنید:")
                 return
+            # در حالت WAITING_FOR_EMP_NUM
+            emp_user = find_user_by_employee_number(text)
+            if emp_user:
+                db_id, emp_num, name, role, title, branch_id, branch_name = emp_user
+                update_user_telegram_id(db_id, chat_id)
+                # ذخیره اطلاعات کاربر در state برای دسترسی سریع
+                user_states[chat_id] = {
+                    "state": "LOGGED_IN",
+                    "user_data": {
+                        "db_id": db_id,
+                        "emp_num": emp_num,
+                        "name": name,
+                        "role": role,
+                        "title": title,
+                        "branch_id": branch_id,
+                        "branch_name": branch_name
+                    }
+                }
+                welcome_msg = (
+                    f"✅ هویت شما تایید شد.\n\n"
+                    f"👤 {name}\n"
+                    f"🏢 {title}\n"
+                    f"🏭 واحد: {branch_name or 'ستاد استان'}\n"
+                    f"🔑 شماره کارمندی: {emp_num}\n"
+                    f"⏰ زمان ورود: {get_shamsi_date_formatted(get_shamsi_date())} {get_iran_time().strftime('%H:%M:%S')}\n\n"
+                    f"خوش آمدید! 👋"
+                )
+                keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
+                send_message(chat_id, welcome_msg, keyboard)
+            else:
+                send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
+            return
 
-        # کاربر احراز شده
-        user_db_id, employee_number, full_name, role, title, branch_id, branch_name = user
-        state = user_state.get("state", "LOGGED_IN")
+        # کاربر لاگین کرده است
+        user_data = user_state.get("user_data", {})
+        if not user_data:
+            # اگر اطلاعات کاربر در state نباشد، از دیتابیس می‌خوانیم
+            user = find_user_by_telegram_id(chat_id)
+            if not user:
+                # اگر کاربر در دیتابیس نباشد (احتمالاً حذف شده)، او را به حالت ورود می‌فرستیم
+                user_states[chat_id] = {"state": "LOGGED_OUT"}
+                send_message(chat_id, "⚠️ نشست شما منقضی شده است. لطفاً شماره کارمندی خود را وارد کنید.")
+                return
+            db_id, emp_num, name, role, title, branch_id, branch_name = user
+            user_data = {
+                "db_id": db_id,
+                "emp_num": emp_num,
+                "name": name,
+                "role": role,
+                "title": title,
+                "branch_id": branch_id,
+                "branch_name": branch_name
+            }
+            user_states[chat_id]["user_data"] = user_data
 
-        # ---------- مدیریت وضعیت‌های ورودی (ثبت مبالغ) ----------
-        if state == "WAITING_FOR_DEPUTY_AMOUNT":
+        role = user_data["role"]
+        branch_id = user_data["branch_id"]
+        branch_name = user_data["branch_name"]
+        user_db_id = user_data["db_id"]
+
+        # مدیریت وضعیت‌های ورودی (ثبت مبلغ)
+        if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
             if text == "🔙 انصراف":
-                user_states[chat_id] = {"state": "LOGGED_IN"}
+                user_states[chat_id]["state"] = "LOGGED_IN"
                 keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
                 send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
                 return
@@ -566,19 +647,17 @@ def handle_message(message):
                 amount = int(text.replace(',', '').replace('،', ''))
                 if amount < 0:
                     raise ValueError
-                user_states[chat_id] = {
-                    "state": "WAITING_FOR_OTHERS_AMOUNT",
-                    "deputy_amount": amount,
-                    "edit_mode": user_state.get("edit_mode", False)
-                }
+                user_states[chat_id]["state"] = "WAITING_FOR_OTHERS_AMOUNT"
+                user_states[chat_id]["deputy_amount"] = amount
+                user_states[chat_id]["edit_mode"] = user_state.get("edit_mode", False)
                 send_message(chat_id, "✏️ اکنون میزان وصولی سایر همکاران شعبه را وارد کنید (برحسب ریال):", get_cancel_keyboard())
             except ValueError:
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت وارد کنید.")
             return
 
-        elif state == "WAITING_FOR_OTHERS_AMOUNT":
+        elif current_state == "WAITING_FOR_OTHERS_AMOUNT":
             if text == "🔙 انصراف":
-                user_states[chat_id] = {"state": "LOGGED_IN"}
+                user_states[chat_id]["state"] = "LOGGED_IN"
                 keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
                 send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
                 return
@@ -597,7 +676,7 @@ def handle_message(message):
                     user_id=user_db_id,
                     update_existing=is_edit
                 )
-                user_states[chat_id] = {"state": "LOGGED_IN"}
+                user_states[chat_id]["state"] = "LOGGED_IN"
                 if success:
                     total = deputy_amount + others_amount
                     status_text = "✏️ بروزرسانی" if is_edit else "✅ ثبت"
@@ -621,79 +700,57 @@ def handle_message(message):
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت وارد کنید.")
             return
 
-        elif state == "WAITING_FOR_EDIT_CONFIRMATION":
+        elif current_state == "WAITING_FOR_EDIT_CONFIRMATION":
             if text == "📝 بله، ویرایش شود":
-                user_states[chat_id] = {"state": "WAITING_FOR_DEPUTY_AMOUNT", "edit_mode": True}
+                user_states[chat_id]["state"] = "WAITING_FOR_DEPUTY_AMOUNT"
+                user_states[chat_id]["edit_mode"] = True
                 send_message(chat_id, "✏️ لطفاً مبلغ جدید وصولی خود (معاون) را وارد کنید:", get_cancel_keyboard())
             else:
-                user_states[chat_id] = {"state": "LOGGED_IN"}
+                user_states[chat_id]["state"] = "LOGGED_IN"
                 keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
                 send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
             return
 
-        # ---------- دستورات ویژه ادمین (حذف رکورد) ----------
-        if role == 'admin' and state == "WAITING_FOR_DELETE_ID":
+        # ====== دستورات جدید: گزارش تاریخ خاص برای معاونین ======
+        if role == 'deputy' and current_state == "WAITING_FOR_BRANCH_DATE":
             if text == "🔙 انصراف":
-                user_states[chat_id] = {"state": "LOGGED_IN"}
-                send_message(chat_id, "❌ عملیات لغو شد.", get_admin_keyboard())
+                user_states[chat_id]["state"] = "LOGGED_IN"
+                send_message(chat_id, "❌ عملیات لغو شد.", get_deputy_keyboard())
                 return
-            try:
-                col_id = int(text.strip())
-                record = get_collection_by_id(col_id)
-                if not record:
-                    send_message(chat_id, "❌ رکوردی با این شناسه یافت نشد.")
-                    user_states[chat_id] = {"state": "LOGGED_IN"}
-                    send_message(chat_id, "به منوی اصلی بازگشتید.", get_admin_keyboard())
-                    return
-                # تأیید نهایی
-                msg = (
-                    f"⚠️ آیا از حذف رکورد زیر اطمینان دارید؟\n"
-                    f"شناسه: {record[0]}\n"
-                    f"شعبه: {record[1]}\n"
-                    f"تاریخ: {get_shamsi_date_formatted(record[2])}\n"
-                    f"مبلغ کل: {record[5]:,.0f} ریال\n"
-                    f"ثبت‌کننده: {record[6]}\n\n"
-                    f"برای تأیید، عدد {col_id} را دوباره وارد کنید."
-                )
-                user_states[chat_id] = {"state": "WAITING_FOR_DELETE_CONFIRM", "delete_id": col_id}
-                send_message(chat_id, msg, get_cancel_keyboard())
-            except ValueError:
-                send_message(chat_id, "❌ شناسه را به صورت عدد وارد کنید.")
-            return
-
-        if role == 'admin' and state == "WAITING_FOR_DELETE_CONFIRM":
-            if text == "🔙 انصراف":
-                user_states[chat_id] = {"state": "LOGGED_IN"}
-                send_message(chat_id, "❌ عملیات لغو شد.", get_admin_keyboard())
-                return
-            try:
-                confirm_id = int(text.strip())
-                expected_id = user_state.get("delete_id")
-                if confirm_id == expected_id:
-                    if delete_collection(expected_id):
-                        send_message(chat_id, f"✅ رکورد با شناسه {expected_id} با موفقیت حذف شد.", get_admin_keyboard())
-                    else:
-                        send_message(chat_id, "❌ خطا در حذف رکورد.", get_admin_keyboard())
+            parts = text.split('/')
+            if len(parts) == 3 and all(p.isdigit() for p in parts):
+                shamsi_date = text
+                record = get_branch_report_by_date(branch_id, shamsi_date)
+                if record:
+                    dep, oth, total = record
+                    msg = (
+                        f"📋 گزارش شعبه {branch_name} برای تاریخ {get_shamsi_date_formatted(shamsi_date)}\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"👤 وصولی معاون: {int(dep):,.0f} ریال\n"
+                        f"👥 وصولی همکاران: {int(oth):,.0f} ریال\n"
+                        f"💰 جمع کل: {int(total):,.0f} ریال"
+                    )
+                    send_message(chat_id, msg, get_deputy_keyboard())
                 else:
-                    send_message(chat_id, "❌ شناسه تأیید اشتباه است. عملیات لغو شد.", get_admin_keyboard())
-                user_states[chat_id] = {"state": "LOGGED_IN"}
-            except ValueError:
-                send_message(chat_id, "❌ شناسه را به صورت عدد وارد کنید.")
+                    send_message(chat_id, f"📭 هیچ داده‌ای برای تاریخ {shamsi_date} یافت نشد.", get_deputy_keyboard())
+            else:
+                send_message(chat_id, "❌ فرمت تاریخ را به صورت YYYY/MM/DD وارد کنید (مثلاً 1403/01/15).")
+                return
+            user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ---------- دستورات ادمین: گزارش تاریخ خاص ----------
-        if role == 'admin' and state == "WAITING_FOR_REPORT_DATE":
+        # ====== دستورات جدید: گزارش تاریخ خاص برای ادمین ======
+        if role == 'admin' and current_state == "WAITING_FOR_ADMIN_DATE":
             if text == "🔙 انصراف":
-                user_states[chat_id] = {"state": "LOGGED_IN"}
+                user_states[chat_id]["state"] = "LOGGED_IN"
                 send_message(chat_id, "❌ عملیات لغو شد.", get_admin_keyboard())
                 return
-            # بررسی فرمت YYYY/MM/DD
             parts = text.split('/')
             if len(parts) == 3 and all(p.isdigit() for p in parts):
                 shamsi_date = text
                 report = get_report_by_date(shamsi_date)
                 if report:
-                    msg = f"📅 گزارش تاریخ {get_shamsi_date_formatted(shamsi_date)}\n━━━━━━━━━━━━━━━━━━\n\n"
+                    msg = f"📅 گزارش استان برای تاریخ {get_shamsi_date_formatted(shamsi_date)}\n━━━━━━━━━━━━━━━━━━\n\n"
                     total_all = 0
                     for idx, row in enumerate(report, 1):
                         dep = int(safe_format(row[1]))
@@ -704,24 +761,23 @@ def handle_message(message):
                         msg += f"   👥 همکاران: {oth:,.0f}\n"
                         msg += f"   💰 جمع: {tot:,.0f} ریال\n\n"
                         total_all += tot
-                    msg += f"━━━━━━━━━━━━━━━━━━\n"
-                    msg += f"💰 جمع کل: {total_all:,.0f} ریال"
+                    msg += f"━━━━━━━━━━━━━━━━━━\n💰 جمع کل استان: {total_all:,.0f} ریال"
                     send_message(chat_id, msg, get_admin_keyboard())
                 else:
                     send_message(chat_id, f"📭 هیچ داده‌ای برای تاریخ {shamsi_date} یافت نشد.", get_admin_keyboard())
             else:
-                send_message(chat_id, "❌ فرمت تاریخ را به صورت YYYY/MM/DD وارد کنید (مثلاً 1403/01/15).")
+                send_message(chat_id, "❌ فرمت تاریخ را به صورت YYYY/MM/DD وارد کنید.")
                 return
-            user_states[chat_id] = {"state": "LOGGED_IN"}
+            user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ---------- خروج از سیستم ----------
+        # ====== خروج ======
         if text == "🔙 خروج":
-            user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
+            user_states[chat_id] = {"state": "LOGGED_OUT"}  # پاک کردن کامل state
             send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.")
             return
 
-        # ---------- راهنما ----------
+        # ====== راهنما ======
         if text == "❓ راهنما":
             help_text = (
                 "📌 **راهنمای ربات وصول مطالبات**\n\n"
@@ -729,7 +785,9 @@ def handle_message(message):
                 "   • ثبت وصولی روزانه (با قابلیت ویرایش)\n"
                 "   • مشاهده گزارش ۱۰ روز اخیر شعبه\n"
                 "   • مقایسه عملکرد روزانه شعبه\n"
-                "   • مشاهده ثبت امروز (در صورت وجود)\n\n"
+                "   • مشاهده ثبت امروز\n"
+                "   • گزارش یک تاریخ خاص برای شعبه خود\n"
+                "   • مشاهده تاریخچه کامل شعبه\n\n"
                 "🔹 **کاربران ارشد (ادمین):**\n"
                 "   • گزارش امروز (همه شعب)\n"
                 "   • گزارش ۱۰ روز اخیر استان\n"
@@ -737,23 +795,23 @@ def handle_message(message):
                 "   • آمار مفصل امروز\n"
                 "   • مقایسه روزانه ۷ روز اخیر\n"
                 "   • تحلیل عملکرد (نسبت معاون/سایر)\n"
-                "   • گزارش تاریخ خاص (وارد کردن YYYY/MM/DD)\n"
-                "   • حذف رکورد (با شناسه)\n\n"
+                "   • گزارش تاریخ خاص برای کل استان\n"
+                "   • نمایش بهترین/بدترین روزهای استان\n\n"
                 "🔸 در هر مرحله می‌توانید با دکمه «انصراف» به منو برگردید.\n"
-                "🔸 برای خروج کامل از سیستم، گزینه «خروج» را انتخاب کنید."
+                "🔸 برای خروج کامل، گزینه «خروج» را انتخاب کنید."
             )
             keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
             send_message(chat_id, help_text, keyboard)
             return
 
-        # ---------- منوی معاونین ----------
+        # ====== منوی معاونین ======
         if role == 'deputy':
             if text == "💰 ثبت وصولی روزانه":
                 shamsi_today = get_shamsi_date()
                 existing = check_existing_collection(branch_id, shamsi_today)
                 if existing:
                     col_id, dep_val, oth_val = existing
-                    user_states[chat_id] = {"state": "WAITING_FOR_EDIT_CONFIRMATION"}
+                    user_states[chat_id]["state"] = "WAITING_FOR_EDIT_CONFIRMATION"
                     confirm_keyboard = {
                         "keyboard": [[{"text": "📝 بله، ویرایش شود"}, {"text": "❌ خیر، لغو شود"}]],
                         "resize_keyboard": True
@@ -772,7 +830,8 @@ def handle_message(message):
                     )
                     send_message(chat_id, msg, confirm_keyboard)
                 else:
-                    user_states[chat_id] = {"state": "WAITING_FOR_DEPUTY_AMOUNT", "edit_mode": False}
+                    user_states[chat_id]["state"] = "WAITING_FOR_DEPUTY_AMOUNT"
+                    user_states[chat_id]["edit_mode"] = False
                     send_message(chat_id, "📝 لطفاً میزان وصولی خود (معاون) را وارد کنید:", get_cancel_keyboard())
 
             elif text == "📊 گزارش وصولی":
@@ -827,10 +886,34 @@ def handle_message(message):
                     send_message(chat_id, msg)
                 else:
                     send_message(chat_id, f"📭 امروز ({shamsi_today}) هنوز ثبت نشده است.")
+
+            elif text == "📅 گزارش تاریخ خاص":
+                user_states[chat_id]["state"] = "WAITING_FOR_BRANCH_DATE"
+                send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً 1403/01/15):", get_cancel_keyboard())
+
+            elif text == "📊 تاریخچه کامل":
+                history = get_branch_full_history(branch_id)
+                if history:
+                    msg = f"📊 تاریخچه کامل شعبه {branch_name}\n━━━━━━━━━━━━━━━━━━\n\n"
+                    total_all = 0
+                    for i, row in enumerate(history, 1):
+                        dep = int(safe_format(row[1]))
+                        oth = int(safe_format(row[2]))
+                        tot = int(safe_format(row[3]))
+                        msg += f"{i}. 📅 {get_shamsi_date_formatted(row[0])}\n"
+                        msg += f"   👤 معاون: {dep:,.0f}\n"
+                        msg += f"   👥 همکاران: {oth:,.0f}\n"
+                        msg += f"   💰 جمع: {tot:,.0f} ریال\n\n"
+                        total_all += tot
+                    msg += f"━━━━━━━━━━━━━━━━━━\n"
+                    msg += f"📈 جمع کل از ابتدا: {total_all:,.0f} ریال"
+                    send_message(chat_id, msg)
+                else:
+                    send_message(chat_id, "📭 هیچ سابقه‌ای برای شعبه شما وجود ندارد.")
             else:
                 send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_deputy_keyboard())
 
-        # ---------- منوی ادمین ----------
+        # ====== منوی ادمین ======
         elif role == 'admin':
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
@@ -897,7 +980,7 @@ def handle_message(message):
                 else:
                     send_message(chat_id, "🏆 داده کافی برای رتبه‌بندی وجود ندارد.")
 
-            elif text == "💹 آمار مفصل":
+            elif text == "💹 آمار مفصل امروز":
                 shamsi_today = get_shamsi_date()
                 report = get_detailed_report(shamsi_today)
                 if report:
@@ -951,12 +1034,24 @@ def handle_message(message):
                 send_message(chat_id, msg)
 
             elif text == "📅 گزارش تاریخ خاص":
-                user_states[chat_id] = {"state": "WAITING_FOR_REPORT_DATE"}
+                user_states[chat_id]["state"] = "WAITING_FOR_ADMIN_DATE"
                 send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً 1403/01/15):", get_cancel_keyboard())
 
-            elif text == "🗑 حذف رکورد":
-                user_states[chat_id] = {"state": "WAITING_FOR_DELETE_ID"}
-                send_message(chat_id, "🗑 لطفاً شناسه (ID) رکورد مورد نظر برای حذف را وارد کنید.\n\nبرای پیدا کردن شناسه، از گزارش‌های مفصل استفاده کنید.", get_cancel_keyboard())
+            elif text == "📊 بهترین/بدترین روز":
+                best, worst = get_best_worst_days(5)
+                msg = "📊 **بهترین روزهای استان**\n━━━━━━━━━━━━━━━━━━\n"
+                if best:
+                    for i, row in enumerate(best, 1):
+                        msg += f"{i}. 📅 {get_shamsi_date_formatted(row[0])} -> {int(row[1]):,.0f} ریال\n"
+                else:
+                    msg += "هیچ داده‌ای موجود نیست.\n"
+                msg += "\n📊 **بدترین روزهای استان**\n━━━━━━━━━━━━━━━━━━\n"
+                if worst:
+                    for i, row in enumerate(worst, 1):
+                        msg += f"{i}. 📅 {get_shamsi_date_formatted(row[0])} -> {int(row[1]):,.0f} ریال\n"
+                else:
+                    msg += "هیچ داده‌ای موجود نیست."
+                send_message(chat_id, msg)
 
             else:
                 send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_admin_keyboard())
@@ -965,17 +1060,16 @@ def handle_message(message):
             send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید.", get_admin_keyboard() if role == 'admin' else get_deputy_keyboard())
 
     except Exception as e:
-        logger.error(f"❌ Error in handle_message: {e}", exc_info=True)
+        logger.error(f"❌ handle_message error: {e}", exc_info=True)
         try:
-            send_message(message['chat']['id'], "❌ خطایی در پردازش پیام رخ داد. لطفاً مجدداً تلاش کنید.")
+            send_message(message['chat']['id'], "❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         except:
             pass
 
 # ============================================
-# ♻️ Keep-Alive Thread
+# Keep-Alive Thread
 # ============================================
 def keep_alive_loop():
-    """هر ۶۰ ثانیه یک درخواست getMe می‌فرستد تا اتصال زنده بماند"""
     while True:
         try:
             time.sleep(60)
@@ -989,15 +1083,14 @@ def keep_alive_loop():
             logger.error(f"❌ Keep-alive error: {e}")
 
 # ============================================
-# 🚀 Main Polling Loop
+# Main Polling Loop
 # ============================================
 def main():
-    global requests_session  # <--- اصلاح: اضافه کردن global در ابتدای تابع
+    global requests_session
     offset = 0
     logger.info("🤖 Bot started successfully!")
     logger.info("📡 Waiting for messages...")
 
-    # راه‌اندازی ترد keep-alive
     threading.Thread(target=keep_alive_loop, daemon=True).start()
 
     while True:
@@ -1030,7 +1123,7 @@ def main():
             time.sleep(2)
         except requests.exceptions.ConnectionError as e:
             logger.error(f"❌ Connection error: {e} – recreating session...")
-            requests_session = create_session()  # بازسازی session
+            requests_session = create_session()
             time.sleep(5)
         except Exception as e:
             logger.error(f"❌ Unexpected error in main loop: {e}")
