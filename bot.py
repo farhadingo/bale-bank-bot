@@ -21,7 +21,7 @@ if not BOT_TOKEN or not DB_URL:
     logger.error("BOT_TOKEN and DB_URL environment variables are required!")
     exit(1)
 
-BASE_URL = f"https://api.bale.ai/bot{BOT_TOKEN}"
+BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
 # راه‌اندازی Connection Pool برای مدیریت بهینه اتصال به دیتابیس Supabase
 try:
