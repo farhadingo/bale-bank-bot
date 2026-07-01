@@ -9,7 +9,7 @@ from datetime import datetime
 # تنظیمات اصلی
 # ==========================================
 BOT_TOKEN = "160966979:s3cnOPW18kZcUJRSpIUp8r68jnuvjUK72wQ"
-DB_CONNECTION_STRING = "postgresql://postgres:Farhad35667900_HERE@ipv4.db.uvpwvhmwuklqqmhgdorx.supabase.co:5432/postgres"
+DB_CONNECTION_STRING = "postgresql://postgres.uvpwvhmwuklqqmhgdorx:[Farhad35667900]@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres"
 
 BALE_API = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 
