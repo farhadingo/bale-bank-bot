@@ -184,7 +184,7 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================
-# 📊 Database Functions (افزوده‌ها و بهبودها)
+# 📊 Database Functions
 # ============================================
 
 def find_user_by_employee_number(emp_num):
@@ -512,7 +512,7 @@ def get_report_by_date(shamsi_date):
         return_db_connection(conn)
 
 # ============================================
-# 📨 Message Handlers (با رفع ارسال دوبله)
+# 📨 Message Handlers
 # ============================================
 
 def handle_message(message):
@@ -992,6 +992,7 @@ def keep_alive_loop():
 # 🚀 Main Polling Loop
 # ============================================
 def main():
+    global requests_session  # <--- اصلاح: اضافه کردن global در ابتدای تابع
     offset = 0
     logger.info("🤖 Bot started successfully!")
     logger.info("📡 Waiting for messages...")
@@ -1029,8 +1030,7 @@ def main():
             time.sleep(2)
         except requests.exceptions.ConnectionError as e:
             logger.error(f"❌ Connection error: {e} – recreating session...")
-            global requests_session
-            requests_session = create_session()
+            requests_session = create_session()  # بازسازی session
             time.sleep(5)
         except Exception as e:
             logger.error(f"❌ Unexpected error in main loop: {e}")
