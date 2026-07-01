@@ -2,6 +2,8 @@ import os
 import time
 import logging
 import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
@@ -13,15 +15,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# بارگذاری متغیرهای محیطی
+# بارگذاری متغیر��ای محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN or not DB_URL:
-    logger.error("BOT_TOKEN and DB_URL environment variables are required!")
+    logger.error("❌ BOT_TOKEN and DATABASE_URL environment variables are required!")
+    logger.error("❌ Please add them in Render Environment Variables section")
     exit(1)
 
+# ✅ URL صحیح Bale API
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
+
+logger.info(f"✅ Environment variables loaded successfully")
+logger.info(f"✅ Connecting to Bale API: {BASE_URL}")
+
+# ============================================
+# 🔧 Setup Keep-Alive Session
+# ============================================
+def create_session_with_keep_alive():
+    """ایجاد session با Keep-Alive و Retry Logic"""
+    session = requests.Session()
+    
+    # تنظیمات Keep-Alive
+    session.headers.update({
+        'Connection': 'keep-alive',
+        'User-Agent': 'Bale-Bank-Bot/1.0'
+    })
+    
+    # تنظیمات Retry (برای خطاهای موقتی)
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+    )
+    
+    # Adapter برای HTTP و HTTPS
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=10,
+        pool_maxsize=10
+    )
+    
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
+
+# ایجاد session global
+requests_session = create_session_with_keep_alive()
 
 # راه‌اندازی Connection Pool برای مدیریت بهینه اتصال به دیتابیس Supabase
 try:
@@ -110,7 +153,8 @@ def send_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        # استفاده از session با Keep-Alive
+        res = requests_session.post(url, json=payload, timeout=15)
         return res.json()
     except Exception as e:
         logger.error(f"❌ Error sending message to {chat_id}: {e}")
@@ -120,7 +164,7 @@ def get_deputy_keyboard():
     """کیبورد برای معاونین شعب"""
     return {
         "keyboard": [
-            [{"text": "💰 ثبت وصولی روزانه"}, {"text": "📊 گزارش وصولی"}],
+            [{"text": "💰 ثبت وصولی روزانه"}, {"text": "📊 گزارش وصو��ی"}],
             [{"text": "📈 مقایسه عملکرد"}, {"text": "🔙 خروج"}]
         ],
         "resize_keyboard": True
@@ -458,7 +502,7 @@ def handle_message(message):
                 keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
                 send_message(chat_id, welcome_msg, keyboard)
             else:
-                send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شمار�� کارمندی صحیح خود را بفرستید:")
+                send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
             return
         else:
             user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
@@ -605,7 +649,7 @@ def handle_message(message):
                         f"   💰 جمع: {row[3]:,.0f} ریال\n\n"
                     )
                     total_sum += row[3]
-                msg += f"━━━━━━━━━━━━━━��━━━\n"
+                msg += f"━━━━━━━━━━��━━━━━━━\n"
                 msg += f"📈 جمع ۱۰ روز: {total_sum:,.0f} ریال\n"
                 msg += f"📊 میانگین روزانه: {total_sum//len(report):,.0f} ریال"
                 send_message(chat_id, msg)
@@ -716,7 +760,7 @@ def handle_message(message):
             comparison = get_daily_comparison()
             if comparison:
                 msg = f"📉 مقایسه روزانه (۷ روز اخیر)\n"
-                msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                msg += f"━━━━━━━━━━━━━━━━���━\n\n"
                 for row in comparison:
                     msg += f"📅 {get_shamsi_date_formatted(row[0])}\n"
                     msg += f"    🏢 شعب ثبت‌کننده: {row[1]}\n"
@@ -761,13 +805,19 @@ def handle_message(message):
 
 def main():
     offset = 0
-    logger.info("🤖 Bot initiated using Polling mechanism...")
+    logger.info("🤖 Bot started successfully!")
+    logger.info(f"🤖 Bale API Base URL: {BASE_URL}")
+    logger.info("📡 Waiting for messages...")
+    logger.info("✅ Keep-Alive activated")
+    logger.info("✅ Timeout: 45 seconds")
     
     while True:
         try:
             url = f"{BASE_URL}/getUpdates"
-            params = {"offset": offset, "timeout": 20}
-            res = requests.get(url, params=params, timeout=25)
+            # ✅ بزرگ‌تر کردن timeout برای جلوگیری از قطع اتصال
+            params = {"offset": offset, "timeout": 45}
+            # استفاده از session برای Keep-Alive
+            res = requests_session.get(url, params=params, timeout=60)
             
             if res.status_code == 200:
                 data = res.json()
@@ -779,13 +829,23 @@ def main():
                             handle_message(update["message"])
                         
                         offset = update_id + 1
+                else:
+                    logger.warning(f"⚠️ Response not ok: {data}")
+                    
             elif res.status_code == 409:
                 logger.warning("⚠️ Conflict (409) detected. Retrying in 5 seconds...")
                 time.sleep(5)
             else:
                 logger.error(f"❌ Failed to fetch updates. Status code: {res.status_code}")
+                logger.error(f"Response: {res.text}")
                 time.sleep(5)
                 
+        except requests.exceptions.Timeout:
+            logger.warning("⚠️ Timeout occurred (expected for long polling). Reconnecting...")
+            time.sleep(2)
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"❌ Connection error: {e}")
+            time.sleep(5)
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Network error in polling loop: {e}")
             time.sleep(5)
