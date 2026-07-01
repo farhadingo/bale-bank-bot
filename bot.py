@@ -15,15 +15,20 @@ logger = logging.getLogger(__name__)
 
 # بارگذاری متغیرهای محیطی
 BOT_TOKEN = os.getenv("160966979:s3cnOPW18kZcUJRSpIUp8r68jnuvjUK72wQ")
-DB_URL = os.getenv("postgresql://postgres.uvpwvhmwuklqqmhgdorx:Farhad35667900@aws-1-ap-southeast-2.pooler.supabase.com:5432/postgres?sslmode=require")
+DB_URL = os.getenv("postgresql://postgres.uvpwvhmwuklqqmhgdorx:Farhad35667900@aws-1-ap-southeast-2.pooler.supabase.com:6543/postgres")
+
+if not BOT_TOKEN or not DB_URL:
+    logger.error("BOT_TOKEN and DB_URL environment variables are required!")
+    exit(1)
+
 BASE_URL = f"https://api.bale.ai/bot{BOT_TOKEN}"
 
 # راه‌اندازی Connection Pool برای مدیریت بهینه اتصال به دیتابیس Supabase
 try:
     db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DB_URL)
-    logger.info("Database connection pool established successfully.")
+    logger.info("✅ Database connection pool established successfully.")
 except Exception as e:
-    logger.error(f"Failed to create database connection pool: {e}")
+    logger.error(f"❌ Failed to create database connection pool: {e}")
     db_pool = None
 
 # مدیریت وضعیت کاربران در حافظه موقت (State Machine)
@@ -108,7 +113,7 @@ def send_message(chat_id, text, reply_markup=None):
         res = requests.post(url, json=payload, timeout=10)
         return res.json()
     except Exception as e:
-        logger.error(f"Error sending message to {chat_id}: {e}")
+        logger.error(f"❌ Error sending message to {chat_id}: {e}")
         return None
 
 def get_deputy_keyboard():
@@ -147,7 +152,7 @@ def find_user_by_employee_number(emp_num):
             """, (emp_num,))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error in find_user_by_employee_number: {e}")
+        logger.error(f"❌ Error in find_user_by_employee_number: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -159,7 +164,7 @@ def update_user_telegram_id(user_db_id, chat_id):
             cur.execute("UPDATE users SET telegram_id = %s WHERE id = %s", (chat_id, user_db_id))
             conn.commit()
     except Exception as e:
-        logger.error(f"Error in update_user_telegram_id: {e}")
+        logger.error(f"❌ Error in update_user_telegram_id: {e}")
     finally:
         return_db_connection(conn)
 
@@ -175,7 +180,7 @@ def find_user_by_telegram_id(chat_id):
             """, (chat_id,))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error in find_user_by_telegram_id: {e}")
+        logger.error(f"❌ Error in find_user_by_telegram_id: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -192,7 +197,7 @@ def check_existing_collection(branch_id, shamsi_date):
             """, (branch_id, shamsi_date))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error in check_existing_collection: {e}")
+        logger.error(f"❌ Error in check_existing_collection: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -217,7 +222,7 @@ def save_or_update_collection(branch_id, deputy_amount, others_amount, shamsi_da
             conn.commit()
             return True
     except Exception as e:
-        logger.error(f"Error in save_or_update_collection: {e}")
+        logger.error(f"❌ Error in save_or_update_collection: {e}")
         return False
     finally:
         return_db_connection(conn)
@@ -236,7 +241,7 @@ def get_branch_10_day_report(branch_id):
             """, (branch_id,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_branch_10_day_report: {e}")
+        logger.error(f"❌ Error in get_branch_10_day_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -255,7 +260,7 @@ def get_today_province_report(shamsi_date):
             """, (shamsi_date,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_today_province_report: {e}")
+        logger.error(f"❌ Error in get_today_province_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -274,7 +279,7 @@ def get_province_10_day_report():
             """)
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_province_10_day_report: {e}")
+        logger.error(f"❌ Error in get_province_10_day_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -294,7 +299,7 @@ def get_top_5_branches():
             """)
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_top_5_branches: {e}")
+        logger.error(f"❌ Error in get_top_5_branches: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -312,7 +317,7 @@ def get_today_statistics():
             """, (shamsi_today,))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error in get_today_statistics: {e}")
+        logger.error(f"❌ Error in get_today_statistics: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -332,7 +337,7 @@ def get_yesterday_vs_today():
             """, (shamsi_today, shamsi_yesterday))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error in get_yesterday_vs_today: {e}")
+        logger.error(f"❌ Error in get_yesterday_vs_today: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -352,7 +357,7 @@ def get_detailed_report(shamsi_date):
             """, (shamsi_date,))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_detailed_report: {e}")
+        logger.error(f"❌ Error in get_detailed_report: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -374,7 +379,7 @@ def get_branch_performance(branch_id, days=10):
             """, (branch_id, days))
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_branch_performance: {e}")
+        logger.error(f"❌ Error in get_branch_performance: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -395,7 +400,7 @@ def get_daily_comparison():
             """)
             return cur.fetchall()
     except Exception as e:
-        logger.error(f"Error in get_daily_comparison: {e}")
+        logger.error(f"❌ Error in get_daily_comparison: {e}")
         return []
     finally:
         return_db_connection(conn)
@@ -415,7 +420,7 @@ def get_deputy_vs_others_ratio():
             """, (get_shamsi_date(),))
             return cur.fetchone()
     except Exception as e:
-        logger.error(f"Error in get_deputy_vs_others_ratio: {e}")
+        logger.error(f"❌ Error in get_deputy_vs_others_ratio: {e}")
         return None
     finally:
         return_db_connection(conn)
@@ -453,7 +458,7 @@ def handle_message(message):
                 keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
                 send_message(chat_id, welcome_msg, keyboard)
             else:
-                send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید:")
+                send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شمار�� کارمندی صحیح خود را بفرستید:")
             return
         else:
             user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
@@ -519,7 +524,7 @@ def handle_message(message):
                 success_msg = (
                     f"{status_text} شد.\n\n"
                     f"📊 خلاصه ثبت:\n"
-                    f"━━━━���━━━━━━━━━━\n"
+                    f"━━━━━━━━━━━━━━━\n"
                     f"🏢 شعبه: {branch_name}\n"
                     f"📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n"
                     f"👤 وصولی معاون: {deputy_amount:,.0f} ریال\n"
@@ -600,7 +605,7 @@ def handle_message(message):
                         f"   💰 جمع: {row[3]:,.0f} ریال\n\n"
                     )
                     total_sum += row[3]
-                msg += f"━━━━━━━━━━━━━━━━━━\n"
+                msg += f"━━━━━━━━━━━━━━��━━━\n"
                 msg += f"📈 جمع ۱۰ روز: {total_sum:,.0f} ریال\n"
                 msg += f"📊 میانگین روزانه: {total_sum//len(report):,.0f} ریال"
                 send_message(chat_id, msg)
@@ -756,7 +761,7 @@ def handle_message(message):
 
 def main():
     offset = 0
-    logger.info("Bot initiated using Polling mechanism...")
+    logger.info("🤖 Bot initiated using Polling mechanism...")
     
     while True:
         try:
@@ -775,17 +780,17 @@ def main():
                         
                         offset = update_id + 1
             elif res.status_code == 409:
-                logger.warning("Conflict (409) detected. Retrying in 5 seconds...")
+                logger.warning("⚠️ Conflict (409) detected. Retrying in 5 seconds...")
                 time.sleep(5)
             else:
-                logger.error(f"Failed to fetch updates. Status code: {res.status_code}")
+                logger.error(f"❌ Failed to fetch updates. Status code: {res.status_code}")
                 time.sleep(5)
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Network error in polling loop: {e}")
+            logger.error(f"❌ Network error in polling loop: {e}")
             time.sleep(5)
         except Exception as e:
-            logger.error(f"Unexpected error in main execution loop: {e}")
+            logger.error(f"❌ Unexpected error in main execution loop: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
