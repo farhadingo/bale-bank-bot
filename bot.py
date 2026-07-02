@@ -8,6 +8,7 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 import threading
+from flask import Flask, jsonify
 
 # ============================================
 # تنظیمات لاگین
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 # متغیرهای محیطی
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
+PORT = int(os.getenv("PORT", 10000))
 
 if not BOT_TOKEN or not DB_URL:
     logger.error("❌ BOT_TOKEN and DATABASE_URL are required!")
@@ -28,6 +30,22 @@ if not BOT_TOKEN or not DB_URL:
 
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 logger.info(f"✅ Bale API URL: {BASE_URL}")
+
+# ============================================
+# اپلیکیشن Flask برای Health Check
+# ============================================
+flask_app = Flask(__name__)
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": time.time()})
+
+@flask_app.route('/')
+def root():
+    return jsonify({"message": "Bot is running", "status": "active"})
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=PORT)
 
 # ============================================
 # Session با Keep-Alive
@@ -61,7 +79,7 @@ except Exception as e:
 # State Management
 # ============================================
 user_states = {}  # {chat_id: {"state": ..., "user_data": {...}}}
-processed_updates = set()  # برای جلوگیری از پردازش دوبله
+processed_updates = set()  # جلوگیری از پردازش دوبله
 
 def get_db_connection():
     if db_pool:
@@ -128,7 +146,7 @@ def safe_format(value, default="0"):
     return value if value is not None else default
 
 # ============================================
-# ارسال پیام (با پشتیبانی از حذف کیبورد)
+# ارسال پیام با پشتیبانی از حذف کیبورد
 # ============================================
 def send_message(chat_id, text, reply_markup=None, remove_keyboard=False):
     url = f"{BASE_URL}/sendMessage"
@@ -178,7 +196,7 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================
-# توابع دیتابیس (همانند قبل، بدون تغییر)
+# توابع دیتابیس
 # ============================================
 def find_user_by_employee_number(emp_num):
     conn = get_db_connection()
@@ -744,7 +762,6 @@ def handle_message(message):
 
         # ===== خروج =====
         if text == "🔙 خروج":
-            # حذف کامل state و ارسال پیام با حذف کیبورد
             user_states[chat_id] = {"state": "LOGGED_OUT"}
             send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.", remove_keyboard=True)
             return
@@ -1039,7 +1056,7 @@ def handle_message(message):
             pass
 
 # ============================================
-# Keep-Alive Thread (هر ۳۰ ثانیه)
+# Keep-Alive داخلی (هر ۳۰ ثانیه)
 # ============================================
 def keep_alive_loop():
     while True:
@@ -1063,12 +1080,18 @@ def main():
     logger.info("🤖 Bot started successfully!")
     logger.info("📡 Waiting for messages...")
 
+    # راه‌اندازی وب‌سرور Flask در یک ترد جداگانه
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"🌐 Flask server started on port {PORT}")
+
+    # راه‌اندازی ترد Keep-Alive
     threading.Thread(target=keep_alive_loop, daemon=True).start()
 
     while True:
         try:
             url = f"{BASE_URL}/getUpdates"
-            params = {"offset": offset, "timeout": 30}  # کاهش timeout برای پاسخ‌دهی سریع‌تر
+            params = {"offset": offset, "timeout": 30}
             res = requests_session.get(url, params=params, timeout=45)
 
             if res.status_code == 200:
@@ -1076,11 +1099,9 @@ def main():
                 if data.get("ok") and data.get("result"):
                     for update in data["result"]:
                         update_id = update["update_id"]
-                        # جلوگیری از پردازش دوبله
                         if update_id in processed_updates:
                             continue
                         processed_updates.add(update_id)
-                        # محدود کردن size set برای جلوگیری از افزایش بی‌نهایت
                         if len(processed_updates) > 1000:
                             processed_updates.clear()
                         if "message" in update:
