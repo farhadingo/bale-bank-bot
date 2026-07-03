@@ -2100,7 +2100,7 @@ def handle_message(message):
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
                 "📅 نسخه: ۷.۰\n"
-                "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
+                "📧 پشتیبانی: hosseinif490@gmail.com"
             )
             keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
             if is_super_admin:
