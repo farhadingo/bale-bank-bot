@@ -62,7 +62,7 @@ def run_flask():
 # ============================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/5.0'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/6.0'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -148,7 +148,76 @@ def parse_shamsi_to_date(shamsi_str):
         return None
 
 # ============================================
-# توابع مدیریت تنظیمات ربات (فعال/غیرفعال)
+# توابع مدیریت تعطیلات
+# ============================================
+def is_holiday(shamsi_date=None):
+    """بررسی اینکه تاریخ مشخص شده تعطیل است یا خیر"""
+    if not shamsi_date:
+        shamsi_date = get_shamsi_date()
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM holidays WHERE shamsi_date = %s", (shamsi_date,))
+            count = cur.fetchone()[0]
+            return count > 0
+    except Exception as e:
+        logger.error(f"is_holiday error: {e}")
+        return False
+    finally:
+        return_db_connection(conn)
+
+def add_holiday(shamsi_date, description=""):
+    """افزودن یک روز تعطیل"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO holidays (shamsi_date, description, created_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (shamsi_date) DO NOTHING
+            """, (shamsi_date, description, get_iran_time()))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"add_holiday error: {e}")
+        return False
+    finally:
+        return_db_connection(conn)
+
+def remove_holiday(shamsi_date):
+    """حذف یک روز تعطیل"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM holidays WHERE shamsi_date = %s", (shamsi_date,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"remove_holiday error: {e}")
+        return False
+    finally:
+        return_db_connection(conn)
+
+def get_all_holidays(limit=30):
+    """دریافت لیست تعطیلات"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT shamsi_date, description, created_at
+                FROM holidays
+                ORDER BY shamsi_date DESC
+                LIMIT %s
+            """, (limit,))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_all_holidays error: {e}")
+        return []
+    finally:
+        return_db_connection(conn)
+
+# ============================================
+# توابع مدیریت وضعیت ربات
 # ============================================
 def get_bot_status():
     conn = get_db_connection()
@@ -158,7 +227,7 @@ def get_bot_status():
             result = cur.fetchone()
             if result:
                 return result[0] == 'active'
-            return True  # پیش‌فرض فعال
+            return True
     except Exception as e:
         logger.error(f"get_bot_status: {e}")
         return True
@@ -186,9 +255,7 @@ def set_bot_status(status):
 # ارسال پیام
 # ============================================
 def send_message(chat_id, text, reply_markup=None, remove_keyboard=False):
-    # بررسی وضعیت ربات
     if not get_bot_status() and not is_super_admin_user(chat_id):
-        # اگر ربات غیرفعال است و کاربر سوپرادمین نیست، پیام بروزرسانی بفرست
         send_maintenance_message(chat_id)
         return None
     
@@ -210,7 +277,6 @@ def send_message(chat_id, text, reply_markup=None, remove_keyboard=False):
         return None
 
 def send_maintenance_message(chat_id):
-    """ارسال پیام در زمان بروزرسانی"""
     msg = "🔧 با عرض پوزش، ربات در حال بروزرسانی می‌باشد.\nلطفاً بعداً مجدداً تلاش کنید."
     url = f"{BASE_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": msg, "reply_markup": {"remove_keyboard": True}}
@@ -220,10 +286,9 @@ def send_maintenance_message(chat_id):
         pass
 
 def is_super_admin_user(chat_id):
-    """بررسی اینکه کاربر جاری سوپرادمین است یا خیر"""
     user = find_user_by_telegram_id(chat_id)
     if user:
-        return user[7]  # is_super_admin
+        return user[7]
     return False
 
 # ============================================
@@ -266,8 +331,8 @@ def get_super_admin_keyboard():
             [{"text": "📊 گزارش روند شعبه"}, {"text": "📋 عملکرد معاونان"}],
             [{"text": "📝 مشاهده یادداشت‌ها"}, {"text": "📋 لاگ ورود/خروج"}],
             [{"text": "🔧 وضعیت ربات"}, {"text": "🔄 ریست گزارش‌ها"}],
-            [{"text": "📨 ارسال پیام به معاونین"}, {"text": "🔙 خروج"}],
-            [{"text": "❓ راهنما"}]
+            [{"text": "📨 ارسال پیام به معاونین"}, {"text": "📅 مدیریت تعطیلات"}],
+            [{"text": "🔙 خروج"}, {"text": "❓ راهنما"}]
         ],
         "resize_keyboard": True
     }
@@ -276,10 +341,9 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================
-# توابع دیتابیس (همه توابع مورد نیاز)
+# توابع دیتابیس
 # ============================================
 
-# ---- توابع قبلی با اصلاحات ----
 def find_user_by_employee_number(emp_num):
     conn = get_db_connection()
     try:
@@ -325,7 +389,6 @@ def find_user_by_telegram_id(chat_id):
     finally:
         return_db_connection(conn)
 
-# ---- لاگ فعالیت کاربران (با جزئیات بیشتر) ----
 def log_user_activity(user_id, action, details=""):
     conn = get_db_connection()
     try:
@@ -358,7 +421,6 @@ def get_user_activity_log(limit=100):
     finally:
         return_db_connection(conn)
 
-# ---- توابع یادداشت ----
 def save_note(collection_id, user_id, note_text):
     conn = get_db_connection()
     try:
@@ -413,16 +475,11 @@ def get_all_notes_with_collection(limit=50):
     finally:
         return_db_connection(conn)
 
-# ---- توابع ذخیره وصول با پشتیبانی از میلیون ریال ----
 def save_or_update_collection_with_note(branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id, note_text=None, update_existing=False):
-    """ذخیره وصول با ورودی به میلیون ریال"""
     conn = get_db_connection()
     created_at_iran = get_iran_time()
-    
-    # تبدیل میلیون به ریال
     deputy_amount = deputy_amount_millions * 1_000_000
     others_amount = others_amount_millions * 1_000_000
-    
     try:
         with conn.cursor() as cur:
             if update_existing:
@@ -445,13 +502,11 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
                 """, (branch_id, deputy_amount, others_amount, shamsi_date, user_id, created_at_iran))
                 result = cur.fetchone()
                 collection_id = result[0] if result else None
-            
             if note_text and collection_id:
                 cur.execute("""
                     INSERT INTO notes (collection_id, user_id, note_text, created_at)
                     VALUES (%s, %s, %s, %s)
                 """, (collection_id, user_id, note_text, created_at_iran))
-            
             conn.commit()
             return True
     except Exception as e:
@@ -460,7 +515,6 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
     finally:
         return_db_connection(conn)
 
-# ---- توابع موجود (بدون تغییر) ----
 def check_existing_collection(branch_id, shamsi_date):
     conn = get_db_connection()
     try:
@@ -745,7 +799,6 @@ def get_best_worst_days(limit=5):
     finally:
         return_db_connection(conn)
 
-# ---- توابع مدیریتی سوپرادمین ----
 def get_all_users():
     conn = get_db_connection()
     try:
@@ -863,7 +916,6 @@ def update_collection(collection_id, deputy_amount, others_amount):
         return_db_connection(conn)
 
 def reset_all_collections():
-    """حذف تمام رکوردهای collections (ریست گزارش‌ها)"""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
@@ -897,7 +949,6 @@ def get_all_deputies():
 def get_log_file_path():
     return "bot.log"
 
-# ---- توابع تحلیل و هشدار ----
 def get_branch_weekly_avg(branch_id, days=7):
     conn = get_db_connection()
     try:
@@ -937,11 +988,8 @@ def get_today_performance_analysis():
     try:
         with conn.cursor() as cur:
             shamsi_today = get_shamsi_date()
-            cur.execute("""
-                SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s
-            """, (shamsi_today,))
+            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_today,))
             today_total = cur.fetchone()[0] or 0
-            
             cur.execute("""
                 SELECT b.name, c.total_amount
                 FROM collections c
@@ -950,7 +998,6 @@ def get_today_performance_analysis():
                 ORDER BY c.total_amount DESC
             """, (shamsi_today,))
             branch_data = cur.fetchall()
-            
             cur.execute("""
                 SELECT SUM(deputy_amount), SUM(others_amount)
                 FROM collections
@@ -959,12 +1006,10 @@ def get_today_performance_analysis():
             deputy_others = cur.fetchone()
             deputy_total = deputy_others[0] or 0
             others_total = deputy_others[1] or 0
-            
             cur.execute("""
                 SELECT COUNT(DISTINCT branch_id) FROM collections WHERE shamsi_date = %s
             """, (shamsi_today,))
             branches_count = cur.fetchone()[0] or 0
-            
             return {
                 "today_total": today_total,
                 "branch_data": branch_data,
@@ -984,7 +1029,6 @@ def get_drop_alert_branches():
         with conn.cursor() as cur:
             shamsi_today = get_shamsi_date()
             shamsi_week_ago = get_shamsi_date(-7)
-            
             cur.execute("""
                 SELECT 
                     b.id,
@@ -1001,7 +1045,6 @@ def get_drop_alert_branches():
                 LEFT JOIN collections c ON c.branch_id = b.id AND c.shamsi_date = %s
                 WHERE c.total_amount IS NOT NULL
             """, (shamsi_week_ago, shamsi_today, shamsi_today))
-            
             results = []
             for row in cur.fetchall():
                 branch_id, name, today, weekly_avg = row
@@ -1055,7 +1098,6 @@ def get_deputy_performance_report(user_id, days=30):
                 AND shamsi_date >= %s
             """, (user_id, shamsi_start))
             result = cur.fetchone()
-            
             if result:
                 total_days = result[0] or 0
                 on_time = result[1] or 0
@@ -1140,23 +1182,19 @@ def generate_management_analysis(analysis):
     deputy_total = analysis['deputy_total']
     others_total = analysis['others_total']
     branches_count = analysis['branches_count']
-    
     if branch_data and len(branch_data) >= 4:
         top4_sum = sum([amount for _, amount in branch_data[:4]])
         top4_percent = (top4_sum / today_total * 100) if today_total > 0 else 0
         lines.append(f"📊 {top4_percent:.0f}% وصول استان توسط ۴ شعبه انجام شده است.")
-    
     if branch_data:
         top_branch = branch_data[0]
         lines.append(f"🏆 بیشترین سهم وصول امروز مربوط به {top_branch[0]} است.")
-    
     if deputy_total + others_total > 0:
         dep_percent = (deputy_total / (deputy_total + others_total) * 100) if (deputy_total + others_total) > 0 else 0
         if dep_percent > 50:
             lines.append(f"👤 میانگین وصول معاونان ({dep_percent:.0f}%) از همکاران بیشتر بوده است.")
         else:
             lines.append(f"👥 میانگین وصول همکاران ({100-dep_percent:.0f}%) از معاونان بیشتر بوده است.")
-    
     for branch_name, amount in branch_data[:3]:
         monthly_avg = get_branch_monthly_avg_for_name(branch_name)
         if monthly_avg and monthly_avg > 0:
@@ -1165,14 +1203,12 @@ def generate_management_analysis(analysis):
                 lines.append(f"📈 شعبه {branch_name} نسبت به میانگین ماه، {growth:.0f}% رشد داشته است.")
             elif growth < -10:
                 lines.append(f"📉 شعبه {branch_name} نسبت به میانگین ماه، {abs(growth):.0f}% کاهش داشته است.")
-    
     if not lines:
         lines.append("📊 داده‌های کافی برای تحلیل مدیریتی وجود ندارد.")
-    
     return "\n".join(lines)
 
 # ============================================
-# توابع ارسال خودکار و یادآوری
+# توابع ارسال خودکار و یادآوری (با پشتیبانی از تعطیلات)
 # ============================================
 
 def send_reminder_to_deputy(chat_id, branch_name):
@@ -1188,72 +1224,73 @@ def send_reminder_to_admin(chat_id, unreported_list):
     send_message(chat_id, msg)
 
 def send_daily_report_to_admins():
+    """ارسال گزارش پایان روز به مدیران (در صورت عدم تعطیلی)"""
+    shamsi_today = get_shamsi_date()
+    if is_holiday(shamsi_today):
+        logger.info(f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است، گزارش ارسال نشد.")
+        return
     if not get_bot_status():
         logger.info("ربات غیرفعال است، گزارش پایان روز ارسال نشد.")
         return
-    
-    shamsi_today = get_shamsi_date()
     analysis = get_today_performance_analysis()
     if not analysis:
         return
-    
     admins = get_all_admins()
     if not admins:
         return
-    
-    # ساخت گزارش
     msg = f"📊 **گزارش پایان روز** - {get_shamsi_date_formatted(shamsi_today)}\n"
     msg += f"━━━━━━━━━━━━━━━━━━\n"
     msg += f"💰 کل وصول استان: {analysis['today_total']//1_000_000:,.0f} میلیون ریال\n"
     msg += f"🏢 تعداد شعب ثبت‌کننده: {analysis['branches_count']}\n"
     msg += f"👤 سهم معاونین: {analysis['deputy_total']//1_000_000:,.0f} میلیون ریال\n"
     msg += f"👥 سهم همکاران: {analysis['others_total']//1_000_000:,.0f} میلیون ریال\n\n"
-    
     if analysis['branch_data']:
         msg += "🏆 **۵ شعبه برتر امروز**\n"
         for i, (name, amount) in enumerate(analysis['branch_data'][:5], 1):
             msg += f"{i}. {name}: {amount//1_000_000:,.0f} میلیون ریال\n"
-    
     msg += "\n📈 **تحلیل مدیریتی**\n"
     msg += generate_management_analysis(analysis)
-    
     for admin in admins:
         admin_id = admin[1]
         if admin_id:
             send_message(admin_id, msg)
 
 def check_and_send_reminders():
+    """ارسال یادآوری به شعب ثبت‌نشده (در صورت عدم تعطیلی)"""
+    shamsi_today = get_shamsi_date()
+    if is_holiday(shamsi_today):
+        logger.info(f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است، یادآوری ارسال نشد.")
+        return
     if not get_bot_status():
         logger.info("ربات غیرفعال است، یادآوری ارسال نشد.")
         return
-    
     logger.info("🔄 Running reminder check...")
     unreported = get_unreported_branches()
-    
     if unreported:
         for branch in unreported:
             branch_id, name, deputy_name, deputy_chat_id = branch
             if deputy_chat_id:
                 send_reminder_to_deputy(deputy_chat_id, name)
-        
         admins = get_all_admins()
         for admin in admins:
             admin_id = admin[1]
             if admin_id:
                 send_reminder_to_admin(admin_id, unreported)
-        
         logger.info(f"✅ Reminders sent to {len(unreported)} branches")
     else:
         logger.info("✅ All branches have reported today")
 
 def check_and_send_drop_alerts():
+    """ارسال هشدار افت عملکرد (در صورت عدم تعطیلی)"""
+    shamsi_today = get_shamsi_date()
+    if is_holiday(shamsi_today):
+        logger.info(f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است، هشدار افت عملکرد ارسال نشد.")
+        return
     if not get_bot_status():
         logger.info("ربات غیرفعال است، هشدار افت عملکرد ارسال نشد.")
         return
-    
     logger.info("🔄 Checking for drop alerts...")
     drops = get_drop_alert_branches()
-    
     if drops:
         admins = get_all_admins()
         for admin in admins:
@@ -1272,33 +1309,25 @@ def check_and_send_drop_alerts():
         logger.info("✅ No drop alerts")
 
 # ============================================
-# پردازش پیام‌ها (با قابلیت‌های جدید)
+# پردازش پیام‌ها
 # ============================================
 def handle_message(message):
     try:
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
-        
-        # بررسی وضعیت ربات (اگر غیرفعال و کاربر سوپرادمین نباشد)
         if not get_bot_status() and not is_super_admin_user(chat_id):
             send_maintenance_message(chat_id)
             return
-        
         user_state = user_states.get(chat_id, {"state": "LOGGED_OUT"})
         current_state = user_state.get("state", "LOGGED_OUT")
-
-        # ===== حالت خروج یا عدم احراز هویت =====
         if current_state == "LOGGED_OUT" or current_state == "WAITING_FOR_EMP_NUM":
             if current_state != "WAITING_FOR_EMP_NUM":
                 user_states[chat_id] = {"state": "WAITING_FOR_EMP_NUM"}
                 send_message(chat_id, "👋 سلام! به ربات وصول مطالبات استان زنجان خوش آمدید.\n\n🔐 لطفاً شماره کارمندی خود را ارسال کنید:", remove_keyboard=True)
                 return
-            
-            # بررسی شماره کارمندی (فقط اعداد انگلیسی)
             if not re.match(r'^[0-9]+$', text):
                 send_message(chat_id, "❌ لطفاً شماره کارمندی را فقط با **اعداد انگلیسی** وارد کنید.\nمثال: ۱۲۳۴۵۶")
                 return
-            
             emp_user = find_user_by_employee_number(text)
             if emp_user:
                 db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = emp_user
@@ -1351,8 +1380,6 @@ def handle_message(message):
             else:
                 send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید.")
             return
-
-        # ===== وضعیت انتظار برای رمز سوپرادمین =====
         if current_state == "WAITING_FOR_SUPER_ADMIN_PASSWORD":
             if text == SUPER_ADMIN_PASSWORD:
                 temp_data = user_state.get("temp_user_data")
@@ -1380,8 +1407,6 @@ def handle_message(message):
             else:
                 send_message(chat_id, "❌ رمز عبور اشتباه است. لطفاً دوباره تلاش کنید.")
             return
-
-        # ===== کاربر لاگین کرده =====
         user_data = user_state.get("user_data", {})
         if not user_data:
             user = find_user_by_telegram_id(chat_id)
@@ -1401,7 +1426,6 @@ def handle_message(message):
                 "is_super_admin": is_super_admin
             }
             user_states[chat_id]["user_data"] = user_data
-
         role = user_data["role"]
         branch_id = user_data["branch_id"]
         branch_name = user_data["branch_name"]
@@ -1426,7 +1450,6 @@ def handle_message(message):
             except ValueError:
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت (میلیون ریال) وارد کنید.")
             return
-
         elif current_state == "WAITING_FOR_OTHERS_AMOUNT":
             if text == "🔙 انصراف":
                 user_states[chat_id]["state"] = "LOGGED_IN"
@@ -1440,19 +1463,17 @@ def handle_message(message):
                 deputy_amount = user_state.get("deputy_amount", 0)
                 shamsi_today = get_shamsi_date()
                 is_edit = user_state.get("edit_mode", False)
-                
                 user_states[chat_id]["state"] = "WAITING_FOR_NOTE"
                 user_states[chat_id]["collection_data"] = {
                     "deputy_amount": deputy_amount,
                     "others_amount": others_amount,
-                    "shamsi_date": shamsi_date,
+                    "shamsi_date": shamsi_today,
                     "is_edit": is_edit
                 }
                 send_message(chat_id, "📝 آیا می‌خواهید یادداشتی برای این وصول ثبت کنید؟ (اختیاری)\nلطفاً متن یادداشت را ارسال کنید یا روی «🔙 انصراف» بزنید تا بدون یادداشت ذخیره شود.", get_cancel_keyboard())
             except ValueError:
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت (میلیون ریال) وارد کنید.")
             return
-
         elif current_state == "WAITING_FOR_NOTE":
             if text == "🔙 انصراف":
                 data = user_state.get("collection_data", {})
@@ -1497,7 +1518,6 @@ def handle_message(message):
                 keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
                 send_message(chat_id, msg, keyboard)
                 return
-
         elif current_state == "WAITING_FOR_EDIT_CONFIRMATION":
             if text == "📝 بله، ویرایش شود":
                 user_states[chat_id]["state"] = "WAITING_FOR_DEPUTY_AMOUNT"
@@ -1611,7 +1631,8 @@ def handle_message(message):
                 "   • مدیریت کاربران و گزارش‌ها\n"
                 "   • فعال/غیرفعال کردن ربات\n"
                 "   • ریست کردن گزارش‌ها\n"
-                "   • ارسال پیام به معاونین\n"
+                "   • ارسال پیام به معاونین (انتخابی)\n"
+                "   • مدیریت تعطیلات (افزودن/حذف)\n"
                 "   • مشاهده لاگ کامل فعالیت‌ها\n\n"
                 "💰 **واحد پول:** تمام مبالغ به **میلیون ریال** است.\n"
                 "🔸 در هر مرحله می‌توانید با دکمه «انصراف» به منو برگردید.\n"
@@ -1676,7 +1697,6 @@ def handle_message(message):
                 if logs:
                     msg = "📋 **لاگ فعالیت کاربران**\n━━━━━━━━━━━━━━━━━━\n"
                     for log in logs:
-                        # تبدیل تاریخ میلادی به شمسی
                         created_at = log[5]
                         shamsi_dt = jdatetime.datetime.fromgregorian(datetime=created_at)
                         shamsi_str = f"{shamsi_dt.year}/{shamsi_dt.month:02d}/{shamsi_dt.day:02d} {shamsi_dt.hour:02d}:{shamsi_dt.minute:02d}"
@@ -1752,6 +1772,94 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
                 return
 
+            # ===== بخش مدیریت تعطیلات =====
+            if text == "📅 مدیریت تعطیلات":
+                keyboard = {
+                    "keyboard": [
+                        [{"text": "➕ افزودن روز تعطیل"}, {"text": "➖ حذف روز تعطیل"}],
+                        [{"text": "📋 مشاهده تعطیلات"}, {"text": "🔙 انصراف"}]
+                    ],
+                    "resize_keyboard": True
+                }
+                send_message(chat_id, "📅 **مدیریت تعطیلات**\n\nلطفاً یکی از گزینه‌های زیر را انتخاب کنید:", keyboard)
+                return
+
+            if text == "➕ افزودن روز تعطیل":
+                user_states[chat_id]["state"] = "WAITING_FOR_ADD_HOLIDAY"
+                send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً ۱۴۰۴/۰۱/۱۵)\nو در صورت تمایل توضیحی وارد کنید:\n\n`تاریخ | توضیح`\nمثال: `۱۴۰۴/۰۱/۱۵ | تعطیلات رسمی`", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_ADD_HOLIDAY":
+                if text == "🔙 انصراف":
+                    user_states[chat_id]["state"] = "LOGGED_IN"
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                parts = text.split('|')
+                shamsi_date = parts[0].strip()
+                description = parts[1].strip() if len(parts) > 1 else "تعطیل"
+                if re.match(r'^\d{4}/\d{2}/\d{2}$', shamsi_date):
+                    if add_holiday(shamsi_date, description):
+                        send_message(chat_id, f"✅ روز {get_shamsi_date_formatted(shamsi_date)} با موفقیت به عنوان تعطیل ثبت شد.\nتوضیح: {description}", get_super_admin_keyboard())
+                        log_user_activity(user_db_id, "add_holiday", f"افزودن تعطیل: {shamsi_date} - {description}")
+                    else:
+                        send_message(chat_id, "❌ خطا در ثبت تعطیل. این تاریخ قبلاً ثبت شده است.", get_cancel_keyboard())
+                        return
+                else:
+                    send_message(chat_id, "❌ فرمت تاریخ نامعتبر. لطفاً به صورت YYYY/MM/DD وارد کنید.", get_cancel_keyboard())
+                    return
+                user_states[chat_id]["state"] = "LOGGED_IN"
+                return
+
+            if text == "➖ حذف روز تعطیل":
+                holidays = get_all_holidays(20)
+                if not holidays:
+                    send_message(chat_id, "📭 هیچ روز تعطیلی ثبت نشده است.", get_super_admin_keyboard())
+                    return
+                msg = "📋 **لیست تعطیلات ثبت‌شده**\n━━━━━━━━━━━━━━━━━━\n"
+                for i, h in enumerate(holidays, 1):
+                    msg += f"{i}. {get_shamsi_date_formatted(h[0])} - {h[1]}\n"
+                msg += "\nلطفاً شماره مورد نظر برای حذف را وارد کنید، یا 🔙 انصراف بزنید."
+                user_states[chat_id]["state"] = "WAITING_FOR_REMOVE_HOLIDAY"
+                user_states[chat_id]["holidays_list"] = holidays
+                send_message(chat_id, msg, get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_REMOVE_HOLIDAY":
+                if text == "🔙 انصراف":
+                    user_states[chat_id]["state"] = "LOGGED_IN"
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                try:
+                    index = int(text) - 1
+                    holidays = user_state.get("holidays_list", [])
+                    if 0 <= index < len(holidays):
+                        shamsi_date = holidays[index][0]
+                        if remove_holiday(shamsi_date):
+                            send_message(chat_id, f"✅ روز {get_shamsi_date_formatted(shamsi_date)} از تعطیلات حذف شد.", get_super_admin_keyboard())
+                            log_user_activity(user_db_id, "remove_holiday", f"حذف تعطیل: {shamsi_date}")
+                        else:
+                            send_message(chat_id, "❌ خطا در حذف تعطیل.", get_super_admin_keyboard())
+                    else:
+                        send_message(chat_id, "❌ شماره نامعتبر.", get_cancel_keyboard())
+                        return
+                except:
+                    send_message(chat_id, "❌ لطفاً یک عدد معتبر وارد کنید.", get_cancel_keyboard())
+                    return
+                user_states[chat_id]["state"] = "LOGGED_IN"
+                return
+
+            if text == "📋 مشاهده تعطیلات":
+                holidays = get_all_holidays(30)
+                if holidays:
+                    msg = "📋 **تعطیلات ثبت‌شده**\n━━━━━━━━━━━━━━━━━━\n"
+                    for h in holidays:
+                        msg += f"📅 {get_shamsi_date_formatted(h[0])} - {h[1]}\n"
+                    send_message(chat_id, msg, get_super_admin_keyboard())
+                else:
+                    send_message(chat_id, "📭 هیچ روز تعطیلی ثبت نشده است.", get_super_admin_keyboard())
+                return
+
+            # ===== ارسال پیام به معاونین (نسخه انتخاب‌گر) =====
             if text == "📨 ارسال پیام به معاونین":
                 deputies = get_all_deputies()
                 if not deputies:
@@ -1801,19 +1909,15 @@ def handle_message(message):
                         send_message(chat_id, "❌ هیچ شماره معتبری یافت نشد.", get_cancel_keyboard())
                         return
                 else:
-                    # جستجو بر اساس نام
                     for dep in deputies:
                         if text in dep[2]:
                             recipients.append(dep)
                     if not recipients:
                         send_message(chat_id, f"❌ معاونی با نام '{text}' یافت نشد.", get_cancel_keyboard())
                         return
-                
                 if not recipients:
                     send_message(chat_id, "❌ هیچ مخاطبی انتخاب نشد.", get_cancel_keyboard())
                     return
-                
-                # ذخیره مخاطبین و رفتن به مرحله نوشتن پیام
                 user_states[chat_id]["state"] = "WAITING_FOR_MESSAGE_TEXT"
                 user_states[chat_id]["recipients"] = recipients
                 recipient_names = ", ".join([f"{r[2]} ({r[4] or 'بدون شعبه'})" for r in recipients])
@@ -1838,11 +1942,11 @@ def handle_message(message):
                         msg = f"📨 **پیام از سوی مدیریت**\n━━━━━━━━━━━━━━━━━━\n\n{message_text}"
                         if send_message(dep_chat_id, msg):
                             success_count += 1
+                            log_user_activity(user_db_id, "send_message_to_deputy", f"ارسال پیام به {dep_name} (ID: {dep_id})")
                         else:
                             logger.error(f"Failed to send message to {dep_name} (chat_id: {dep_chat_id})")
                     else:
                         logger.warning(f"Deputy {dep_name} has no chat_id")
-                
                 final_msg = f"✅ پیام به {success_count} از {len(recipients)} مخاطب ارسال شد."
                 if success_count < len(recipients):
                     final_msg += f"\n⚠️ {len(recipients) - success_count} مخاطب پیام را دریافت نکردند (احتمالاً ربات را استارت نکرده‌اند)."
@@ -1922,7 +2026,7 @@ def handle_message(message):
                 if len(parts) == 4:
                     try:
                         col_id = int(parts[1])
-                        deputy = int(parts[2]) * 1_000_000  # تبدیل میلیون به ریال
+                        deputy = int(parts[2]) * 1_000_000
                         others = int(parts[3]) * 1_000_000
                         if update_collection(col_id, deputy, others):
                             send_message(chat_id, f"✅ گزارش {col_id} به‌روزرسانی شد.", get_super_admin_keyboard())
@@ -1934,21 +2038,22 @@ def handle_message(message):
                     send_message(chat_id, "❌ فرمت: /edit_collection [id] [deputy_amount_millions] [others_amount_millions]", get_super_admin_keyboard())
                 return
 
-            # اگر سوپرادمین بود و دستور خاصی نبود، منوی خودش را نمایش بده
-            if text not in ["👥 مدیریت کاربران", "📊 مدیریت گزارش‌ها", "📋 مشاهده لاگ‌ها", "📋 لاگ ورود/خروج", "📝 مشاهده یادداشت‌ها", "📊 گزارش امروز", "📈 گزارش ۱۰ روز اخیر", "🏆 رتبه‌بندی شعب", "💹 آمار مفصل امروز", "🎯 تحلیل مدیریتی", "📅 گزارش تاریخ خاص", "📊 بهترین/بدترین روز", "📊 گزارش روند شعبه", "📋 عملکرد معاونان", "🔧 وضعیت ربات", "🔄 ریست گزارش‌ها", "📨 ارسال پیام به معاونین", "🔙 خروج", "❓ راهنما"]:
+            if text not in ["👥 مدیریت کاربران", "📊 مدیریت گزارش‌ها", "📋 مشاهده لاگ‌ها", "📋 لاگ ورود/خروج", "📝 مشاهده یادداشت‌ها", "📊 گزارش امروز", "📈 گزارش ۱۰ روز اخیر", "🏆 رتبه‌بندی شعب", "💹 آمار مفصل امروز", "🎯 تحلیل مدیریتی", "📅 گزارش تاریخ خاص", "📊 بهترین/بدترین روز", "📊 گزارش روند شعبه", "📋 عملکرد معاونان", "🔧 وضعیت ربات", "🔄 ریست گزارش‌ها", "📨 ارسال پیام به معاونین", "📅 مدیریت تعطیلات", "🔙 خروج", "❓ راهنما", "➕ افزودن روز تعطیل", "➖ حذف روز تعطیل", "📋 مشاهده تعطیلات"]:
                 send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_super_admin_keyboard())
                 return
 
         # ========================================
-        # بخش تحلیل مدیریتی (برای ادمین و سوپرادمین)
+        # بخش تحلیل مدیریتی
         # ========================================
         if text == "🎯 تحلیل مدیریتی" and (role == 'admin' or is_super_admin):
+            if is_holiday():
+                send_message(chat_id, "📅 امروز تعطیل است، گزارشی ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
+                return
             analysis = get_today_performance_analysis()
             if analysis:
                 msg = f"📈 **تحلیل مدیریتی امروز** - {get_shamsi_date_formatted(get_shamsi_date())}\n"
                 msg += f"━━━━━━━━━━━━━━━━━━\n\n"
                 msg += generate_management_analysis(analysis)
-                # نمایش به میلیون ریال
                 msg += f"\n\n💰 کل وصول: {analysis['today_total']//1_000_000:,.0f} میلیون ریال"
                 keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
                 send_message(chat_id, msg, keyboard)
@@ -1958,7 +2063,7 @@ def handle_message(message):
             return
 
         # ========================================
-        # بخش گزارش روند شعبه (برای ادمین و سوپرادمین)
+        # بخش گزارش روند شعبه
         # ========================================
         if text == "📊 گزارش روند شعبه" and (role == 'admin' or is_super_admin):
             user_states[chat_id]["state"] = "WAITING_FOR_BRANCH_TREND"
@@ -1999,7 +2104,7 @@ def handle_message(message):
             return
 
         # ========================================
-        # بخش عملکرد معاونان (برای ادمین و سوپرادمین)
+        # بخش عملکرد معاونان
         # ========================================
         if text == "📋 عملکرد معاونان" and (role == 'admin' or is_super_admin):
             deputies = get_all_deputies()
@@ -2022,7 +2127,7 @@ def handle_message(message):
             return
 
         # ========================================
-        # بخش مشاهده یادداشت‌ها (برای ادمین و سوپرادمین)
+        # بخش مشاهده یادداشت‌ها
         # ========================================
         if text == "📝 مشاهده یادداشت‌ها" and (role == 'admin' or is_super_admin):
             notes = get_all_notes_with_collection(30)
@@ -2102,9 +2207,11 @@ def handle_message(message):
         # منوی ادمین (ادامه)
         # ========================================
         if role == 'admin' or is_super_admin:
-            # گزارش امروز
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
+                if is_holiday(shamsi_today):
+                    send_message(chat_id, f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است و گزارشی ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
+                    return
                 report = get_today_province_report(shamsi_today)
                 stats = get_today_statistics()
                 if report:
@@ -2179,6 +2286,9 @@ def handle_message(message):
 
             if text == "💹 آمار مفصل امروز":
                 shamsi_today = get_shamsi_date()
+                if is_holiday(shamsi_today):
+                    send_message(chat_id, f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است، گزارشی ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
+                    return
                 report = get_detailed_report(shamsi_today)
                 if report:
                     msg = f"💹 آمار مفصل امروز\n━━━━━━━━━━━━━━━━━━\n\n"
@@ -2216,7 +2326,7 @@ def handle_message(message):
 
             if text == "📅 گزارش تاریخ خاص":
                 user_states[chat_id]["state"] = "WAITING_FOR_ADMIN_DATE"
-                send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً 1403/01/15):", get_cancel_keyboard())
+                send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً ۱۴۰۳/۰۱/۱۵):", get_cancel_keyboard())
                 return
 
             if text == "📊 بهترین/بدترین روز":
@@ -2237,17 +2347,19 @@ def handle_message(message):
                 send_message(chat_id, msg, keyboard)
                 return
 
-            # اگر دستور خاصی نبود
             keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
             send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", keyboard)
             return
 
         # ========================================
-        # منوی معاون (ادامه)
+        # منوی معاون
         # ========================================
         if role == 'deputy':
             if text == "💰 ثبت وصولی روزانه":
                 shamsi_today = get_shamsi_date()
+                if is_holiday(shamsi_today):
+                    send_message(chat_id, f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است، نیازی به ثبت وصول نیست.", get_deputy_keyboard())
+                    return
                 existing = check_existing_collection(branch_id, shamsi_today)
                 if existing:
                     col_id, dep_val, oth_val = existing
@@ -2315,6 +2427,9 @@ def handle_message(message):
 
             if text == "📋 مشاهده ثبت امروز":
                 shamsi_today = get_shamsi_date()
+                if is_holiday(shamsi_today):
+                    send_message(chat_id, f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است، ثبت وصولی وجود ندارد.", get_deputy_keyboard())
+                    return
                 existing = check_existing_collection(branch_id, shamsi_today)
                 if existing:
                     col_id, dep_val, oth_val = existing
@@ -2333,7 +2448,7 @@ def handle_message(message):
 
             if text == "📅 گزارش تاریخ خاص":
                 user_states[chat_id]["state"] = "WAITING_FOR_BRANCH_DATE"
-                send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً 1403/01/15):", get_cancel_keyboard())
+                send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً ۱۴۰۳/۰۱/۱۵):", get_cancel_keyboard())
                 return
 
             if text == "📊 تاریخچه کامل":
@@ -2357,7 +2472,6 @@ def handle_message(message):
                     send_message(chat_id, "📭 هیچ سابقه‌ای برای شعبه شما وجود ندارد.", get_deputy_keyboard())
                 return
 
-            # اگر دستور خاصی نبود
             send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", get_deputy_keyboard())
             return
 
@@ -2394,28 +2508,24 @@ def keep_alive_loop():
 # ============================================
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone='Asia/Tehran')
-    
     scheduler.add_job(
         check_and_send_reminders,
         CronTrigger(hour=15, minute=0),
         id='reminder_job',
         replace_existing=True
     )
-    
     scheduler.add_job(
         send_daily_report_to_admins,
         CronTrigger(hour=17, minute=30),
         id='daily_report_job',
         replace_existing=True
     )
-    
     scheduler.add_job(
         check_and_send_drop_alerts,
         CronTrigger(hour=18, minute=30),
         id='drop_alert_job',
         replace_existing=True
     )
-    
     scheduler.start()
     logger.info("✅ Scheduler started (reminders at 15:00, reports at 17:30, alerts at 18:30)")
 
@@ -2427,20 +2537,15 @@ def main():
     offset = 0
     logger.info("🤖 Bot started successfully!")
     logger.info("📡 Waiting for messages...")
-
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"🌐 Flask server started on port {PORT}")
-
     threading.Thread(target=keep_alive_loop, daemon=True).start()
-    
     start_scheduler()
-
     while True:
         try:
             url = f"{BASE_URL}/getUpdates"
             params = {"offset": offset, "timeout": 30}
             res = requests_session.get(url, params=params, timeout=45)
-
             if res.status_code == 200:
                 data = res.json()
                 if data.get("ok") and data.get("result"):
@@ -2464,7 +2569,6 @@ def main():
             else:
                 logger.error(f"❌ HTTP error: {res.status_code} - {res.text}")
                 time.sleep(5)
-
         except requests.exceptions.Timeout:
             logger.warning("⏳ Timeout in long polling (normal). Reconnecting...")
             time.sleep(2)
