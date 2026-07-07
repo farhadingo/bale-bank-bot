@@ -1,8 +1,8 @@
-requests==2.31.0
-psycopg2-binary==2.9.9
-Flask==3.0.0
-jdatetime==4.1.1
-apscheduler==3.10.4
-matplotlib==3.7.1
-numpy==1.24.3
-Pillow==10.0.0
+requests
+psycopg2-binary
+Flask
+jdatetime
+apscheduler
+matplotlib
+numpy
+Pillow
