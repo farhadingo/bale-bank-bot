@@ -1,3 +1,4 @@
+```python
 import os
 import time
 import logging
@@ -74,7 +75,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.0'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.1'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -750,10 +751,15 @@ def get_adaptive_comparison():
             return_db_connection(conn)
 
 def get_forecast(branch_id=None, days=7):
+    """
+    پیش‌بینی هوشمند با استفاده از رگرسیون خطی
+    اگر branch_id مشخص باشد، برای آن شعبه، وگرنه برای کل استان
+    """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
+            # دریافت داده‌های ۴۵ روز اخیر
             if branch_id:
                 cur.execute("""
                     SELECT shamsi_date, total_amount
@@ -771,54 +777,66 @@ def get_forecast(branch_id=None, days=7):
                     LIMIT 45
                 """)
             data = cur.fetchall()
-            if len(data) < 3:
-                return None, None
             
+            # اگر داده‌ها کمتر از ۳ روز باشد، پیش‌بینی ممکن نیست
+            if len(data) < 3:
+                logger.warning(f"get_forecast: فقط {len(data)} روز داده موجود است (حداقل ۳ روز نیاز است)")
+                return None, {'error': 'حداقل ۳ روز داده نیاز است', 'available_days': len(data)}
+            
+            # تبدیل تاریخ‌ها و مبالغ
             dates = []
             amounts = []
             for row in reversed(data):
                 shamsi_str = row[0]
                 parts = shamsi_str.split('/')
                 if len(parts) == 3:
-                    year, month, day = map(int, parts)
                     try:
+                        year, month, day = map(int, parts)
                         greg = jdatetime.date(year, month, day).togregorian()
                         dates.append(greg.toordinal())
                         amounts.append(row[1] or 0)
-                    except:
+                    except Exception as e:
+                        logger.warning(f"خطا در تبدیل تاریخ {shamsi_str}: {e}")
                         continue
             
             if len(dates) < 3:
-                return None, None
+                logger.warning(f"get_forecast: بعد از تبدیل فقط {len(dates)} تاریخ معتبر باقی ماند")
+                return None, {'error': f'تعداد داده‌های معتبر: {len(dates)} (حداقل ۳ روز نیاز است)'}
             
+            # تبدیل به آرایه numpy
             x = np.array(dates)
             y = np.array(amounts)
             
-            weights = np.exp(np.linspace(0, 1, len(x)))
-            weights = weights / weights.sum() * len(x)
+            # وزن‌دهی به روزهای اخیر (وزن بیشتر برای روزهای جدیدتر)
+            n = len(x)
+            weights = np.exp(np.linspace(0, 1, n))
+            weights = weights / weights.sum() * n
             
+            # محاسبه رگرسیون خطی وزنی
             x_mean = np.average(x, weights=weights)
             y_mean = np.average(y, weights=weights)
             cov = np.average((x - x_mean) * (y - y_mean), weights=weights)
             var = np.average((x - x_mean) ** 2, weights=weights)
             
             if var == 0:
-                return None, None
+                return None, {'error': 'داده‌ها تغییرات کافی ندارند'}
             
             slope = cov / var
             intercept = y_mean - slope * x_mean
             
-            y_pred = slope * x + intercept
-            mse = np.mean((y - y_pred) ** 2)
+            # محاسبه خطاها و معیارهای ارزیابی
+            y_pred_all = slope * x + intercept
+            mse = np.mean((y - y_pred_all) ** 2)
             rmse = np.sqrt(mse)
             
             ss_tot = np.sum((y - y_mean) ** 2)
-            ss_res = np.sum((y - y_pred) ** 2)
+            ss_res = np.sum((y - y_pred_all) ** 2)
             r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
             
+            # پیش‌بینی روزهای آینده
             last_date = dates[-1]
             forecast = []
-            for i in range(1, days+1):
+            for i in range(1, days + 1):
                 future_date = last_date + i
                 predicted = slope * future_date + intercept
                 lower = predicted - 1.96 * rmse
@@ -833,6 +851,7 @@ def get_forecast(branch_id=None, days=7):
                     'upper': max(0, upper)
                 })
             
+            # تحلیل روند
             trend_analysis = {
                 'slope': slope,
                 'r2': r2,
@@ -840,13 +859,16 @@ def get_forecast(branch_id=None, days=7):
                 'trend': 'صعودی' if slope > 0 else 'نزولی' if slope < 0 else 'ثابت',
                 'strength': 'قوی' if r2 > 0.7 else 'متوسط' if r2 > 0.4 else 'ضعیف',
                 'avg_amount': np.mean(y),
-                'last_amount': y[-1] if len(y) > 0 else 0
+                'last_amount': y[-1] if len(y) > 0 else 0,
+                'data_count': len(dates)
             }
             
+            logger.info(f"پیش‌بینی با موفقیت انجام شد. تعداد داده‌ها: {len(dates)}، R²: {r2:.3f}")
             return forecast, trend_analysis
+            
     except Exception as e:
         logger.error(f"get_forecast error: {e}")
-        return None, None
+        return None, {'error': str(e)}
     finally:
         if conn:
             return_db_connection(conn)
@@ -1393,17 +1415,24 @@ def get_branch_10_day_report(branch_id):
             return_db_connection(conn)
 
 def get_today_province_report(shamsi_date):
+    """
+    دریافت گزارش امروز استان با LEFT JOIN برای نمایش همه شعب
+    حتی شعب بدون وصول با مقدار 0 نمایش داده می‌شوند
+    """
     shamsi_date = normalize_digits(shamsi_date)
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT b.name, c.deputy_amount, c.others_amount, c.total_amount
-                FROM collections c
-                JOIN branches b ON c.branch_id = b.id
-                WHERE c.shamsi_date = %s
-                ORDER BY c.total_amount DESC
+                SELECT 
+                    b.name, 
+                    COALESCE(c.deputy_amount, 0) as deputy_amount,
+                    COALESCE(c.others_amount, 0) as others_amount,
+                    COALESCE(c.total_amount, 0) as total_amount
+                FROM branches b
+                LEFT JOIN collections c ON c.branch_id = b.id AND c.shamsi_date = %s
+                ORDER BY COALESCE(c.total_amount, 0) DESC
             """, (shamsi_date,))
             return cur.fetchall()
     except Exception as e:
@@ -2377,7 +2406,7 @@ def send_monthly_report_to_all():
             send_message(chat_id, msg)
 
 # ============================================================
-# پردازش پیام‌ها (نسخه اصلاح‌شده با پشتیبانی کامل از سوپرادمین)
+# پردازش پیام‌ها (نسخه نهایی با تمام اصلاحات)
 # ============================================================
 def handle_message(message):
     try:
@@ -2656,7 +2685,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== گزارش تاریخ خاص برای ادمین و سوپرادمین (اصلاح‌شده) =====
+        # ===== گزارش تاریخ خاص برای ادمین و سوپرادمین =====
         if (role == 'admin' or is_super_admin) and current_state == "WAITING_FOR_ADMIN_DATE":
             if text == "🔙 انصراف":
                 user_states[chat_id]["state"] = "LOGGED_IN"
@@ -2723,7 +2752,7 @@ def handle_message(message):
                 "   • نمایش بهترین/بدترین روزهای استان\n"
                 "   • گزارش روند هر شعبه\n"
                 "   • گزارش عملکرد معاونان\n"
-                "   • گزارش عملکرد همکاران\n"
+                "   • گزارش عملکرد همکاران (همه شعب حتی بدون وصول)\n"
                 "   • گزارش تطبیقی (مقایسه با دوره قبل)\n"
                 "   • پیش‌بینی عملکرد (تحلیل روند هوشمند)\n"
                 "   • نمودارهای تصویری (استان و شعبه)\n"
@@ -2763,7 +2792,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۸.۰\n"
+                "📅 نسخه: ۸.۱\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
@@ -3698,7 +3727,6 @@ def handle_message(message):
                         trend = get_branch_trend(branch_id, 5)
                         if trend:
                             msg = f"📊 **روند ۵ روز اخیر شعبه {text}**\n━━━━━━━━━━━━━━━━━━\n"
-                            # اصلاح فلش روند
                             for i in range(len(trend)):
                                 date, amount = trend[i]
                                 if i == 0:
@@ -3749,7 +3777,7 @@ def handle_message(message):
             send_message(chat_id, msg, keyboard)
             return
 
-        # ===== عملکرد همکاران =====
+        # ===== عملکرد همکاران (اصلاح‌شده - همه شعب حتی بدون وصول) =====
         if text == "👥 عملکرد همکاران" and (role == 'admin' or is_super_admin):
             shamsi_today = get_shamsi_date()
             if is_holiday(shamsi_today):
@@ -3759,22 +3787,29 @@ def handle_message(message):
             if report:
                 msg = f"📊 **عملکرد همکاران (غیر از معاونین)**\n📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n━━━━━━━━━━━━━━━━━━\n\n"
                 total_others = 0
+                has_data = False
                 for idx, row in enumerate(report, 1):
+                    branch_name = row[0]
                     dep = int(safe_format(row[1]))
                     oth = int(safe_format(row[2]))
                     tot = int(safe_format(row[3]))
+                    # نمایش همه شعب حتی اگر oth=0 باشد
+                    msg += f"{idx}. 🏢 {branch_name}\n"
+                    msg += f"   👥 سهم همکاران: {oth//1_000_000:,.0f} میلیون ریال\n"
+                    if tot > 0:
+                        msg += f"   📊 درصد از کل: {(oth/tot*100):.1f}%\n"
+                    else:
+                        msg += f"   📊 درصد از کل: ۰%\n"
+                    msg += f"   📈 کل وصول شعبه: {tot//1_000_000:,.0f} میلیون ریال\n\n"
+                    total_others += oth
                     if oth > 0:
-                        msg += f"{idx}. 🏢 {row[0]}\n"
-                        msg += f"   👥 سهم همکاران: {oth//1_000_000:,.0f} میلیون ریال\n"
-                        msg += f"   📊 درصد از کل: {(oth/tot*100):.1f}%\n\n"
-                        total_others += oth
-                if total_others > 0:
-                    msg += f"━━━━━━━━━━━━━━━━━━\n"
-                    msg += f"💰 کل وصولی همکاران: {total_others//1_000_000:,.0f} میلیون ریال"
-                    keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
-                    send_message(chat_id, msg, keyboard)
-                else:
-                    send_message(chat_id, "📭 امروز هیچ وصولی توسط همکاران ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
+                        has_data = True
+                msg += f"━━━━━━━━━━━━━━━━━━\n"
+                msg += f"💰 کل وصولی همکاران: {total_others//1_000_000:,.0f} میلیون ریال"
+                if not has_data:
+                    msg += "\n\n📌 امروز هیچ وصولی توسط همکاران ثبت نشده است."
+                keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
+                send_message(chat_id, msg, keyboard)
             else:
                 send_message(chat_id, "📭 امروز هیچ گزارشی ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
             return
@@ -3805,7 +3840,7 @@ def handle_message(message):
                 send_message(chat_id, "📊 داده‌های کافی برای گزارش تطبیقی وجود ندارد.", keyboard)
             return
 
-        # ===== پیش‌بینی عملکرد =====
+        # ===== پیش‌بینی عملکرد (اصلاح‌شده) =====
         if text == "📈 پیش‌بینی عملکرد" and (role == 'admin' or is_super_admin):
             if not get_forecast_report_status():
                 send_message(chat_id, "🔴 پیش‌بینی عملکرد در حال حاضر غیرفعال است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
@@ -3813,7 +3848,10 @@ def handle_message(message):
             if is_holiday():
                 send_message(chat_id, "📅 امروز تعطیل است، داده‌های کافی برای پیش‌بینی وجود ندارد.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
                 return
+            
+            # ابتدا پیش‌بینی کل استان
             forecast, trend = get_forecast(None, 7)
+            
             if forecast and trend:
                 msg = f"📈 **پیش‌بینی عملکرد استان (۷ روز آینده)**\n━━━━━━━━━━━━━━━━━━\n\n"
                 for f in forecast:
@@ -3824,12 +3862,19 @@ def handle_message(message):
                 msg += f"   • جهت: {trend['trend']}\n"
                 msg += f"   • قدرت: {trend['strength']} (R² = {trend['r2']:.2f})\n"
                 msg += f"   • میانگین وصول: {trend['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"   • آخرین وصول: {trend['last_amount']//1_000_000:,.0f} میلیون ریال"
+                msg += f"   • آخرین وصول: {trend['last_amount']//1_000_000:,.0f} میلیون ریال\n"
+                msg += f"   • تعداد داده‌ها: {trend['data_count']} روز"
                 keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
                 send_message(chat_id, msg, keyboard)
             else:
+                # نمایش پیام خطای دقیق
+                error_msg = "📈 داده‌های کافی برای پیش‌بینی وجود ندارد."
+                if trend and isinstance(trend, dict) and 'error' in trend:
+                    error_msg = f"📈 {trend['error']}"
+                    if 'available_days' in trend:
+                        error_msg += f"\n📊 تعداد روزهای موجود: {trend['available_days']}"
                 keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
-                send_message(chat_id, "📈 داده‌های کافی برای پیش‌بینی وجود ندارد.", keyboard)
+                send_message(chat_id, error_msg, keyboard)
             return
 
         # ===== نمودار استان =====
@@ -4386,3 +4431,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
