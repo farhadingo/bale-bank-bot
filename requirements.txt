@@ -6,7 +6,3 @@ apscheduler
 matplotlib
 numpy
 Pillow
-arabic_reshaper
-python-bidi
-setuptools
-wheel
