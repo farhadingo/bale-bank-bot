@@ -794,9 +794,14 @@ def create_tables_if_not_exists():
 create_tables_if_not_exists()
 
 # ============================================================
-# توابع آمار واقعی (Actual Stats)
+# توابع آمار واقعی (Actual Stats) - اصلاح شده برای جلوگیری از اعداد منفی
 # ============================================================
 def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
+    """ذخیره آمار واقعی - اگر total_actual منفی باشد، خطا برمی‌گرداند"""
+    if total_actual < 0:
+        logger.warning(f"Attempt to save negative actual stats: {total_actual} for branch {branch_id} on {shamsi_date}")
+        return False, "مبلغ نمی‌تواند منفی باشد. لطفاً عددی بزرگتر یا مساوی صفر وارد کنید."
+    
     conn = None
     try:
         conn = get_db_connection()
@@ -811,12 +816,12 @@ def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
                     updated_at = CURRENT_TIMESTAMP
             """, (branch_id, shamsi_date, total_actual_rial, user_id, get_iran_time()))
             conn.commit()
-            return True
+            return True, "ثبت شد"
     except Exception as e:
         logger.error(f"save_actual_stats error: {e}")
         if conn:
             conn.rollback()
-        return False
+        return False, f"خطا: {e}"
     finally:
         if conn:
             return_db_connection(conn)
@@ -863,6 +868,10 @@ def get_actual_stats_for_date(shamsi_date):
             return_db_connection(conn)
 
 def compare_collection_with_actual(branch_id, shamsi_date):
+    """
+    مقایسه وصول ثبت‌شده با آمار واقعی.
+    اگر مقدار واقعی منفی باشد، آن را صفر در نظر می‌گیریم (برای محاسبه) اما مقدار اصلی را برمی‌گردانیم.
+    """
     conn = None
     try:
         conn = get_db_connection()
@@ -882,16 +891,18 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             if not actual:
                 return None
             total_col = collection[0] if collection else 0
-            total_act = actual[0]
+            total_act_raw = actual[0]
+            # اگر مقدار واقعی منفی است، آن را صفر در نظر می‌گیریم برای محاسبات
+            total_act = total_act_raw if total_act_raw >= 0 else 0
             if total_act > 0:
                 match_percent = (min(total_col, total_act) / max(total_col, total_act)) * 100
             else:
                 match_percent = 0 if total_col > 0 else 100
             return {
                 'total_collected': total_col,
-                'total_actual': total_act,
+                'total_actual': total_act_raw,  # مقدار اصلی (ممکن است منفی باشد)
                 'match_percent': match_percent,
-                'diff_total': total_col - total_act
+                'diff_total': total_col - total_act  # اختلاف بر اساس مقدار صفر شده
             }
     except Exception as e:
         logger.error(f"compare_collection_with_actual error: {e}")
@@ -4271,16 +4282,20 @@ def handle_message(message):
                     total_value = parse_number(text)
                     if total_value is None:
                         raise ValueError
+                    # اعتبارسنجی منفی نبودن
+                    if total_value < 0:
+                        send_message(chat_id, "❌ مبلغ نمی‌تواند منفی باشد. لطفاً عددی بزرگتر یا مساوی صفر وارد کنید.", get_cancel_keyboard())
+                        return
                     shamsi_date = user_state.get("actual_date")
                     branches = user_state.get("actual_branches", [])
                     index = user_state.get("actual_branch_index", 0)
                     if index < len(branches):
                         branch_id = branches[index][0]
-                        success = save_actual_stats(branch_id, shamsi_date, total_value, user_db_id)
+                        success, message = save_actual_stats(branch_id, shamsi_date, total_value, user_db_id)
                         if success:
                             log_user_activity(user_db_id, "add_actual_stats", f"ثبت آمار واقعی برای شعبه {branches[index][1]} تاریخ {shamsi_date}: {total_value} میلیون ریال")
                         else:
-                            send_message(chat_id, "❌ خطا در ثبت آمار واقعی.", get_super_admin_keyboard())
+                            send_message(chat_id, f"❌ خطا در ثبت آمار واقعی: {message}", get_cancel_keyboard())
                             return
                         index += 1
                         if index < len(branches):
@@ -4661,7 +4676,7 @@ def handle_message(message):
                         comparison_data.append({
                             'branch_name': branch_name,
                             'collected': comp['total_collected'],
-                            'actual': comp['total_actual'],
+                            'actual': comp['total_actual'],  # ممکن است منفی باشد
                             'match_pct': comp['match_percent'],
                             'diff': comp['diff_total']
                         })
@@ -4681,10 +4696,13 @@ def handle_message(message):
                 for item in comparison_data:
                     branch_name = item['branch_name']
                     collected = item['collected']
-                    actual = item['actual']
+                    actual = item['actual']  # می‌تواند منفی باشد
                     match_pct = item['match_pct']
                     diff = item['diff']
                     total_collected_all += collected
+                    # برای جمع کل واقعی، اگر منفی است، آن را صفر در نظر نمی‌گیریم (نمایش می‌دهیم ولی جمع نمی‌کنیم؟ بهتر است فقط نمایش دهیم)
+                    # اما برای جمع کل، بهتر است فقط مقادیر مثبت یا صفر را در نظر بگیریم یا همان مقدار اصلی را جمع بزنیم.
+                    # برای نمایش خلاصه، از مقدار اصلی استفاده می‌کنیم (منفی هم جمع می‌شود تا خطا مشخص شود).
                     total_actual_all += actual
                     if match_pct >= 95:
                         status = "✅ عالی"
@@ -4697,6 +4715,9 @@ def handle_message(message):
                         low_match_count += 1
                     else:
                         status = "🔴 ضعیف"
+                    # نمایش مقدار واقعی - اگر منفی باشد، عبارت "نامعتبر" نشان می‌دهیم
+                    actual_display = f"{actual//1_000_000:,.0f}" if actual >= 0 else "⚠️ نامعتبر"
+                    # اختلاف را بر اساس مقدار صفر شده محاسبه کرده‌ایم، بنابراین diff درست است.
                     diff_text = ""
                     if diff > 0:
                         diff_text = f"📈 {diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"
@@ -4706,16 +4727,18 @@ def handle_message(message):
                         diff_text = "✅ کاملاً مطابق"
                     msg += f"🏢 **{branch_name}**\n"
                     msg += f"   📝 ثبت‌شده: {collected//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"   📊 واقعی: {actual//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   📊 واقعی: {actual_display} میلیون ریال\n"
                     msg += f"   📈 انطباق: {match_pct:.1f}% - {status}\n"
                     msg += f"   📌 اختلاف: {diff_text}\n\n"
                 total_collected_all_int = total_collected_all or 0
                 total_actual_all_int = total_actual_all or 0
-                if total_actual_all_int > 0:
-                    total_match_pct = (min(total_collected_all_int, total_actual_all_int) / max(total_collected_all_int, total_actual_all_int)) * 100
+                # برای درصد انطباق کلی، اگر مجموع واقعی منفی باشد، از صفر استفاده می‌کنیم
+                total_actual_for_percent = max(0, total_actual_all_int)
+                if total_actual_for_percent > 0:
+                    total_match_pct = (min(total_collected_all_int, total_actual_for_percent) / max(total_collected_all_int, total_actual_for_percent)) * 100
                 else:
                     total_match_pct = 0 if total_collected_all_int > 0 else 100
-                total_diff = total_collected_all_int - total_actual_all_int
+                total_diff = total_collected_all_int - total_actual_for_percent  # اختلاف بر اساس مقدار تصحیح شده
                 diff_total_text = ""
                 if total_diff > 0:
                     diff_total_text = f"📈 {total_diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"
