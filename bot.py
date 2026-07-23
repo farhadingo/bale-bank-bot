@@ -794,14 +794,10 @@ def create_tables_if_not_exists():
 create_tables_if_not_exists()
 
 # ============================================================
-# توابع آمار واقعی (Actual Stats) - اصلاح شده برای جلوگیری از اعداد منفی
+# توابع آمار واقعی (Actual Stats) - بدون محدودیت منفی
 # ============================================================
 def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
-    """ذخیره آمار واقعی - اگر total_actual منفی باشد، خطا برمی‌گرداند"""
-    if total_actual < 0:
-        logger.warning(f"Attempt to save negative actual stats: {total_actual} for branch {branch_id} on {shamsi_date}")
-        return False, "مبلغ نمی‌تواند منفی باشد. لطفاً عددی بزرگتر یا مساوی صفر وارد کنید."
-    
+    """ذخیره آمار واقعی - اعداد منفی مجاز هستند"""
     conn = None
     try:
         conn = get_db_connection()
@@ -4282,10 +4278,7 @@ def handle_message(message):
                     total_value = parse_number(text)
                     if total_value is None:
                         raise ValueError
-                    # اعتبارسنجی منفی نبودن
-                    if total_value < 0:
-                        send_message(chat_id, "❌ مبلغ نمی‌تواند منفی باشد. لطفاً عددی بزرگتر یا مساوی صفر وارد کنید.", get_cancel_keyboard())
-                        return
+                    # حذف محدودیت منفی: اجازه هر عددی داده می‌شود
                     shamsi_date = user_state.get("actual_date")
                     branches = user_state.get("actual_branches", [])
                     index = user_state.get("actual_branch_index", 0)
@@ -4700,10 +4693,7 @@ def handle_message(message):
                     match_pct = item['match_pct']
                     diff = item['diff']
                     total_collected_all += collected
-                    # برای جمع کل واقعی، اگر منفی است، آن را صفر در نظر نمی‌گیریم (نمایش می‌دهیم ولی جمع نمی‌کنیم؟ بهتر است فقط نمایش دهیم)
-                    # اما برای جمع کل، بهتر است فقط مقادیر مثبت یا صفر را در نظر بگیریم یا همان مقدار اصلی را جمع بزنیم.
-                    # برای نمایش خلاصه، از مقدار اصلی استفاده می‌کنیم (منفی هم جمع می‌شود تا خطا مشخص شود).
-                    total_actual_all += actual
+                    total_actual_all += actual  # حتی اگر منفی باشد، جمع می‌شود (برای نمایش)
                     if match_pct >= 95:
                         status = "✅ عالی"
                         perfect_count += 1
@@ -4715,9 +4705,9 @@ def handle_message(message):
                         low_match_count += 1
                     else:
                         status = "🔴 ضعیف"
-                    # نمایش مقدار واقعی - اگر منفی باشد، عبارت "نامعتبر" نشان می‌دهیم
-                    actual_display = f"{actual//1_000_000:,.0f}" if actual >= 0 else "⚠️ نامعتبر"
-                    # اختلاف را بر اساس مقدار صفر شده محاسبه کرده‌ایم، بنابراین diff درست است.
+                    # نمایش مقدار واقعی - حالا عدد را نشان می‌دهیم (حتی اگر منفی باشد)
+                    actual_display = f"{actual//1_000_000:,.0f}"  # همیشه نمایش عدد
+                    # اختلاف بر اساس مقدار صفر شده محاسبه شده است (diff)
                     diff_text = ""
                     if diff > 0:
                         diff_text = f"📈 {diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"
@@ -4732,7 +4722,7 @@ def handle_message(message):
                     msg += f"   📌 اختلاف: {diff_text}\n\n"
                 total_collected_all_int = total_collected_all or 0
                 total_actual_all_int = total_actual_all or 0
-                # برای درصد انطباق کلی، اگر مجموع واقعی منفی باشد، از صفر استفاده می‌کنیم
+                # برای درصد انطباق کلی، اگر مجموع واقعی منفی است، از صفر استفاده می‌کنیم
                 total_actual_for_percent = max(0, total_actual_all_int)
                 if total_actual_for_percent > 0:
                     total_match_pct = (min(total_collected_all_int, total_actual_for_percent) / max(total_collected_all_int, total_actual_for_percent)) * 100
