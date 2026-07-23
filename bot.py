@@ -132,7 +132,6 @@ ENGLISH_DIGITS = '0123456789'
 DIGIT_MAP = str.maketrans(PERSIAN_DIGITS + ARABIC_DIGITS, ENGLISH_DIGITS + ENGLISH_DIGITS)
 
 def normalize_digits(text):
-    """تبدیل ارقام فارسی/عربی به انگلیسی و حذف کاما و فاصله، پشتیبانی از ممیز"""
     if not text:
         return text
     text = str(text).translate(DIGIT_MAP)
@@ -140,7 +139,6 @@ def normalize_digits(text):
     return text
 
 def parse_number(text):
-    """تبدیل متن به عدد صحیح (پشتیبانی از اعداد اعشاری)"""
     try:
         text = normalize_digits(text)
         if '.' in text:
@@ -153,7 +151,6 @@ def parse_number(text):
 # توابع تنظیم فونت فارسی برای Matplotlib
 # ============================================================
 def setup_persian_font():
-    """تنظیم فونت فارسی برای matplotlib با استفاده از فونت داخلی"""
     try:
         import matplotlib.font_manager as fm
         font_paths = [
@@ -186,12 +183,10 @@ def setup_persian_font():
 # توابع ایجاد جداول جدید (در صورت عدم وجود)
 # ============================================================
 def create_tables_if_not_exists():
-    """ایجاد جداول جدید در صورت عدم وجود (بدون DROP)"""
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # جدول آمار واقعی (با فیلد total_actual اضافه شده)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS actual_stats (
                     id SERIAL PRIMARY KEY,
@@ -206,15 +201,6 @@ def create_tables_if_not_exists():
                     CONSTRAINT unique_branch_actual_date UNIQUE (branch_id, shamsi_date)
                 )
             """)
-            cur.execute("""
-                COMMENT ON TABLE actual_stats IS 'آمار واقعی وصول ثبت شده توسط سوپرادمین';
-                COMMENT ON COLUMN actual_stats.branch_id IS 'شناسه شعبه';
-                COMMENT ON COLUMN actual_stats.shamsi_date IS 'تاریخ شمسی';
-                COMMENT ON COLUMN actual_stats.deputy_actual IS 'مبلغ واقعی معاون (قدیمی)';
-                COMMENT ON COLUMN actual_stats.others_actual IS 'مبلغ واقعی همکاران (قدیمی)';
-                COMMENT ON COLUMN actual_stats.total_actual IS 'مجموع واقعی وصول';
-                COMMENT ON COLUMN actual_stats.recorded_by IS 'ثبت کننده (سوپرادمین)';
-            """)
             conn.commit()
             logger.info("✅ Table actual_stats created/verified successfully.")
     except Exception as e:
@@ -223,7 +209,6 @@ def create_tables_if_not_exists():
         if conn:
             return_db_connection(conn)
 
-# ایجاد جداول در شروع برنامه
 create_tables_if_not_exists()
 
 # ============================================================
@@ -806,10 +791,9 @@ def get_survey_responses(survey_id):
             return_db_connection(conn)
 
 # ============================================================
-# توابع آمار واقعی (Actual Stats) - اصلاح شده برای دریافت یک عدد
+# توابع آمار واقعی (Actual Stats)
 # ============================================================
 def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
-    """ذخیره آمار واقعی با یک عدد (کل وصول)"""
     conn = None
     try:
         conn = get_db_connection()
@@ -875,12 +859,10 @@ def get_actual_stats_for_date(shamsi_date):
             return_db_connection(conn)
 
 def compare_collection_with_actual(branch_id, shamsi_date):
-    """مقایسه وصول ثبت شده با آمار واقعی برای یک شعبه در یک تاریخ"""
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # وصول ثبت شده توسط معاون
             cur.execute("""
                 SELECT total_amount
                 FROM collections
@@ -888,7 +870,6 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             """, (branch_id, shamsi_date))
             collection = cur.fetchone()
             
-            # آمار واقعی
             cur.execute("""
                 SELECT total_actual
                 FROM actual_stats
@@ -921,7 +902,6 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             return_db_connection(conn)
 
 def get_deputy_match_report(user_id, days=30):
-    """گزارش تطابق عملکرد معاون با آمار واقعی در ۳۰ روز اخیر"""
     conn = None
     try:
         conn = get_db_connection()
@@ -959,10 +939,9 @@ def get_deputy_match_report(user_id, days=30):
             return_db_connection(conn)
 
 # ============================================================
-# توابع مدیریت معاونین (جدید)
+# توابع مدیریت معاونین
 # ============================================================
 def get_all_deputies_with_details():
-    """دریافت لیست کامل معاونین با جزئیات"""
     conn = None
     try:
         conn = get_db_connection()
@@ -983,7 +962,6 @@ def get_all_deputies_with_details():
             return_db_connection(conn)
 
 def add_deputy(employee_number, full_name, title, branch_id, is_super_admin=False):
-    """افزودن معاون جدید"""
     conn = None
     try:
         conn = get_db_connection()
@@ -1009,7 +987,6 @@ def add_deputy(employee_number, full_name, title, branch_id, is_super_admin=Fals
             return_db_connection(conn)
 
 def update_deputy(user_id, employee_number=None, full_name=None, title=None, branch_id=None):
-    """به‌روزرسانی اطلاعات معاون"""
     conn = None
     try:
         conn = get_db_connection()
@@ -1048,17 +1025,14 @@ def update_deputy(user_id, employee_number=None, full_name=None, title=None, bra
             return_db_connection(conn)
 
 def delete_deputy(user_id):
-    """حذف معاون (با حفظ تاریخچه وصولی‌ها)"""
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # ابتدا بررسی می‌کنیم که کاربر معاون باشد
             cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
             result = cur.fetchone()
             if not result or result[0] != 'deputy':
                 return False
-            # حذف کاربر (وصولی‌ها با ON DELETE CASCADE حذف نمی‌شوند چون recorded_by فقط SET NULL می‌شود)
             cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
             conn.commit()
             return True
@@ -1072,7 +1046,6 @@ def delete_deputy(user_id):
             return_db_connection(conn)
 
 def get_deputy_by_employee_number(emp_num):
-    """دریافت اطلاعات معاون با شماره کارمندی"""
     emp_num = normalize_digits(emp_num)
     conn = None
     try:
@@ -1092,7 +1065,7 @@ def get_deputy_by_employee_number(emp_num):
             return_db_connection(conn)
 
 # ============================================================
-# توابع گزارش‌های تطبیقی و پیش‌بینی (بهبودیافته)
+# توابع گزارش‌های تطبیقی و پیش‌بینی
 # ============================================================
 def get_adaptive_comparison():
     shamsi_today = get_shamsi_date()
@@ -1135,10 +1108,6 @@ def get_adaptive_comparison():
             return_db_connection(conn)
 
 def get_forecast(branch_id=None, days=7):
-    """
-    پیش‌بینی هوشمند با استفاده از رگرسیون خطی
-    اگر branch_id مشخص باشد، برای آن شعبه، وگرنه برای کل استان
-    """
     conn = None
     try:
         conn = get_db_connection()
@@ -1162,7 +1131,6 @@ def get_forecast(branch_id=None, days=7):
             data = cur.fetchall()
             
             if len(data) < 3:
-                logger.warning(f"get_forecast: فقط {len(data)} روز داده موجود است (حداقل ۳ روز نیاز است)")
                 return None, {'error': 'حداقل ۳ روز داده نیاز است', 'available_days': len(data)}
             
             dates = []
@@ -1177,11 +1145,9 @@ def get_forecast(branch_id=None, days=7):
                         dates.append(greg.toordinal())
                         amounts.append(float(row[1] or 0))
                     except Exception as e:
-                        logger.warning(f"خطا در تبدیل تاریخ {shamsi_str}: {e}")
                         continue
             
             if len(dates) < 3:
-                logger.warning(f"get_forecast: بعد از تبدیل فقط {len(dates)} تاریخ معتبر باقی ماند")
                 return None, {'error': f'تعداد داده‌های معتبر: {len(dates)} (حداقل ۳ روز نیاز است)'}
             
             x = np.array(dates)
@@ -1238,9 +1204,7 @@ def get_forecast(branch_id=None, days=7):
                 'data_count': len(dates)
             }
             
-            logger.info(f"پیش‌بینی با موفقیت انجام شد. تعداد داده‌ها: {len(dates)}، R²: {r2:.3f}")
             return forecast, trend_analysis
-            
     except Exception as e:
         logger.error(f"get_forecast error: {e}")
         return None, {'error': str(e)}
@@ -1249,7 +1213,6 @@ def get_forecast(branch_id=None, days=7):
             return_db_connection(conn)
 
 def get_forecast_for_all_branches(days=7):
-    """دریافت پیش‌بینی برای همه شعب به صورت جداگانه"""
     conn = None
     try:
         conn = get_db_connection()
@@ -1277,12 +1240,10 @@ def get_forecast_for_all_branches(days=7):
 # توابع نمودار (با پشتیبانی از فونت فارسی و خطاگیری)
 # ============================================================
 def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
-    """تولید تصویر نمودار با پشتیبانی از فارسی و خطاگیری"""
     try:
         setup_persian_font()
         plt.figure(figsize=figsize)
         
-        # بازسازی متن برای نمایش فارسی
         title_fa = arabic_reshaper.reshape(title) if title else ""
         title_fa = get_display(title_fa)
         x_label_fa = arabic_reshaper.reshape(x_label) if x_label else ""
@@ -1396,85 +1357,7 @@ def generate_province_chart(days=10):
         if conn:
             return_db_connection(conn)
 
-def generate_comparison_chart(branch_id, shamsi_date):
-    """نمودار مقایسه وصول ثبت شده با آمار واقعی برای یک شعبه"""
-    try:
-        comparison = compare_collection_with_actual(branch_id, shamsi_date)
-        if not comparison:
-            return None
-        
-        labels = ['کل وصول']
-        collected = [comparison['total_collected']]
-        actual = [comparison['total_actual']]
-        
-        setup_persian_font()
-        x = np.arange(len(labels))
-        width = 0.35
-        
-        fig, ax = plt.subplots(figsize=(8, 5))
-        rects1 = ax.bar(x - width/2, [v//1_000_000 for v in collected], width, label='ثبت شده', color='blue', alpha=0.7)
-        rects2 = ax.bar(x + width/2, [v//1_000_000 for v in actual], width, label='واقعی', color='orange', alpha=0.7)
-        
-        ax.set_ylabel('میلیون ریال')
-        ax.set_title('مقایسه وصول ثبت شده با آمار واقعی')
-        ax.set_xticks(x)
-        ax.set_xticklabels([get_display(arabic_reshaper.reshape(l)) for l in labels])
-        ax.legend()
-        
-        ax.text(0.5, -0.15, f"درصد تطابق: {comparison['match_percent']:.1f}%", 
-                transform=ax.transAxes, ha='center', fontsize=12, fontweight='bold')
-        
-        plt.tight_layout()
-        img_bytes = io.BytesIO()
-        plt.savefig(img_bytes, format='png', dpi=100, bbox_inches='tight')
-        plt.close()
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
-    except Exception as e:
-        logger.error(f"generate_comparison_chart error: {e}")
-        return None
-
-def generate_branch_comparison_chart(comparison_data):
-    """نمودار مقایسه ای چند شعبه"""
-    try:
-        if not comparison_data:
-            return None
-        
-        setup_persian_font()
-        fig, ax = plt.subplots(figsize=(12, 6))
-        
-        branches = [item[1] for item in comparison_data]
-        collected = [item[2] for item in comparison_data]
-        actual = [item[3] for item in comparison_data]
-        match_pct = [item[4] for item in comparison_data]
-        
-        x = np.arange(len(branches))
-        width = 0.35
-        
-        rects1 = ax.bar(x - width/2, [c//1_000_000 for c in collected], width, label='ثبت شده', color='blue', alpha=0.7)
-        rects2 = ax.bar(x + width/2, [a//1_000_000 for a in actual], width, label='واقعی', color='orange', alpha=0.7)
-        
-        ax.set_ylabel('میلیون ریال')
-        ax.set_title('مقایسه وصول ثبت شده با آمار واقعی - همه شعب')
-        ax.set_xticks(x)
-        ax.set_xticklabels([get_display(arabic_reshaper.reshape(b[:10])) for b in branches], rotation=45, ha='right')
-        ax.legend()
-        
-        for i, pct in enumerate(match_pct):
-            ax.text(i, max(collected[i], actual[i])//1_000_000 + 0.5, f"{pct:.0f}%", ha='center', fontsize=9)
-        
-        plt.tight_layout()
-        img_bytes = io.BytesIO()
-        plt.savefig(img_bytes, format='png', dpi=100, bbox_inches='tight')
-        plt.close()
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
-    except Exception as e:
-        logger.error(f"generate_branch_comparison_chart error: {e}")
-        return None
-
 def get_analytical_chart_data(chart_type, days=10):
-    """دریافت داده برای انواع نمودارهای تحلیلی"""
     conn = None
     try:
         conn = get_db_connection()
@@ -1696,7 +1579,7 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================================
-# توابع دیتابیس (همه توابع مورد نیاز)
+# توابع دیتابیس
 # ============================================================
 def find_user_by_employee_number(emp_num):
     emp_num = normalize_digits(emp_num)
@@ -1982,10 +1865,6 @@ def get_branch_10_day_report(branch_id):
             return_db_connection(conn)
 
 def get_today_province_report(shamsi_date):
-    """
-    دریافت گزارش امروز استان با LEFT JOIN برای نمایش همه شعب
-    حتی شعب بدون وصول با مقدار 0 نمایش داده می‌شوند
-    """
     shamsi_date = normalize_digits(shamsi_date)
     conn = None
     try:
@@ -3352,7 +3231,7 @@ def handle_message(message):
                 "   • پیش‌بینی عملکرد (تحلیل روند هوشمند)\n"
                 "   • نمودارهای تصویری (استان و شعبه)\n"
                 "   • نمودارهای تحلیلی متنوع\n"
-                "   • مقایسه انطباق با آمار واقعی\n"
+                "   • مقایسه انطباق با آمار واقعی (گزارش متنی دقیق)\n"
                 "   • مشاهده یادداشت‌ها\n"
                 "   • ثبت مشکل\n"
                 "   • شرکت در نظرسنجی‌ها\n"
@@ -3425,7 +3304,7 @@ def handle_message(message):
             return
 
         # ============================================================
-        # بخش نظرسنجی (با رفع باگ‌های بحرانی)
+        # بخش نظرسنجی
         # ============================================================
         if text == "📊 نظرسنجی":
             if not get_survey_system_status():
@@ -3543,7 +3422,7 @@ def handle_message(message):
             send_message(chat_id, msg, get_super_admin_keyboard())
             return
 
-        # ===== نتایج نظرسنجی (رفع باگ بحرانی) =====
+        # ===== نتایج نظرسنجی =====
         if text == "📊 نتایج نظرسنجی" and is_super_admin:
             user_states[chat_id]["state"] = "WAITING_FOR_SURVEY_RESULTS"
             send_message(chat_id, "📊 لطفاً **شناسه نظرسنجی** را وارد کنید تا نتایج آن را مشاهده کنید:", get_cancel_keyboard())
@@ -3619,7 +3498,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== شرکت در نظرسنجی (رفع باگ نشتی کانکشن) =====
+        # ===== شرکت در نظرسنجی =====
         if text.startswith("/survey"):
             parts = text.split()
             if len(parts) == 2:
@@ -3740,7 +3619,7 @@ def handle_message(message):
             return
 
         # ============================================================
-        # بخش سوپرادمین (با همه قابلیت‌ها)
+        # بخش سوپرادمین
         # ============================================================
         if is_super_admin:
             # ===== کنترل خودکار =====
@@ -3879,7 +3758,7 @@ def handle_message(message):
                     send_message(chat_id, "❌ فرمت: /resolve_problem [problem_id]", get_super_admin_keyboard())
                 return
 
-            # ===== مدیریت معاونین (جدید) =====
+            # ===== مدیریت معاونین =====
             if text == "👥 مدیریت معاونین":
                 deputies = get_all_deputies_with_details()
                 if deputies:
@@ -3905,13 +3784,11 @@ def handle_message(message):
                     full_name = parts[1].strip()
                     branch_id = int(parts[2].strip())
                     title = parts[3].strip()
-                    # بررسی وجود شعبه
                     branches = get_all_branches()
                     branch_ids = [b[0] for b in branches]
                     if branch_id not in branch_ids:
                         send_message(chat_id, "❌ شناسه شعبه نامعتبر.", get_super_admin_keyboard())
                         return
-                    # بررسی عدم تکراری بودن شماره کارمندی
                     existing = get_deputy_by_employee_number(emp_num)
                     if existing:
                         send_message(chat_id, f"❌ شماره کارمندی {emp_num} قبلاً ثبت شده است.", get_super_admin_keyboard())
@@ -3935,7 +3812,6 @@ def handle_message(message):
                         value = ' '.join(parts[3:]) if len(parts) > 3 else ''
                         if field == 'employee_number':
                             value = normalize_digits(value)
-                            # بررسی عدم تکراری
                             existing = get_deputy_by_employee_number(value)
                             if existing and existing[0] != user_id:
                                 send_message(chat_id, f"❌ شماره کارمندی {value} قبلاً ثبت شده است.", get_super_admin_keyboard())
@@ -4400,7 +4276,7 @@ def handle_message(message):
                     send_message(chat_id, "هیچ یادداشتی وجود ندارد.", get_super_admin_keyboard())
                 return
 
-            # ===== ثبت آمار واقعی (با یک عدد) =====
+            # ===== ثبت آمار واقعی =====
             if text == "📊 ثبت آمار واقعی":
                 if not get_actual_stats_status():
                     send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_super_admin_keyboard())
@@ -4478,7 +4354,7 @@ def handle_message(message):
                 return
 
         # ============================================================
-        # ادامه منوی ادمین (با پشتیبانی از سوپرادمین)
+        # ادامه منوی ادمین
         # ============================================================
         
         # ===== تحلیل مدیریتی =====
@@ -4551,7 +4427,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== عملکرد معاونان (با اضافه کردن انطباق) =====
+        # ===== عملکرد معاونان با میانگین انطباق =====
         if text == "📋 عملکرد معاونان" and (role == 'admin' or is_super_admin):
             deputies = get_all_deputies()
             if not deputies:
@@ -4568,17 +4444,18 @@ def handle_message(message):
                     msg += f"   📅 تاخیر: {perf['late']} روز\n"
                     msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
                     msg += f"   🏆 بهترین روز: {perf['best_day']//1_000_000:,.0f} میلیون ریال\n"
+                    # محاسبه میانگین انطباق
                     match_data = get_deputy_match_report(dep_id, 30)
                     if match_data:
                         total_match = 0
                         count = 0
                         for row in match_data:
-                            if row[2] > 0:
-                                total_match += row[3]
+                            if row[2] > 0:  # actual > 0
+                                total_match += row[3]  # match_percent
                                 count += 1
                         if count > 0:
                             avg_match = total_match / count
-                            msg += f"   📊 تطابق با آمار واقعی: {avg_match:.1f}%\n"
+                            msg += f"   📊 میانگین انطباق با آمار واقعی: {avg_match:.1f}%\n"
                     msg += "\n"
             keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
             send_message(chat_id, msg, keyboard)
@@ -4812,7 +4689,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== مقایسه انطباق =====
+        # ===== مقایسه انطباق (گزارش متنی دقیق) =====
         if text == "📊 مقایسه انطباق" and (role == 'admin' or is_super_admin):
             if not get_actual_stats_status():
                 send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
@@ -4836,12 +4713,19 @@ def handle_message(message):
                     user_states[chat_id]["state"] = "LOGGED_IN"
                     return
                 
+                # جمع‌آوری داده‌های مقایسه
                 comparison_data = []
                 for item in actual_data:
                     branch_id, branch_name, total_act = item
                     comp = compare_collection_with_actual(branch_id, shamsi_date)
                     if comp:
-                        comparison_data.append((branch_id, branch_name, comp['total_collected'], comp['total_actual'], comp['match_percent']))
+                        comparison_data.append({
+                            'branch_name': branch_name,
+                            'collected': comp['total_collected'],
+                            'actual': comp['total_actual'],
+                            'match_pct': comp['match_percent'],
+                            'diff': comp['diff_total']
+                        })
                 
                 if not comparison_data:
                     keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
@@ -4849,42 +4733,86 @@ def handle_message(message):
                     user_states[chat_id]["state"] = "LOGGED_IN"
                     return
                 
-                msg = f"📊 **مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}**\n━━━━━━━━━━━━━━━━━━\n\n"
+                # تولید گزارش متنی دقیق
+                msg = f"📊 **گزارش مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}**\n"
+                msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                msg += f"این گزارش نشان‌دهنده میزان تطابق آمار ثبت‌شده توسط معاونین با آمار واقعی وصول است.\n\n"
+                
                 total_collected_all = 0
                 total_actual_all = 0
-                for branch_id, branch_name, collected, actual, match_pct in comparison_data:
-                    msg += f"🏢 {branch_name}\n"
-                    msg += f"   ثبت شده: {collected//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"   واقعی: {actual//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"   تطابق: {match_pct:.1f}%\n"
-                    diff = collected - actual
-                    if diff > 0:
-                        msg += f"   📈 {diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی\n"
-                    elif diff < 0:
-                        msg += f"   📉 {abs(diff)//1_000_000:,.0f} میلیون ریال کمتر از واقعی\n"
-                    else:
-                        msg += f"   ✅ کاملاً مطابق\n"
-                    msg += "\n"
+                perfect_count = 0
+                high_match_count = 0
+                low_match_count = 0
+                
+                # بررسی هر شعبه
+                for item in comparison_data:
+                    branch_name = item['branch_name']
+                    collected = item['collected']
+                    actual = item['actual']
+                    match_pct = item['match_pct']
+                    diff = item['diff']
+                    
                     total_collected_all += collected
                     total_actual_all += actual
+                    
+                    # دسته‌بندی انطباق
+                    if match_pct >= 95:
+                        status = "✅ عالی"
+                        perfect_count += 1
+                    elif match_pct >= 80:
+                        status = "🟢 خوب"
+                        high_match_count += 1
+                    elif match_pct >= 50:
+                        status = "🟡 متوسط"
+                        low_match_count += 1
+                    else:
+                        status = "🔴 ضعیف"
+                    
+                    diff_text = ""
+                    if diff > 0:
+                        diff_text = f"📈 {diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"
+                    elif diff < 0:
+                        diff_text = f"📉 {abs(diff)//1_000_000:,.0f} میلیون ریال کمتر از واقعی"
+                    else:
+                        diff_text = "✅ کاملاً مطابق"
+                    
+                    msg += f"🏢 **{branch_name}**\n"
+                    msg += f"   📝 ثبت‌شده: {collected//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   📊 واقعی: {actual//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   📈 انطباق: {match_pct:.1f}% - {status}\n"
+                    msg += f"   📌 اختلاف: {diff_text}\n\n"
                 
-                if total_actual_all > 0:
-                    total_match_pct = (min(total_collected_all, total_actual_all) / max(total_collected_all, total_actual_all)) * 100
+                # محاسبه آمار کلی
+                total_collected_all_int = total_collected_all or 0
+                total_actual_all_int = total_actual_all or 0
+                if total_actual_all_int > 0:
+                    total_match_pct = (min(total_collected_all_int, total_actual_all_int) / max(total_collected_all_int, total_actual_all_int)) * 100
                 else:
-                    total_match_pct = 0 if total_collected_all > 0 else 100
-                msg += f"━━━━━━━━━━━━━━━━━━\n"
-                msg += f"💰 کل ثبت شده استان: {total_collected_all//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"💰 کل واقعی استان: {total_actual_all//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"📊 تطابق کلی: {total_match_pct:.1f}%\n"
+                    total_match_pct = 0 if total_collected_all_int > 0 else 100
                 
-                chart_bytes = generate_branch_comparison_chart(comparison_data)
-                if chart_bytes:
-                    caption = f"📊 مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}"
-                    keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
-                    send_photo(chat_id, chart_bytes, caption, keyboard)
+                total_diff = total_collected_all_int - total_actual_all_int
+                diff_total_text = ""
+                if total_diff > 0:
+                    diff_total_text = f"📈 {total_diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"
+                elif total_diff < 0:
+                    diff_total_text = f"📉 {abs(total_diff)//1_000_000:,.0f} میلیون ریال کمتر از واقعی"
                 else:
-                    keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
-                    send_message(chat_id, msg, keyboard)
+                    diff_total_text = "✅ کاملاً مطابق"
+                
+                msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                msg += f"📊 **خلاصه کلی**\n"
+                msg += f"   🏢 تعداد شعب: {len(comparison_data)}\n"
+                msg += f"   ✅ انطباق عالی (≥۹۵%): {perfect_count} شعبه\n"
+                msg += f"   🟢 انطباق خوب (≥۸۰%): {high_match_count} شعبه\n"
+                msg += f"   🟡 انطباق متوسط (≥۵۰%): {low_match_count} شعبه\n"
+                msg += f"   🔴 انطباق ضعیف (<۵۰%): {len(comparison_data) - perfect_count - high_match_count - low_match_count} شعبه\n\n"
+                msg += f"💰 کل ثبت‌شده استان: {total_collected_all_int//1_000_000:,.0f} میلیون ریال\n"
+                msg += f"💰 کل واقعی استان: {total_actual_all_int//1_000_000:,.0f} میلیون ریال\n"
+                msg += f"📈 انطباق کلی: {total_match_pct:.1f}%\n"
+                msg += f"📌 اختلاف کل: {diff_total_text}"
+                
+                keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
+                send_message(chat_id, msg, keyboard)
                 user_states[chat_id]["state"] = "LOGGED_IN"
             else:
                 send_message(chat_id, "❌ فرمت تاریخ نامعتبر. لطفاً به صورت YYYY/MM/DD وارد کنید.")
@@ -4969,7 +4897,6 @@ def handle_message(message):
         # منوی ادمین (گزارش‌های اصلی)
         # ============================================================
         if role == 'admin' or is_super_admin:
-            # ===== گزارش امروز =====
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
                 if is_holiday(shamsi_today):
@@ -5006,7 +4933,6 @@ def handle_message(message):
                     send_message(chat_id, f"📊 امروز ({shamsi_today}) هنوز هیچ شعبه‌ای اطلاعات ثبت نکرده است.", keyboard)
                 return
 
-            # ===== گزارش ۱۰ روز اخیر =====
             if text == "📈 گزارش ۱۰ روز اخیر":
                 report = get_province_10_day_report()
                 if report:
@@ -5030,7 +4956,6 @@ def handle_message(message):
                     send_message(chat_id, "📈 دیتابیس خالی است.", keyboard)
                 return
 
-            # ===== رتبه‌بندی شعب =====
             if text == "🏆 رتبه‌بندی شعب":
                 report = get_top_5_branches()
                 if report:
@@ -5049,7 +4974,6 @@ def handle_message(message):
                     send_message(chat_id, "🏆 داده کافی برای رتبه‌بندی وجود ندارد.", keyboard)
                 return
 
-            # ===== آمار مفصل امروز =====
             if text == "💹 آمار مفصل امروز":
                 shamsi_today = get_shamsi_date()
                 if is_holiday(shamsi_today):
@@ -5073,7 +4997,6 @@ def handle_message(message):
                     send_message(chat_id, "💹 برای امروز اطلاعاتی وجود ندارد.", keyboard)
                 return
 
-            # ===== مقایسه روزانه =====
             if text == "📉 مقایسه روزانه":
                 comparison = get_daily_comparison()
                 if comparison:
@@ -5091,13 +5014,11 @@ def handle_message(message):
                     send_message(chat_id, "📉 داده کافی وجود ندارد.", keyboard)
                 return
 
-            # ===== گزارش تاریخ خاص (ادمین) =====
             if text == "📅 گزارش تاریخ خاص":
                 user_states[chat_id]["state"] = "WAITING_FOR_ADMIN_DATE"
                 send_message(chat_id, "📅 لطفاً تاریخ مورد نظر را به فرمت **YYYY/MM/DD** وارد کنید (مثلاً ۱۴۰۳/۰۱/۱۵):", get_cancel_keyboard())
                 return
 
-            # ===== بهترین/بدترین روز =====
             if text == "📊 بهترین/بدترین روز":
                 best, worst = get_best_worst_days(5)
                 msg = "📊 **بهترین روزهای استان**\n━━━━━━━━━━━━━━━━━━\n"
@@ -5116,7 +5037,6 @@ def handle_message(message):
                 send_message(chat_id, msg, keyboard)
                 return
 
-            # ===== منوی پیش‌فرض =====
             keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
             send_message(chat_id, "لطفاً یک گزینه از منو انتخاب کنید:", keyboard)
             return
