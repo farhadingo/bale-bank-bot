@@ -1,4 +1,3 @@
-```python
 import os
 import time
 import logging
@@ -5178,4 +5177,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
+
