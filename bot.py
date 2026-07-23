@@ -865,8 +865,10 @@ def get_actual_stats_for_date(shamsi_date):
 
 def compare_collection_with_actual(branch_id, shamsi_date):
     """
-    مقایسه وصول ثبت‌شده با آمار واقعی.
-    اگر مقدار واقعی منفی باشد، آن را صفر در نظر می‌گیریم (برای محاسبه) اما مقدار اصلی را برمی‌گردانیم.
+    مقایسه وصول ثبت‌شده با آمار واقعی با منطق جدید:
+    - اگر واقعی منفی باشد (کاهش مطالبات) و ثبت‌شده مثبت باشد → انطباق ۱۰۰٪
+    - اگر واقعی صفر باشد و ثبت‌شده صفر باشد → ۱۰۰٪
+    - در غیر این صورت، نسبت ثبت‌شده به واقعی (با حد بالای ۱۰۰٪)
     """
     conn = None
     try:
@@ -887,18 +889,37 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             if not actual:
                 return None
             total_col = collection[0] if collection else 0
-            total_act_raw = actual[0]
-            # اگر مقدار واقعی منفی است، آن را صفر در نظر می‌گیریم برای محاسبات
-            total_act = total_act_raw if total_act_raw >= 0 else 0
-            if total_act > 0:
-                match_percent = (min(total_col, total_act) / max(total_col, total_act)) * 100
+            total_act_raw = actual[0]  # ممکن است منفی باشد
+
+            # محاسبه درصد انطباق بر اساس منطق جدید
+            if total_act_raw < 0:
+                # واقعی منفی است (کاهش مطالبات)
+                if total_col >= 0:
+                    # معاون وصول داشته، عملکرد عالی
+                    match_percent = 100.0
+                else:
+                    match_percent = 0.0
+            elif total_act_raw == 0:
+                # واقعی صفر است
+                if total_col == 0:
+                    match_percent = 100.0
+                else:
+                    match_percent = 0.0
             else:
-                match_percent = 0 if total_col > 0 else 100
+                # واقعی مثبت است
+                if total_col > 0:
+                    match_percent = min(1.0, total_col / total_act_raw) * 100
+                else:
+                    match_percent = 0.0
+
+            # اختلاف را بر اساس مقادیر اصلی محاسبه می‌کنیم (ممکن است منفی باشد)
+            diff = total_col - total_act_raw
+
             return {
                 'total_collected': total_col,
-                'total_actual': total_act_raw,  # مقدار اصلی (ممکن است منفی باشد)
+                'total_actual': total_act_raw,
                 'match_percent': match_percent,
-                'diff_total': total_col - total_act  # اختلاف بر اساس مقدار صفر شده
+                'diff_total': diff
             }
     except Exception as e:
         logger.error(f"compare_collection_with_actual error: {e}")
@@ -924,8 +945,9 @@ def get_deputy_match_report(user_id, days=30):
                     c.total_amount as collected,
                     a.total_actual as actual,
                     CASE 
-                        WHEN a.total_actual > 0 
-                        THEN ROUND((c.total_amount * 100.0) / a.total_actual, 2)
+                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN 100
+                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                        WHEN a.total_actual > 0 THEN ROUND((c.total_amount * 100.0) / a.total_actual, 2)
                         ELSE 0 
                     END as match_percent
                 FROM collections c
@@ -1391,8 +1413,9 @@ def get_analytical_chart_data(chart_type, days=10):
                     SELECT 
                         b.name,
                         COALESCE(AVG(CASE 
-                            WHEN a.total_actual > 0 
-                            THEN (c.total_amount * 100.0) / a.total_actual
+                            WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN 100
+                            WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                            WHEN a.total_actual > 0 THEN (c.total_amount * 100.0) / a.total_actual
                             ELSE 0 
                         END), 0) as match_percent
                     FROM branches b
@@ -4680,7 +4703,8 @@ def handle_message(message):
                     return
                 msg = f"📊 **گزارش مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}**\n"
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                msg += f"این گزارش نشان‌دهنده میزان تطابق آمار ثبت‌شده توسط معاونین با آمار واقعی وصول است.\n\n"
+                msg += f"این گزارش نشان‌دهنده میزان تطابق آمار ثبت‌شده توسط معاونین با آمار واقعی وصول است.\n"
+                msg += f"توجه: اگر آمار واقعی منفی باشد (کاهش مطالبات) و معاون عدد مثبت ثبت کرده باشد، انطباق ۱۰۰٪ در نظر گرفته می‌شود.\n\n"
                 total_collected_all = 0
                 total_actual_all = 0
                 perfect_count = 0
@@ -4705,8 +4729,8 @@ def handle_message(message):
                         low_match_count += 1
                     else:
                         status = "🔴 ضعیف"
-                    # نمایش مقدار واقعی - حالا عدد را نشان می‌دهیم (حتی اگر منفی باشد)
-                    actual_display = f"{actual//1_000_000:,.0f}"  # همیشه نمایش عدد
+                    # نمایش مقدار واقعی - حتی اگر منفی باشد
+                    actual_display = f"{actual//1_000_000:,.0f}"
                     # اختلاف بر اساس مقدار صفر شده محاسبه شده است (diff)
                     diff_text = ""
                     if diff > 0:
