@@ -866,7 +866,6 @@ def get_actual_stats_for_date(shamsi_date):
 def compare_collection_with_actual(branch_id, shamsi_date):
     """
     مقایسه وصول ثبت‌شده با آمار واقعی
-    اختلاف = واقعی - ثبت (به ریال)
     """
     conn = None
     try:
@@ -889,9 +888,9 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             total_col = collection[0] if collection else 0
             total_act_raw = actual[0]  # ممکن است منفی باشد
 
-            # محاسبه انطباق بر اساس قدر مطلق
             col_abs = abs(total_col)
             act_abs = abs(total_act_raw)
+
             if col_abs == 0 and act_abs == 0:
                 match_percent = 100.0
             elif col_abs == 0 or act_abs == 0:
@@ -899,7 +898,7 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             else:
                 match_percent = (min(col_abs, act_abs) / max(col_abs, act_abs)) * 100
 
-            diff = total_act_raw - total_col  # اختلاف واقعی - ثبت (می‌تواند منفی باشد)
+            diff = act_abs - col_abs  # اختلاف قدر مطلق ها
 
             return {
                 'total_collected': total_col,
@@ -935,7 +934,7 @@ def get_deputy_match_report(user_id, days=30):
                         WHEN ABS(a.total_actual) = 0 OR ABS(c.total_amount) = 0 THEN 0
                         ELSE ROUND((MIN(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / MAX(ABS(a.total_actual), ABS(c.total_amount)), 2)
                     END as match_percent,
-                    (a.total_actual - c.total_amount) as diff
+                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
                 FROM collections c
                 LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
                 WHERE c.branch_id = %s 
@@ -4680,7 +4679,7 @@ def handle_message(message):
                             'collected': comp['total_collected'],
                             'actual': comp['total_actual'],  # ممکن است منفی باشد
                             'match_pct': comp['match_percent'],
-                            'diff': comp['diff_total']  # اختلاف = واقعی - ثبت
+                            'diff': comp['diff_total']  # قدر مطلق ها
                         })
                 if not comparison_data:
                     keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
@@ -4688,12 +4687,11 @@ def handle_message(message):
                     user_states[chat_id]["state"] = "LOGGED_IN"
                     return
 
-                # شروع ساخت گزارش
+                # شروع ساخت گزارش با فرمت جدید
                 msg = f"📊 **گزارش مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}**\n"
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 msg += f"این گزارش نشان‌دهنده میزان تطابق آمار ثبت‌شده توسط معاونین با آمار واقعی وصول است.\n"
-                msg += f"انطباق بر اساس قدر مطلق هر دو عدد محاسبه می‌شود.\n"
-                msg += f"اختلاف = واقعی - ثبت (مثبت یعنی واقعی بیشتر، منفی یعنی واقعی کمتر)\n\n"
+                msg += f"انطباق بر اساس قدر مطلق هر دو عدد محاسبه می‌شود.\n\n"
 
                 total_col_abs = 0
                 total_act_abs = 0
@@ -4706,21 +4704,23 @@ def handle_message(message):
 
                 for item in comparison_data:
                     branch_name = item['branch_name']
-                    collected = item['collected']
-                    actual = item['actual']
+                    collected = item['collected']  # به ریال
+                    actual = item['actual']        # به ریال (ممکن است منفی باشد)
                     match_pct = item['match_pct']
-                    diff = item['diff']  # واقعی - ثبت
+                    diff = item['diff']  # |واقعی| - |ثبت|
 
                     col_abs = abs(collected)
                     act_abs = abs(actual)
                     total_col_abs += col_abs
                     total_act_abs += act_abs
 
+                    # جمع اختلافات مثبت و منفی (بر اساس قدر مطلق)
                     if diff > 0:
                         sum_positive_diff += diff
                     elif diff < 0:
-                        sum_negative_diff += diff
+                        sum_negative_diff += diff  # منفی است
 
+                    # وضعیت انطباق
                     if match_pct >= 95:
                         status = "✅ عالی"
                         perfect_count += 1
@@ -4734,27 +4734,27 @@ def handle_message(message):
                         status = "🔴 ضعیف"
                         weak_match_count += 1
 
-                    # نمایش واقعی با علامت
+                    # نمایش واقعی بدون علامت با توضیح افزایش/کاهش
                     if actual > 0:
-                        actual_display = f"+{actual//1_000_000:,.0f} میلیون ریال (افزایش)"
+                        actual_display = f"{act_abs//1_000_000:,.0f} میلیون ریال (افزایش)"
                     elif actual < 0:
-                        actual_display = f"{actual//1_000_000:,.0f} میلیون ریال (کاهش)"
+                        actual_display = f"{act_abs//1_000_000:,.0f} میلیون ریال (کاهش)"
                     else:
                         actual_display = "0 میلیون ریال"
 
-                    # نمایش اختلاف
+                    # نمایش اختلاف با توضیح
                     if diff > 0:
-                        diff_text = f"📈 +{diff//1_000_000:,.0f} میلیون ریال (افزایش)"
+                        diff_text = f"{diff//1_000_000:,.0f} میلیون ریال بیشتر از ثبت"
                     elif diff < 0:
-                        diff_text = f"📉 {diff//1_000_000:,.0f} میلیون ریال (کاهش)"
+                        diff_text = f"{abs(diff)//1_000_000:,.0f} میلیون ریال کمتر از ثبت"
                     else:
-                        diff_text = "✅ بدون تغییر"
+                        diff_text = "مطابق با ثبت"
 
                     msg += f"🏢 **{branch_name}**\n"
                     msg += f"   📝 ثبت‌شده: {col_abs//1_000_000:,.0f} میلیون ریال\n"
                     msg += f"   📊 واقعی: {actual_display}\n"
                     msg += f"   📈 انطباق: {match_pct:.1f}% - {status}\n"
-                    msg += f"   📌 اختلاف (واقعی - ثبت): {diff_text}\n\n"
+                    msg += f"   📌 اختلاف: {diff_text}\n\n"
 
                 # خلاصه کلی
                 if total_col_abs == 0 and total_act_abs == 0:
