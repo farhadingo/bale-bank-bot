@@ -4687,25 +4687,40 @@ def handle_message(message):
                     send_message(chat_id, f"📭 هیچ وصولی برای تاریخ {get_shamsi_date_formatted(shamsi_date)} ثبت نشده است.", keyboard)
                     user_states[chat_id]["state"] = "LOGGED_IN"
                     return
+
+                # شروع ساخت گزارش
                 msg = f"📊 **گزارش مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}**\n"
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 msg += f"این گزارش نشان‌دهنده میزان تطابق آمار ثبت‌شده توسط معاونین با آمار واقعی وصول است.\n"
-                msg += f"انطباق بر اساس قدر مطلق هر دو عدد محاسبه می‌شود. اختلاف = |واقعی| - |ثبت‌شده|\n\n"
+                msg += f"انطباق بر اساس قدر مطلق هر دو عدد محاسبه می‌شود.\n"
+                msg += f"اختلاف = |واقعی| - |ثبت‌شده| (مثبت یعنی واقعی بیشتر، منفی یعنی ثبت‌شده بیشتر)\n\n"
+
                 total_col_abs = 0
                 total_act_abs = 0
                 perfect_count = 0
                 high_match_count = 0
-                low_match_count = 0
+                medium_match_count = 0
+                weak_match_count = 0
+                sum_positive_diff = 0
+                sum_negative_diff = 0
+
                 for item in comparison_data:
                     branch_name = item['branch_name']
-                    collected = item['collected']
-                    actual = item['actual']
+                    collected = item['collected']  # عدد صحیح به ریال
+                    actual = item['actual']        # عدد صحیح به ریال (ممکن است منفی)
                     match_pct = item['match_pct']
                     diff = item['diff']  # |actual| - |collected|
+
                     col_abs = abs(collected)
                     act_abs = abs(actual)
                     total_col_abs += col_abs
                     total_act_abs += act_abs
+
+                    if diff > 0:
+                        sum_positive_diff += diff
+                    elif diff < 0:
+                        sum_negative_diff += diff  # منفی است
+
                     if match_pct >= 95:
                         status = "✅ عالی"
                         perfect_count += 1
@@ -4714,22 +4729,33 @@ def handle_message(message):
                         high_match_count += 1
                     elif match_pct >= 50:
                         status = "🟡 متوسط"
-                        low_match_count += 1
+                        medium_match_count += 1
                     else:
                         status = "🔴 ضعیف"
-                    actual_display = f"{actual//1_000_000:,.0f}"
-                    diff_text = ""
-                    if diff > 0:
-                        diff_text = f"📈 {diff//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"  # واقعی بیشتر
-                    elif diff < 0:
-                        diff_text = f"📉 {abs(diff)//1_000_000:,.0f} میلیون ریال کمتر از واقعی"  # واقعی کمتر
+                        weak_match_count += 1
+
+                    # نمایش مقدار واقعی با علامت و کلمه
+                    if actual > 0:
+                        actual_display = f"+{actual//1_000_000:,.0f} میلیون ریال (افزایش)"
+                    elif actual < 0:
+                        actual_display = f"{actual//1_000_000:,.0f} میلیون ریال (کاهش)"
                     else:
-                        diff_text = "✅ کاملاً مطابق"
+                        actual_display = "0 میلیون ریال"
+
+                    # نمایش اختلاف
+                    if diff > 0:
+                        diff_text = f"📈 +{diff//1_000_000:,.0f} میلیون ریال (افزایش)"
+                    elif diff < 0:
+                        diff_text = f"📉 {diff//1_000_000:,.0f} میلیون ریال (کاهش)"
+                    else:
+                        diff_text = "✅ بدون تغییر"
+
                     msg += f"🏢 **{branch_name}**\n"
                     msg += f"   📝 ثبت‌شده: {col_abs//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"   📊 واقعی: {actual_display} میلیون ریال\n"
+                    msg += f"   📊 واقعی: {actual_display}\n"
                     msg += f"   📈 انطباق: {match_pct:.1f}% - {status}\n"
-                    msg += f"   📌 اختلاف: {diff_text}\n\n"
+                    msg += f"   📌 تغییر نسبت به ثبت: {diff_text}\n\n"
+
                 # خلاصه کلی
                 if total_col_abs == 0 and total_act_abs == 0:
                     total_match_pct = 100.0
@@ -4737,25 +4763,29 @@ def handle_message(message):
                     total_match_pct = 0.0
                 else:
                     total_match_pct = (min(total_col_abs, total_act_abs) / max(total_col_abs, total_act_abs)) * 100
+
                 total_diff_abs = total_act_abs - total_col_abs
-                diff_total_text = ""
                 if total_diff_abs > 0:
-                    diff_total_text = f"📈 {total_diff_abs//1_000_000:,.0f} میلیون ریال بیشتر از واقعی"
+                    diff_total_text = f"📈 +{total_diff_abs//1_000_000:,.0f} میلیون ریال (افزایش کلی)"
                 elif total_diff_abs < 0:
-                    diff_total_text = f"📉 {abs(total_diff_abs)//1_000_000:,.0f} میلیون ریال کمتر از واقعی"
+                    diff_total_text = f"📉 {total_diff_abs//1_000_000:,.0f} میلیون ریال (کاهش کلی)"
                 else:
-                    diff_total_text = "✅ کاملاً مطابق"
+                    diff_total_text = "✅ بدون تغییر کلی"
+
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 msg += f"📊 **خلاصه کلی**\n"
                 msg += f"   🏢 تعداد شعب: {len(comparison_data)}\n"
                 msg += f"   ✅ انطباق عالی (≥۹۵%): {perfect_count} شعبه\n"
                 msg += f"   🟢 انطباق خوب (≥۸۰%): {high_match_count} شعبه\n"
-                msg += f"   🟡 انطباق متوسط (≥۵۰%): {low_match_count} شعبه\n"
-                msg += f"   🔴 انطباق ضعیف (<۵۰%): {len(comparison_data) - perfect_count - high_match_count - low_match_count} شعبه\n\n"
+                msg += f"   🟡 انطباق متوسط (≥۵۰%): {medium_match_count} شعبه\n"
+                msg += f"   🔴 انطباق ضعیف (<۵۰%): {weak_match_count} شعبه\n\n"
+                msg += f"💰 مجموع افزایش‌ها (واقعی > ثبت): +{sum_positive_diff//1_000_000:,.0f} میلیون ریال\n"
+                msg += f"💰 مجموع کاهش‌ها (واقعی < ثبت): {sum_negative_diff//1_000_000:,.0f} میلیون ریال\n"
                 msg += f"💰 کل ثبت‌شده استان (قدر مطلق): {total_col_abs//1_000_000:,.0f} میلیون ریال\n"
                 msg += f"💰 کل واقعی استان (قدر مطلق): {total_act_abs//1_000_000:,.0f} میلیون ریال\n"
                 msg += f"📈 انطباق کلی: {total_match_pct:.1f}%\n"
-                msg += f"📌 اختلاف کل: {diff_total_text}"
+                msg += f"📌 خالص تغییرات: {diff_total_text}"
+
                 keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
                 send_message(chat_id, msg, keyboard)
                 user_states[chat_id]["state"] = "LOGGED_IN"
