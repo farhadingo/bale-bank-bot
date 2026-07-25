@@ -1,4 +1,4 @@
-impor os
+import os
 import time
 import logging
 import requests
@@ -865,7 +865,7 @@ def get_actual_stats_for_date(shamsi_date):
 
 def compare_collection_with_actual(branch_id, shamsi_date):
     """
-    مقایسه وصول ثبت‌شده با آمار واقعی
+    مقایسه وصول ثبت‌شده با آمار واقعی - بازگشت دقت ثبت بر اساس فرمول جدید
     """
     conn = None
     try:
@@ -891,20 +891,25 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             col_abs = abs(total_col)
             act_abs = abs(total_act_raw)
 
+            # محاسبه دقت ثبت با فرمول جدید
             if col_abs == 0 and act_abs == 0:
-                match_percent = 100.0
+                accuracy = 100.0
             elif col_abs == 0 or act_abs == 0:
-                match_percent = 0.0
+                accuracy = 0.0
             else:
-                match_percent = (min(col_abs, act_abs) / max(col_abs, act_abs)) * 100
+                diff_abs = abs(col_abs - act_abs)
+                max_val = max(col_abs, act_abs)
+                accuracy = (1 - (diff_abs / max_val)) * 100
 
-            diff = act_abs - col_abs  # اختلاف قدر مطلق ها
+            diff_abs_value = abs(col_abs - act_abs)
+            is_col_more = col_abs > act_abs
 
             return {
                 'total_collected': total_col,
                 'total_actual': total_act_raw,
-                'match_percent': match_percent,
-                'diff_total': diff
+                'accuracy': accuracy,
+                'diff_abs': diff_abs_value,
+                'is_col_more': is_col_more  # True اگر ثبت بیشتر از واقعی باشد
             }
     except Exception as e:
         logger.error(f"compare_collection_with_actual error: {e}")
@@ -932,9 +937,10 @@ def get_deputy_match_report(user_id, days=30):
                     CASE 
                         WHEN ABS(a.total_actual) = 0 AND ABS(c.total_amount) = 0 THEN 100
                         WHEN ABS(a.total_actual) = 0 OR ABS(c.total_amount) = 0 THEN 0
-                        ELSE ROUND((MIN(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / MAX(ABS(a.total_actual), ABS(c.total_amount)), 2)
-                    END as match_percent,
-                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
+                        ELSE ROUND((1 - (ABS(ABS(a.total_actual) - ABS(c.total_amount)) * 1.0 / MAX(ABS(a.total_actual), ABS(c.total_amount)))) * 100, 2)
+                    END as accuracy,
+                    ABS(ABS(a.total_actual) - ABS(c.total_amount)) as diff_abs,
+                    CASE WHEN ABS(c.total_amount) > ABS(a.total_actual) THEN TRUE ELSE FALSE END as is_col_more
                 FROM collections c
                 LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
                 WHERE c.branch_id = %s 
@@ -1401,15 +1407,15 @@ def get_analytical_chart_data(chart_type, days=10):
                             CASE 
                                 WHEN ABS(a.total_actual) = 0 AND ABS(c.total_amount) = 0 THEN 100
                                 WHEN ABS(a.total_actual) = 0 OR ABS(c.total_amount) = 0 THEN 0
-                                ELSE (MIN(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / MAX(ABS(a.total_actual), ABS(c.total_amount))
+                                ELSE (1 - (ABS(ABS(a.total_actual) - ABS(c.total_amount)) * 1.0 / MAX(ABS(a.total_actual), ABS(c.total_amount)))) * 100
                             END
-                        ), 0) as match_percent
+                        ), 0) as accuracy
                     FROM branches b
                     LEFT JOIN collections c ON b.id = c.branch_id
                     LEFT JOIN actual_stats a ON b.id = a.branch_id AND c.shamsi_date = a.shamsi_date
                     WHERE c.shamsi_date >= %s
                     GROUP BY b.name
-                    ORDER BY match_percent DESC
+                    ORDER BY accuracy DESC
                 """, (get_shamsi_date(-days),))
                 data = cur.fetchall()
                 return {
@@ -4646,7 +4652,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== مقایسه انطباق (گزارش متنی دقیق) =====
+        # ===== مقایسه انطباق (گزارش متنی دقیق) - فرمت جدید =====
         if text == "📊 مقایسه انطباق" and (role == 'admin' or is_super_admin):
             if not get_actual_stats_status():
                 send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
@@ -4669,6 +4675,7 @@ def handle_message(message):
                     send_message(chat_id, f"📭 هیچ آمار واقعی برای تاریخ {get_shamsi_date_formatted(shamsi_date)} ثبت نشده است.", keyboard)
                     user_states[chat_id]["state"] = "LOGGED_IN"
                     return
+                
                 comparison_data = []
                 for item in actual_data:
                     branch_id, branch_name, total_act_rial = item
@@ -4677,126 +4684,97 @@ def handle_message(message):
                         comparison_data.append({
                             'branch_name': branch_name,
                             'collected': comp['total_collected'],
-                            'actual': comp['total_actual'],  # ممکن است منفی باشد
-                            'match_pct': comp['match_percent'],
-                            'diff': comp['diff_total']  # قدر مطلق ها
+                            'actual': comp['total_actual'],
+                            'accuracy': comp['accuracy'],
+                            'diff_abs': comp['diff_abs'],
+                            'is_col_more': comp['is_col_more']
                         })
+                
                 if not comparison_data:
                     keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
                     send_message(chat_id, f"📭 هیچ وصولی برای تاریخ {get_shamsi_date_formatted(shamsi_date)} ثبت نشده است.", keyboard)
                     user_states[chat_id]["state"] = "LOGGED_IN"
                     return
 
-                # شروع ساخت گزارش با فرمت جدید
+                # ساخت گزارش با فرمت جدید
                 msg = f"📊 **گزارش مقایسه انطباق - {get_shamsi_date_formatted(shamsi_date)}**\n"
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                msg += f"این گزارش نشان‌دهنده میزان تطابق آمار ثبت‌شده توسط معاونین با آمار واقعی وصول است.\n"
-                msg += f"انطباق بر اساس قدر مطلق هر دو عدد محاسبه می‌شود.\n\n"
 
-                total_col_abs = 0
-                total_act_abs = 0
-                perfect_count = 0
-                high_match_count = 0
-                medium_match_count = 0
-                weak_match_count = 0
-                sum_positive_diff = 0
-                sum_negative_diff = 0
+                accuracies = []
+                outlier_branches = []
+                outlier_threshold = 3  # انحراف معیار
 
+                # جمع‌آوری دقت‌ها برای محاسبه outlier
+                for item in comparison_data:
+                    accuracies.append(item['accuracy'])
+
+                if accuracies:
+                    mean_acc = sum(accuracies) / len(accuracies)
+                    std_acc = (sum((x - mean_acc) ** 2 for x in accuracies) / len(accuracies)) ** 0.5
+                    threshold = mean_acc + outlier_threshold * std_acc if std_acc > 0 else 100
+                else:
+                    threshold = 100
+
+                # تولید خطوط هر شعبه
                 for item in comparison_data:
                     branch_name = item['branch_name']
-                    collected = item['collected']  # به ریال
-                    actual = item['actual']        # به ریال (ممکن است منفی باشد)
-                    match_pct = item['match_pct']
-                    diff = item['diff']  # |واقعی| - |ثبت|
+                    col_abs = abs(item['collected'])
+                    act_abs = abs(item['actual'])
+                    accuracy = item['accuracy']
+                    diff_abs = item['diff_abs']
+                    is_col_more = item['is_col_more']
 
-                    col_abs = abs(collected)
-                    act_abs = abs(actual)
-                    total_col_abs += col_abs
-                    total_act_abs += act_abs
-
-                    # جمع اختلافات مثبت و منفی (بر اساس قدر مطلق)
-                    if diff > 0:
-                        sum_positive_diff += diff
-                    elif diff < 0:
-                        sum_negative_diff += diff  # منفی است
-
-                    # وضعیت انطباق
-                    if match_pct >= 95:
-                        status = "✅ عالی"
-                        perfect_count += 1
-                    elif match_pct >= 80:
-                        status = "🟢 خوب"
-                        high_match_count += 1
-                    elif match_pct >= 50:
-                        status = "🟡 متوسط"
-                        medium_match_count += 1
+                    # انتخاب ایموجی
+                    if accuracy >= 95:
+                        emoji = "✅"
+                    elif accuracy >= 80:
+                        emoji = "🟢"
+                    elif accuracy >= 50:
+                        emoji = "🟡"
                     else:
-                        status = "🔴 ضعیف"
-                        weak_match_count += 1
+                        emoji = "🔴"
 
-                    # نمایش واقعی بدون علامت با توضیح افزایش/کاهش
-                    if actual > 0:
-                        actual_display = f"{act_abs//1_000_000:,.0f} میلیون ریال (افزایش)"
-                    elif actual < 0:
-                        actual_display = f"{act_abs//1_000_000:,.0f} میلیون ریال (کاهش)"
+                    # تعیین عبارت اختلاف
+                    if is_col_more:
+                        diff_text = "ثبت‌شده بیشتر از واقعی بوده"
                     else:
-                        actual_display = "0 میلیون ریال"
-
-                    # نمایش اختلاف با توضیح کامل داخل پرانتز
-                    if diff > 0:
-                        if actual > 0:
-                            # واقعی افزایش داشته و اختلاف مثبت است
-                            extra_text = "یعنی علاوه بر وصول ثبت‌شده، این مقدار نیز افزایش داشته است"
-                        else:
-                            # واقعی کاهش داشته و اختلاف مثبت است
-                            extra_text = "یعنی با وجود کاهش واقعی، وصول ثبت‌شده کمتر از میزان کاهش بوده است"
-                        diff_text = f"{diff//1_000_000:,.0f} میلیون ریال بیشتر از ثبت ({extra_text})"
-                    elif diff < 0:
-                        if actual > 0:
-                            # واقعی افزایش داشته و اختلاف منفی است
-                            extra_text = "یعنی با وجود افزایش واقعی، وصول ثبت‌شده بیشتر از میزان افزایش بوده است"
-                        else:
-                            # واقعی کاهش داشته و اختلاف منفی است
-                            extra_text = "یعنی میزان کاهش واقعی، بیشتر از وصول ثبت‌شده است"
-                        diff_text = f"{abs(diff)//1_000_000:,.0f} میلیون ریال کمتر از ثبت ({extra_text})"
-                    else:
-                        diff_text = "مطابق با ثبت"
+                        diff_text = "ثبت‌شده کمتر از واقعی بوده"
 
                     msg += f"🏢 **{branch_name}**\n"
-                    msg += f"   📝 ثبت‌شده: {col_abs//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"   📊 واقعی: {actual_display}\n"
-                    msg += f"   📈 انطباق: {match_pct:.1f}% - {status}\n"
-                    msg += f"   📌 اختلاف: {diff_text}\n\n"
+                    msg += f"📝 ثبت‌شده: {col_abs//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"📊 واقعی: {act_abs//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"↕️ اختلاف: {diff_abs//1_000_000:,.0f} ({diff_text})\n"
+                    msg += f"🎯 دقت ثبت: {accuracy:.1f}% {emoji}\n"
 
-                # خلاصه کلی
-                if total_col_abs == 0 and total_act_abs == 0:
-                    total_match_pct = 100.0
-                elif total_col_abs == 0 or total_act_abs == 0:
-                    total_match_pct = 0.0
-                else:
-                    total_match_pct = (min(total_col_abs, total_act_abs) / max(total_col_abs, total_act_abs)) * 100
+                    # بررسی هشدار خطای ثبتی
+                    if col_abs > 0 and act_abs > 0:
+                        smaller = min(col_abs, act_abs)
+                        larger = max(col_abs, act_abs)
+                        if larger > 10 * smaller:
+                            msg += f"⚠️ این عدد را دستی بررسی کن - احتمال خطای ثبتی بالا است\n"
+                    
+                    # بررسی outlier
+                    if accuracy < threshold - 20:  # اگر دقت به طور قابل توجهی پایین‌تر از میانگین بود
+                        outlier_branches.append(branch_name)
 
-                total_diff_abs = total_act_abs - total_col_abs
-                if total_diff_abs > 0:
-                    diff_total_text = f"📈 +{total_diff_abs//1_000_000:,.0f} میلیون ریال (افزایش کلی)"
-                elif total_diff_abs < 0:
-                    diff_total_text = f"📉 {total_diff_abs//1_000_000:,.0f} میلیون ریال (کاهش کلی)"
-                else:
-                    diff_total_text = "✅ بدون تغییر کلی"
+                    msg += "\n"
+
+                # محاسبه میانگین دقت (بدون outlierها)
+                filtered_accuracies = []
+                for i, item in enumerate(comparison_data):
+                    if comparison_data[i]['branch_name'] not in outlier_branches:
+                        filtered_accuracies.append(accuracies[i])
+
+                avg_accuracy = sum(filtered_accuracies) / len(filtered_accuracies) if filtered_accuracies else 0
 
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 msg += f"📊 **خلاصه کلی**\n"
                 msg += f"   🏢 تعداد شعب: {len(comparison_data)}\n"
-                msg += f"   ✅ انطباق عالی (≥۹۵%): {perfect_count} شعبه\n"
-                msg += f"   🟢 انطباق خوب (≥۸۰%): {high_match_count} شعبه\n"
-                msg += f"   🟡 انطباق متوسط (≥۵۰%): {medium_match_count} شعبه\n"
-                msg += f"   🔴 انطباق ضعیف (<۵۰%): {weak_match_count} شعبه\n\n"
-                msg += f"💰 مجموع افزایش‌ها (واقعی > ثبت): +{sum_positive_diff//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"💰 مجموع کاهش‌ها (واقعی < ثبت): {sum_negative_diff//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"💰 کل ثبت‌شده استان (قدر مطلق): {total_col_abs//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"💰 کل واقعی استان (قدر مطلق): {total_act_abs//1_000_000:,.0f} میلیون ریال\n"
-                msg += f"📈 انطباق کلی: {total_match_pct:.1f}%\n"
-                msg += f"📌 خالص تغییرات: {diff_total_text}"
+                msg += f"   📈 میانگین دقت ثبت: {avg_accuracy:.1f}%\n"
+
+                if outlier_branches:
+                    msg += f"   ⚠️ شعب با اختلاف غیرعادی (حذف از میانگین): {', '.join(outlier_branches)}\n"
+                    msg += f"      این شعب به‌صورت جداگانه بررسی شوند.\n"
 
                 keyboard = get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard()
                 send_message(chat_id, msg, keyboard)
