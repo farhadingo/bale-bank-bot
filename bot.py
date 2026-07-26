@@ -903,6 +903,46 @@ def compare_collection_with_actual(branch_id, shamsi_date):
         if conn:
             return_db_connection(conn)
 
+def get_deputy_match_report(user_id, days=30):
+    """گزارش انطباق معاون - اصلاح شده با LEAST و GREATEST"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT branch_id FROM users WHERE id = %s", (user_id,))
+            branch = cur.fetchone()
+            if not branch:
+                return None
+            branch_id = branch[0]
+            shamsi_start = get_shamsi_date(-days)
+            
+            # کوئری اصلاح شده با LEAST و GREATEST به جای MIN/MAX
+            cur.execute("""
+                SELECT 
+                    c.shamsi_date,
+                    c.total_amount as collected,
+                    a.total_actual as actual,
+                    CASE 
+                        WHEN ABS(a.total_actual) = 0 AND ABS(c.total_amount) = 0 THEN 100
+                        WHEN ABS(a.total_actual) = 0 OR ABS(c.total_amount) = 0 THEN 0
+                        ELSE ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 2)
+                    END as match_percent,
+                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
+                FROM collections c
+                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
+                WHERE c.branch_id = %s 
+                AND c.shamsi_date >= %s
+                AND a.total_actual IS NOT NULL
+                ORDER BY c.shamsi_date DESC
+            """, (branch_id, shamsi_start))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_deputy_match_report error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
 # ============================================================
 # توابع مدیریت معاونین
 # ============================================================
@@ -1354,7 +1394,7 @@ def get_analytical_chart_data(chart_type, days=10):
                             CASE 
                                 WHEN ABS(a.total_actual) = 0 AND ABS(c.total_amount) = 0 THEN 100
                                 WHEN ABS(a.total_actual) = 0 OR ABS(c.total_amount) = 0 THEN 0
-                                ELSE (1 - (ABS(ABS(a.total_actual) - ABS(c.total_amount)) * 1.0 / MAX(ABS(a.total_actual), ABS(c.total_amount)))) * 100
+                                ELSE (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
                             END
                         ), 0) as accuracy
                     FROM branches b
@@ -2425,7 +2465,7 @@ def get_others_performance_summary():
             return_db_connection(conn)
 
 # ============================================================
-# ارسال پیام و عکس
+# ارسال پیام و عکس - اصلاح شده برای افزایش Timeout و مدیریت خطا
 # ============================================================
 def send_message(chat_id, text, reply_markup=None, remove_keyboard=False):
     if not get_bot_status() and not is_super_admin_user(chat_id):
@@ -2443,12 +2483,16 @@ def send_message(chat_id, text, reply_markup=None, remove_keyboard=False):
     elif reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        res = requests_session.post(url, json=payload, timeout=15)
+        res = requests_session.post(url, json=payload, timeout=30)
         if res.status_code == 200:
             return res.json()
         else:
             logger.error(f"sendMessage failed: {res.status_code}")
             return None
+    except requests.exceptions.Timeout:
+        logger.error(f"sendMessage timeout for chat_id {chat_id}")
+        send_message_chunk(chat_id, "⏳ ارسال گزارش با تأخیر مواجه شد. لطفاً چند لحظه صبر کنید و دوباره تلاش کنید.")
+        return None
     except Exception as e:
         logger.error(f"sendMessage error: {e}")
         return None
@@ -2461,7 +2505,9 @@ def send_message_chunk(chat_id, text, reply_markup=None, remove_keyboard=False):
     elif reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests_session.post(url, json=payload, timeout=15)
+        requests_session.post(url, json=payload, timeout=30)
+    except requests.exceptions.Timeout:
+        logger.error(f"send_message_chunk timeout for chat_id {chat_id}")
     except Exception as e:
         logger.error(f"send_message_chunk error: {e}")
 
@@ -4360,12 +4406,14 @@ def handle_message(message):
                     msg += f"   📅 تاخیر: {perf['late']} روز\n"
                     msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
                     msg += f"   🏆 بهترین روز: {perf['best_day']//1_000_000:,.0f} میلیون ریال\n"
+                    # دریافت گزارش انطباق از تابع اصلاح شده
                     match_data = get_deputy_match_report(dep_id, 30)
                     if match_data:
                         total_match = 0
                         count = 0
                         for row in match_data:
-                            if row[2] > 0:
+                            # row[3] = match_percent
+                            if row[3] > 0:
                                 total_match += row[3]
                                 count += 1
                         if count > 0:
@@ -4599,7 +4647,7 @@ def handle_message(message):
             user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== گزارش مقایسه خوداظهاری - فرمت جدید نهایی =====
+        # ===== گزارش مقایسه خوداظهاری - فرمت نهایی =====
         if text == "📊 مقایسه انطباق" and (role == 'admin' or is_super_admin):
             if not get_actual_stats_status():
                 send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
