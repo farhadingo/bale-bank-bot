@@ -1,6 +1,7 @@
 requests
+psycopg2
 psycopg2-binary
-Flask
+flask
 jdatetime
 apscheduler
 matplotlib
@@ -8,5 +9,3 @@ numpy
 Pillow
 arabic_reshaper
 python-bidi
-setuptools
-wheel
