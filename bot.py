@@ -109,7 +109,6 @@ requests_session = create_session()
 # ============================================================
 # Connection Pool دیتابیس - اصلاح به ThreadedConnectionPool با افزایش ظرفیت
 # ============================================================
-# === بهینه‌سازی سرعت: افزایش min/max و استفاده از ThreadedConnectionPool ===
 try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(5, 30, DB_URL)
     logger.info("✅ ThreadedConnectionPool created with min=5, max=30.")
@@ -120,7 +119,6 @@ except Exception as e:
 # ============================================================
 # کش‌های هوشمند با TTL
 # ============================================================
-# === بهینه‌سازی سرعت: کش‌های جدید ===
 class TTLCache:
     def __init__(self, ttl_seconds=10):
         self._cache = {}
@@ -160,33 +158,26 @@ cache_adaptive = TTLCache(ttl_seconds=60)
 cache_forecast_all = TTLCache(ttl_seconds=120)
 
 # ============================================================
-# State Management
-# ============================================================
-user_states = {}
-# === بهینه‌سازی سرعت: ترکیب set + deque برای بررسی O(1) ===
-processed_updates = deque(maxlen=2000)
-processed_set = set()
-
-def get_db_connection():
-    if db_pool:
-        try:
-            return db_pool.getconn()
-        except:
-            return psycopg2.connect(DB_URL)
-    return psycopg2.connect(DB_URL)
-
-def return_db_connection(conn):
-    if db_pool and conn:
-        try:
-            db_pool.putconn(conn)
-        except:
-            conn.close()
-    elif conn:
-        conn.close()
-
-# ============================================================
 # توابع کش‌شده
 # ============================================================
+def get_bot_status_db():
+    """خواندن مستقیم وضعیت ربات از دیتابیس"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM settings WHERE key = 'bot_status'")
+            result = cur.fetchone()
+            if result:
+                return result[0] == 'active'
+            return True
+    except Exception as e:
+        logger.error(f"get_bot_status_db: {e}")
+        return True
+    finally:
+        if conn:
+            return_db_connection(conn)
+
 def get_cached_bot_status():
     cached = cache_bot_status.get('bot_status')
     if cached is not None:
@@ -222,7 +213,7 @@ def set_feature_setting(key, value):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO feature_settings (key, value, updated_at) 
+                INSERT INTO feature_settings (key, value, updated_at)
                 VALUES (%s, %s, %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
             """, (key, value, get_iran_time()))
@@ -261,7 +252,31 @@ def invalidate_branches_cache():
     cache_branches.invalidate('branches')
 
 # ============================================================
-# توابع کمکی (بدون تغییر)
+# State Management
+# ============================================================
+user_states = {}
+processed_updates = deque(maxlen=2000)
+processed_set = set()
+
+def get_db_connection():
+    if db_pool:
+        try:
+            return db_pool.getconn()
+        except:
+            return psycopg2.connect(DB_URL)
+    return psycopg2.connect(DB_URL)
+
+def return_db_connection(conn):
+    if db_pool and conn:
+        try:
+            db_pool.putconn(conn)
+        except:
+            conn.close()
+    elif conn:
+        conn.close()
+
+# ============================================================
+# توابع کمکی
 # ============================================================
 PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹'
 ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩'
@@ -293,7 +308,6 @@ def parse_number(text):
         return None
 
 def escape_markdown(text):
-    """فرار از کاراکترهای خاص Markdown"""
     if not text:
         return ""
     escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
@@ -302,7 +316,6 @@ def escape_markdown(text):
     return text
 
 def split_text_safely(text, max_len=4000):
-    """تقسیم متن با رعایت Markdown"""
     if len(text) <= max_len:
         return [text]
     chunks = []
@@ -321,7 +334,7 @@ def split_text_safely(text, max_len=4000):
     return chunks
 
 # ============================================================
-# تنظیم فونت فارسی برای Matplotlib - بهبود یافته
+# تنظیم فونت فارسی برای Matplotlib
 # ============================================================
 def setup_persian_font():
     try:
@@ -340,7 +353,7 @@ def setup_persian_font():
         ]
         plt.rcParams['font.family'] = 'sans-serif'
         plt.rcParams['axes.unicode_minus'] = False
-        
+
         for path in font_paths:
             if os.path.exists(path):
                 fm.fontManager.addfont(path)
@@ -348,7 +361,7 @@ def setup_persian_font():
                 plt.rcParams['font.family'] = prop.get_name()
                 logger.info(f"✅ Font loaded: {path}")
                 return True
-        
+
         plt.rcParams['font.family'] = ['DejaVu Sans', 'Liberation Sans', 'sans-serif']
         logger.warning("⚠️ No Persian font found, using fallback fonts")
         return False
@@ -410,7 +423,6 @@ def parse_shamsi_to_date(shamsi_str):
     except:
         return None
 
-# === رفع باگ شماره ۵: اصلاح تشخیص آخرین روز ماه با jdatetime ===
 def is_last_day_of_shamsi_month(shamsi_date_str):
     try:
         parts = shamsi_date_str.split('/')
@@ -460,7 +472,7 @@ def set_bot_status(status):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO settings (key, value, updated_at) 
+                INSERT INTO settings (key, value, updated_at)
                 VALUES ('bot_status', %s, %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
             """, ('active' if status else 'inactive', get_iran_time()))
@@ -480,9 +492,51 @@ def get_auto_reminder_status():
     return get_feature_setting('auto_reminder', 'active') == 'active'
 def set_auto_reminder_status(status):
     return set_feature_setting('auto_reminder', 'active' if status else 'inactive')
-# ... سایر توابع get/set feature_settings به همین شکل (با کش) ...
+def get_auto_report_status():
+    return get_feature_setting('auto_report', 'active') == 'active'
+def set_auto_report_status(status):
+    return set_feature_setting('auto_report', 'active' if status else 'inactive')
+def get_auto_alert_status():
+    return get_feature_setting('auto_alert', 'active') == 'active'
+def set_auto_alert_status(status):
+    return set_feature_setting('auto_alert', 'active' if status else 'inactive')
+def get_auto_scoring_status():
+    return get_feature_setting('auto_scoring', 'active') == 'active'
+def set_auto_scoring_status(status):
+    return set_feature_setting('auto_scoring', 'active' if status else 'inactive')
+def get_weekly_report_status():
+    return get_feature_setting('weekly_report', 'active') == 'active'
+def set_weekly_report_status(status):
+    return set_feature_setting('weekly_report', 'active' if status else 'inactive')
+def get_monthly_report_status():
+    return get_feature_setting('monthly_report', 'active') == 'active'
+def set_monthly_report_status(status):
+    return set_feature_setting('monthly_report', 'active' if status else 'inactive')
+def get_instant_notification_status():
+    return get_feature_setting('instant_notification', 'active') == 'active'
+def set_instant_notification_status(status):
+    return set_feature_setting('instant_notification', 'active' if status else 'inactive')
+def get_adaptive_report_status():
+    return get_feature_setting('adaptive_report', 'active') == 'active'
+def set_adaptive_report_status(status):
+    return set_feature_setting('adaptive_report', 'active' if status else 'inactive')
+def get_forecast_report_status():
+    return get_feature_setting('forecast_report', 'active') == 'active'
+def set_forecast_report_status(status):
+    return set_feature_setting('forecast_report', 'active' if status else 'inactive')
+def get_survey_system_status():
+    return get_feature_setting('survey_system', 'active') == 'active'
+def set_survey_system_status(status):
+    return set_feature_setting('survey_system', 'active' if status else 'inactive')
+def get_chart_report_status():
+    return get_feature_setting('chart_report', 'active') == 'active'
+def set_chart_report_status(status):
+    return set_feature_setting('chart_report', 'active' if status else 'inactive')
+def get_actual_stats_status():
+    return get_feature_setting('actual_stats', 'active') == 'active'
+def set_actual_stats_status(status):
+    return set_feature_setting('actual_stats', 'active' if status else 'inactive')
 
-# توابع تعطیلات و ... بدون تغییر (با همان منطق قبلی)
 def is_holiday(shamsi_date=None):
     if not shamsi_date:
         shamsi_date = get_shamsi_date()
@@ -730,7 +784,7 @@ def get_all_problems(status=None, limit=50):
         with conn.cursor() as cur:
             if status:
                 cur.execute("""
-                    SELECT p.id, u.full_name, u.employee_number, p.problem_text, p.category, p.status, 
+                    SELECT p.id, u.full_name, u.employee_number, p.problem_text, p.category, p.status,
                            p.created_at AT TIME ZONE 'Asia/Tehran' as created_at_iran
                     FROM problems p
                     JOIN users u ON p.user_id = u.id
@@ -761,7 +815,7 @@ def update_problem_status(problem_id, new_status):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE problems 
+                UPDATE problems
                 SET status = %s, updated_at = %s
                 WHERE id = %s
             """, (new_status, get_iran_time(), problem_id))
@@ -826,7 +880,7 @@ def submit_survey_response(survey_id, user_id, answers):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT COUNT(*) FROM survey_responses 
+                SELECT COUNT(*) FROM survey_responses
                 WHERE survey_id = %s AND user_id = %s
             """, (survey_id, user_id))
             if cur.fetchone()[0] > 0:
@@ -865,7 +919,7 @@ def get_survey_responses(survey_id):
             return_db_connection(conn)
 
 # ============================================================
-# توابع ایجاد جداول (بدون تغییر، اما با اضافه کردن ایندکس‌ها)
+# توابع ایجاد جداول (با ایندکس‌ها)
 # ============================================================
 def create_all_tables_if_not_exists():
     conn = None
@@ -1001,7 +1055,7 @@ def create_all_tables_if_not_exists():
                     CONSTRAINT unique_branch_actual_date UNIQUE (branch_id, shamsi_date)
                 )
             """)
-            # === بهینه‌سازی سرعت: ایندکس‌های ضروری ===
+            # ایندکس‌های بهینه‌سازی
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_branch_date ON collections(branch_id, shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_shamsi ON collections(shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id);")
@@ -1081,6 +1135,42 @@ def get_actual_stats_for_date(shamsi_date):
     except Exception as e:
         logger.error(f"get_actual_stats_for_date error: {e}")
         return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def compare_collection_with_actual(branch_id, shamsi_date):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT total_amount
+                FROM collections
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            collection = cur.fetchone()
+            cur.execute("""
+                SELECT total_actual
+                FROM actual_stats
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            actual = cur.fetchone()
+            if not actual:
+                return None
+            claimed = collection[0] if collection else 0
+            actual_raw = actual[0]
+
+            return {
+                'claimed': claimed,
+                'actual': actual_raw,
+                'abs_actual': abs(actual_raw),
+                'diff_abs': abs(abs(claimed) - abs(actual_raw)),
+                'is_claimed_more': abs(claimed) > abs(actual_raw) if actual_raw < 0 else None
+            }
+    except Exception as e:
+        logger.error(f"compare_collection_with_actual error: {e}")
+        return None
     finally:
         if conn:
             return_db_connection(conn)
@@ -1250,35 +1340,35 @@ def get_forecast_for_all_branches(days=7):
             return_db_connection(conn)
 
 # ============================================================
-# توابع نمودار - با پشتیبانی کامل از فارسی (اصلاح شده)
+# توابع نمودار - با پشتیبانی کامل از فارسی
 # ============================================================
 def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
     try:
         setup_persian_font()
         plt.figure(figsize=figsize)
-        
+
         title_fa = reshape_persian(title)
         x_label_fa = reshape_persian(x_label)
         y_label_fa = reshape_persian(y_label)
-        
+
         labels = [reshape_persian(str(lbl)) for lbl in data['labels']]
         values = [float(v) if v is not None else 0 for v in data['values']]
-        
+
         plt.xticks(rotation=45, ha='right', fontsize=10)
-        
+
         if chart_type == 'bar':
             plt.bar(labels, values, color='skyblue', edgecolor='navy')
             max_val = max(values) if values else 1
             for i, v in enumerate(values):
                 if v > 0:
-                    plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}", 
+                    plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
                             ha='center', va='bottom', fontsize=8)
         elif chart_type == 'line':
             plt.plot(labels, values, marker='o', linestyle='-', color='blue', linewidth=2, markersize=8)
             max_val = max(values) if values else 1
             for i, v in enumerate(values):
                 if v > 0:
-                    plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}", 
+                    plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
                             ha='center', va='bottom', fontsize=8)
         elif chart_type == 'pie':
             non_zero = [(l, v) for l, v in zip(labels, values) if v > 0]
@@ -1292,7 +1382,7 @@ def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10,
             max_val = max(values) if values else 1
             for i, v in enumerate(values):
                 if v > 0:
-                    plt.text(v + 0.02*max_val, i, f"{int(v)//1_000_000:,.0f}", 
+                    plt.text(v + 0.02*max_val, i, f"{int(v)//1_000_000:,.0f}",
                             va='center', fontsize=8)
         elif chart_type == 'stacked':
             if 'values2' in data:
@@ -1302,11 +1392,11 @@ def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10,
                 plt.legend()
             else:
                 plt.bar(labels, values, color='skyblue')
-        
+
         plt.title(title_fa, fontsize=14, fontweight='bold')
         plt.xlabel(x_label_fa)
         plt.ylabel(y_label_fa)
-        
+
         plt.tight_layout()
         img_bytes = io.BytesIO()
         plt.savefig(img_bytes, format='png', dpi=120, bbox_inches='tight')
@@ -1395,7 +1485,7 @@ def get_analytical_chart_data(chart_type, days=10):
                 }
             elif chart_type == 'deputy_others_ratio':
                 cur.execute("""
-                    SELECT 
+                    SELECT
                         SUM(deputy_amount) as deputy_total,
                         SUM(others_amount) as others_total
                     FROM collections
@@ -1421,16 +1511,15 @@ def get_analytical_chart_data(chart_type, days=10):
                     'values': [row[1] for row in reversed(data)]
                 }
             elif chart_type == 'match_analysis':
-                # === رفع باگ شماره ۲: یکسان‌سازی فرمول دقت ===
                 cur.execute("""
-                    SELECT 
+                    SELECT
                         b.name,
                         COALESCE(AVG(
-                            CASE 
+                            CASE
                                 WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN 100
                                 WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
                                 WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
-                                WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN 
+                                WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
                                     (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
                                 ELSE NULL
                             END
@@ -1516,7 +1605,6 @@ def find_user_by_telegram_id(chat_id):
             return_db_connection(conn)
 
 def log_user_activity(user_id, action, details=""):
-    # === بهینه‌سازی سرعت: لاگ‌های پرمصرف را سطح debug کنیم ===
     if action in ["collection_add", "login", "logout"]:
         logger.info(f"User {user_id} {action}")
     else:
@@ -1544,7 +1632,7 @@ def get_user_activity_log(limit=100):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT l.id, u.full_name, u.employee_number, l.action, l.details, 
+                SELECT l.id, u.full_name, u.employee_number, l.action, l.details,
                        l.created_at AT TIME ZONE 'Asia/Tehran' as created_at_iran
                 FROM user_activity_log l
                 JOIN users u ON l.user_id = u.id
@@ -1585,7 +1673,7 @@ def get_notes_for_collection(collection_id):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT n.id, u.full_name, n.note_text, 
+                SELECT n.id, u.full_name, n.note_text,
                        n.created_at AT TIME ZONE 'Asia/Tehran' as created_at_iran
                 FROM notes n
                 JOIN users u ON n.user_id = u.id
@@ -1606,7 +1694,7 @@ def get_all_notes_with_collection(limit=50):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT n.id, b.name, c.shamsi_date, u.full_name, n.note_text, 
+                SELECT n.id, b.name, c.shamsi_date, u.full_name, n.note_text,
                        n.created_at AT TIME ZONE 'Asia/Tehran' as created_at_iran
                 FROM notes n
                 JOIN collections c ON n.collection_id = c.id
@@ -1634,7 +1722,7 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
         with conn.cursor() as cur:
             if update_existing:
                 cur.execute("""
-                    UPDATE collections 
+                    UPDATE collections
                     SET deputy_amount = %s, others_amount = %s, recorded_by = %s, updated_at = %s
                     WHERE branch_id = %s AND shamsi_date = %s
                     RETURNING id
@@ -1663,7 +1751,7 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
                     VALUES (%s, %s, %s, %s)
                 """, (collection_id, user_id, note_text, created_at_iran))
             conn.commit()
-            # === بهینه‌سازی سرعت: invalidate کش‌های مرتبط ===
+            # invalidate caches
             cache_today_report.invalidate_all()
             cache_top_branches.invalidate('top5')
             cache_10day_report.invalidate('10day')
@@ -1700,8 +1788,8 @@ def send_instant_notification_async(branch_id, deputy_amount, others_amount, sha
             cur.execute("SELECT full_name FROM users WHERE id = %s", (user_id,))
             user_name = cur.fetchone()[0]
             cur.execute("""
-                SELECT telegram_id FROM users 
-                WHERE (role IN ('admin', 'super_admin') OR is_super_admin = TRUE) 
+                SELECT telegram_id FROM users
+                WHERE (role IN ('admin', 'super_admin') OR is_super_admin = TRUE)
                 AND telegram_id IS NOT NULL
             """)
             admins = cur.fetchall()
@@ -1731,8 +1819,8 @@ def check_existing_collection(branch_id, shamsi_date):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, deputy_amount, others_amount 
-                FROM collections 
+                SELECT id, deputy_amount, others_amount
+                FROM collections
                 WHERE branch_id = %s AND shamsi_date = %s
             """, (branch_id, shamsi_date))
             return cur.fetchone()
@@ -1749,10 +1837,10 @@ def get_branch_10_day_report(branch_id):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT shamsi_date, deputy_amount, others_amount, total_amount 
-                FROM collections 
-                WHERE branch_id = %s 
-                ORDER BY shamsi_date DESC 
+                SELECT shamsi_date, deputy_amount, others_amount, total_amount
+                FROM collections
+                WHERE branch_id = %s
+                ORDER BY shamsi_date DESC
                 LIMIT 10
             """, (branch_id,))
             return cur.fetchall()
@@ -1763,7 +1851,6 @@ def get_branch_10_day_report(branch_id):
         if conn:
             return_db_connection(conn)
 
-# === بهینه‌سازی سرعت: کش کردن گزارش امروز ===
 def get_today_province_report(shamsi_date):
     cache_key = f'today_report_{shamsi_date}'
     cached = cache_today_report.get(cache_key)
@@ -1774,8 +1861,8 @@ def get_today_province_report(shamsi_date):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
-                    b.name, 
+                SELECT
+                    b.name,
                     COALESCE(c.deputy_amount, 0) as deputy_amount,
                     COALESCE(c.others_amount, 0) as others_amount,
                     COALESCE(c.total_amount, 0) as total_amount
@@ -1871,7 +1958,7 @@ def get_yesterday_vs_today():
             shamsi_today = get_shamsi_date()
             shamsi_yesterday = get_shamsi_date(-1)
             cur.execute("""
-                SELECT 
+                SELECT
                     (SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s) as today_total,
                     (SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s) as yesterday_total
             """, (shamsi_today, shamsi_yesterday))
@@ -1911,7 +1998,7 @@ def get_branch_performance(branch_id, days=10):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     shamsi_date,
                     SUM(total_amount) as daily_total,
                     AVG(SUM(total_amount)) OVER (ORDER BY shamsi_date ASC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) as avg_3day
@@ -1935,7 +2022,7 @@ def get_daily_comparison():
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     shamsi_date,
                     COUNT(DISTINCT branch_id) as branches_count,
                     SUM(total_amount) as total_collection
@@ -1958,7 +2045,7 @@ def get_deputy_vs_others_ratio():
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     SUM(deputy_amount) as deputy_total,
                     SUM(others_amount) as others_total,
                     ROUND(100.0 * SUM(deputy_amount) / NULLIF(SUM(deputy_amount) + SUM(others_amount), 0), 2) as deputy_percentage
@@ -2087,8 +2174,8 @@ def update_user_role(user_id, new_role):
         with conn.cursor() as cur:
             is_super = new_role == 'super_admin'
             cur.execute("""
-                UPDATE users 
-                SET role = %s, is_super_admin = %s, updated_at = %s 
+                UPDATE users
+                SET role = %s, is_super_admin = %s, updated_at = %s
                 WHERE id = %s
             """, (new_role, is_super, get_iran_time(), user_id))
             conn.commit()
@@ -2183,7 +2270,7 @@ def update_collection(collection_id, deputy_amount, others_amount):
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                UPDATE collections 
+                UPDATE collections
                 SET deputy_amount = %s, others_amount = %s, updated_at = %s
                 WHERE id = %s
             """, (deputy_amount, others_amount, get_iran_time(), collection_id))
@@ -2326,15 +2413,15 @@ def get_drop_alert_branches():
             shamsi_today = get_shamsi_date()
             shamsi_week_ago = get_shamsi_date(-7)
             cur.execute("""
-                SELECT 
+                SELECT
                     b.id,
                     b.name,
                     c.total_amount as today_amount,
                     COALESCE((
-                        SELECT AVG(c2.total_amount) 
-                        FROM collections c2 
-                        WHERE c2.branch_id = b.id 
-                        AND c2.shamsi_date >= %s 
+                        SELECT AVG(c2.total_amount)
+                        FROM collections c2
+                        WHERE c2.branch_id = b.id
+                        AND c2.shamsi_date >= %s
                         AND c2.shamsi_date < %s
                     ), 0) as weekly_avg
                 FROM branches b
@@ -2389,7 +2476,7 @@ def get_deputy_performance_report(user_id, days=30):
         with conn.cursor() as cur:
             shamsi_start = get_shamsi_date(-days)
             cur.execute("""
-                SELECT 
+                SELECT
                     COUNT(*) as total_days,
                     SUM(CASE WHEN EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Tehran') < 15 THEN 1 ELSE 0 END) as on_time_days,
                     AVG(total_amount) as avg_amount,
@@ -2431,7 +2518,7 @@ def get_unreported_branches():
                 FROM branches b
                 LEFT JOIN users u ON u.branch_id = b.id AND u.role = 'deputy'
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM collections c 
+                    SELECT 1 FROM collections c
                     WHERE c.branch_id = b.id AND c.shamsi_date = %s
                 )
             """, (shamsi_today,))
@@ -2520,7 +2607,7 @@ def get_others_performance_summary():
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     b.id,
                     b.name,
                     COALESCE(SUM(c.others_amount), 0) as total_others,
@@ -2546,12 +2633,12 @@ def send_message(chat_id, text, reply_markup=None, remove_keyboard=False, parse_
     if not get_bot_status() and not is_super_admin_user(chat_id):
         send_maintenance_message(chat_id)
         return None
-    
+
     if escape_user_text:
         text = escape_markdown(text)
-    
+
     if len(text) > 4000:
-        chunks = split_text_safely(text, 4000)  # === رفع باگ شماره ۴: برش هوشمند ===
+        chunks = split_text_safely(text, 4000)
         for chunk in chunks:
             send_message_chunk(chat_id, chunk, reply_markup, remove_keyboard, parse_mode, escape_user_text)
         return None
@@ -2635,7 +2722,7 @@ def is_super_admin_user(chat_id):
     return False
 
 # ============================================================
-# کیبوردها (بدون تغییر)
+# کیبوردها
 # ============================================================
 def get_deputy_keyboard():
     return {
@@ -2699,7 +2786,7 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================================
-# توابع ارسال خودکار (بدون تغییر)
+# توابع ارسال خودکار
 # ============================================================
 def send_reminder_to_deputy(chat_id, branch_name):
     msg = f"⏰ یادآوری: شما تا ساعت ۱۵ امروز گزارش وصول شعبه {branch_name} را ثبت نکرده‌اید. لطفاً هرچه سریعتر اقدام فرمایید."
@@ -2816,7 +2903,7 @@ def generate_weekly_report():
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     b.id,
                     b.name,
                     COUNT(c.id) as report_count,
@@ -2846,7 +2933,7 @@ def generate_monthly_report():
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     b.id,
                     b.name,
                     COUNT(c.id) as report_count,
@@ -3073,7 +3160,7 @@ def generate_and_send_forecast(chat_id, role, is_super_admin):
         send_message(chat_id, "❌ خطا در تولید پیش‌بینی.", get_cancel_keyboard())
 
 # ============================================================
-# توابع مدیریت معاونین (با اصلاح split)
+# توابع مدیریت معاونین
 # ============================================================
 def get_all_deputies_with_details():
     conn = None
@@ -3200,7 +3287,7 @@ def get_deputy_by_employee_number(emp_num):
         if conn:
             return_db_connection(conn)
 
-# === رفع باگ شماره ۶: اصلاح split در تابع deputy match report ===
+# رفع باگ شماره ۲: اصلاح تابع گزارش انطباق معاون
 def get_deputy_match_report(user_id, days=30):
     conn = None
     try:
@@ -3213,22 +3300,22 @@ def get_deputy_match_report(user_id, days=30):
             branch_id = branch[0]
             shamsi_start = get_shamsi_date(-days)
             cur.execute("""
-                SELECT 
+                SELECT
                     c.shamsi_date,
                     c.total_amount as collected,
                     a.total_actual as actual,
-                    CASE 
+                    CASE
                         WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN 100
                         WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
                         WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
-                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN 
+                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
                             ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 2)
                         ELSE 0
                     END as match_percent,
                     (ABS(a.total_actual) - ABS(c.total_amount)) as diff
                 FROM collections c
                 LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
-                WHERE c.branch_id = %s 
+                WHERE c.branch_id = %s
                 AND c.shamsi_date >= %s
                 AND a.total_actual IS NOT NULL
                 ORDER BY c.shamsi_date DESC
@@ -3256,7 +3343,7 @@ def handle_message(message):
 
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
-        
+
         if not text:
             user_state = user_states.get(chat_id, {"state": "LOGGED_IN"})
             current_state = user_state.get("state", "LOGGED_IN")
@@ -3462,7 +3549,6 @@ def handle_message(message):
                 return
             else:
                 data = user_state.get("collection_data", {})
-                # === رفع باگ شماره ۳: فرار کاراکترهای یادداشت ===
                 note_text = escape_markdown(text) if text else ""
                 success, collection_id = save_or_update_collection_with_note(
                     branch_id=branch_id,
@@ -3574,7 +3660,6 @@ def handle_message(message):
                     keyboard = get_super_admin_keyboard()
                 send_message(chat_id, "❌ عملیات لغو شد.", keyboard)
                 return
-            # === رفع باگ شماره ۳: فرار کاراکترهای مشکل ===
             safe_text = escape_markdown(text)
             if save_problem(user_db_id, text, "general"):
                 send_message(chat_id, "✅ مشکل شما با موفقیت ثبت شد. تیم پشتیبانی در اسرع وقت بررسی خواهد کرد.", get_admin_keyboard() if role == 'admin' else get_deputy_keyboard())
@@ -3638,7 +3723,6 @@ def handle_message(message):
                 except ValueError:
                     send_message(chat_id, "❌ لطفاً یک عدد وارد کنید.", get_cancel_keyboard())
             else:
-                # === رفع باگ شماره ۳: فرار کاراکترهای پاسخ متنی ===
                 answers.append(text)
                 user_states[chat_id]["survey_answers"] = answers
                 user_states[chat_id]["survey_index"] = index + 1
@@ -3669,7 +3753,6 @@ def handle_message(message):
                 send_message(chat_id, "❌ عملیات لغو شد.", get_deputy_keyboard())
                 return
             try:
-                # === رفع باگ شماره ۶: استفاده از maxsplit=1 ===
                 parts = text.split('|', 1)
                 if len(parts) == 2:
                     collection_id = int(parts[0].strip())
@@ -3755,7 +3838,6 @@ def handle_message(message):
                 send_message(chat_id, "خطا: مخاطبی انتخاب نشده است.", get_super_admin_keyboard())
                 user_states[chat_id]["state"] = "LOGGED_IN"
                 return
-            # === رفع باگ شماره ۳: فرار کاراکترهای پیام ارسالی به معاونین ===
             message_text = escape_markdown(text)
             success_count = 0
             for dep in recipients:
@@ -3984,7 +4066,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
                 send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
                 return
-            parts = text.split('|', 1)  # === رفع باگ شماره ۶ ===
+            parts = text.split('|', 1)
             shamsi_date = normalize_digits(parts[0].strip())
             description = parts[1].strip() if len(parts) > 1 else "تعطیل"
             if validate_shamsi_date(shamsi_date):
@@ -4097,7 +4179,6 @@ def handle_message(message):
                     result = cur.fetchone()
                     if result:
                         branch_id = result[0]
-                        # === بهینه‌سازی سرعت: ارسال پیام موقت و اجرا در ترد جداگانه ===
                         send_message(chat_id, "⏳ در حال تولید نمودار... لطفاً چند لحظه صبر کنید.")
                         threading.Thread(
                             target=generate_and_send_branch_chart,
@@ -4319,13 +4400,13 @@ def handle_message(message):
             about_msg = (
                 "🤖 **ربات وصول مطالبات استان زنجان**\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
-                "این ربات توسط سید فرهاد سید حسینی**\n"
+                "این ربات توسط **سید فرهاد سید حسینی**\n"
                 "کارشناس حقوقی مدیریت شعب استان زنجان\n\n"
-                "با حمایت‌های آقای هادی بیگدلی**\n"
+                "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
                 "📅 نسخه: ۸.۵ (بهینه‌سازی سرعت و رفع باگ)\n"
-                "📧 پشتیبانی: hosseinif490@gmail.com"
+                "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
             if is_super_admin:
@@ -4595,7 +4676,6 @@ def handle_message(message):
                 return
 
             if text.startswith("/add_deputy"):
-                # === رفع باگ شماره ۶: استفاده از maxsplit=3 ===
                 parts = text.replace("/add_deputy", "", 1).strip().split('|', 3)
                 if len(parts) == 4:
                     emp_num = normalize_digits(parts[0].strip())
@@ -5013,7 +5093,6 @@ def handle_message(message):
                         msg += f"   📅 تاخیر: {perf['late']} روز\n"
                         msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   🏆 بهترین روز: {perf['best_day']//1_000_000:,.0f} میلیون ریال\n"
-                        # === رفع باگ شماره ۲: استفاده از تابع اصلاح‌شده ===
                         match_data = get_deputy_match_report(dep_id, 30)
                         if match_data:
                             total_match = 0
@@ -5066,7 +5145,7 @@ def handle_message(message):
                 if is_holiday():
                     send_message(chat_id, "📅 امروز تعطیل است، گزارشی ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
                     return
-                comparison = get_adaptive_comparison()  # این تابع کش شده
+                comparison = get_adaptive_comparison()
                 if comparison:
                     msg = f"📊 **گزارش تطبیقی** - {get_shamsi_date_formatted(get_shamsi_date())}\n"
                     msg += f"━━━━━━━━━━━━━━━━━━\n\n"
@@ -5164,7 +5243,7 @@ def handle_message(message):
                 if is_holiday(shamsi_today):
                     send_message(chat_id, f"📅 امروز {get_shamsi_date_formatted(shamsi_today)} تعطیل است و گزارشی ثبت نشده است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
                     return
-                report = get_today_province_report(shamsi_today)  # کش شده
+                report = get_today_province_report(shamsi_today)
                 stats = get_today_statistics()
                 if report:
                     msg = f"📊 گزارش وصول امروز\n📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n━━━━━━━━━━━━━━━━━━\n\n"
@@ -5196,7 +5275,7 @@ def handle_message(message):
                 return
 
             if text == "📈 گزارش ۱۰ روز اخیر":
-                report = get_province_10_day_report()  # کش شده
+                report = get_province_10_day_report()
                 if report:
                     msg = f"📈 گزارش ۱۰ روز اخیر استان زنجان\n━━━━━━━━━━━━━━━━━━\n\n"
                     total_all = 0
@@ -5219,7 +5298,7 @@ def handle_message(message):
                 return
 
             if text == "🏆 رتبه‌بندی شعب":
-                report = get_top_5_branches()  # کش شده
+                report = get_top_5_branches()
                 if report:
                     msg = f"🏆 ۵ شعبه برتر استان زنجان\n━━━━━━━━━━━━━━━━━━\n\n"
                     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -5446,7 +5525,7 @@ def handle_message(message):
                     conn = get_db_connection()
                     with conn.cursor() as cur:
                         cur.execute("""
-                            SELECT n.id, b.name, c.shamsi_date, n.note_text, 
+                            SELECT n.id, b.name, c.shamsi_date, n.note_text,
                                    n.created_at AT TIME ZONE 'Asia/Tehran' as created_at_iran
                             FROM notes n
                             JOIN collections c ON n.collection_id = c.id
@@ -5549,7 +5628,6 @@ def main():
                 if data.get("ok") and data.get("result"):
                     for update in data["result"]:
                         update_id = update["update_id"]
-                        # === بهینه‌سازی سرعت: استفاده از set برای O(1) ===
                         if update_id in processed_set:
                             continue
                         processed_set.add(update_id)
