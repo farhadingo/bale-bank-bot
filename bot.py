@@ -93,7 +93,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.5'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.6'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -156,7 +156,7 @@ cache_top_branches = TTLCache(ttl_seconds=60)
 cache_10day_report = TTLCache(ttl_seconds=60)
 cache_adaptive = TTLCache(ttl_seconds=60)
 cache_forecast_all = TTLCache(ttl_seconds=120)
-cache_targets = TTLCache(ttl_seconds=60)  # کش جدید برای اهداف
+cache_targets = TTLCache(ttl_seconds=60)
 
 # ============================================================
 # توابع کش‌شده
@@ -1193,175 +1193,6 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             return_db_connection(conn)
 
 # ============================================================
-# توابع مدیریت اهداف وصولی (جدید)
-# ============================================================
-
-def set_branch_target(branch_id, target_amount, target_date, created_by):
-    """تعیین هدف جدید برای یک شعبه (هدف قبلی غیرفعال می‌شود)"""
-    target_date = normalize_digits(target_date)
-    if not validate_shamsi_date(target_date):
-        return False, "تاریخ هدف نامعتبر است"
-    if target_amount <= 0:
-        return False, "مبلغ هدف باید مثبت باشد"
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            # غیرفعال کردن هدف قبلی
-            cur.execute("""
-                UPDATE branch_targets
-                SET is_active = FALSE, updated_at = %s
-                WHERE branch_id = %s AND is_active = TRUE
-            """, (get_iran_time(), branch_id))
-            # ایجاد هدف جدید
-            cur.execute("""
-                INSERT INTO branch_targets (branch_id, target_amount, target_date, created_by, created_at)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id
-            """, (branch_id, target_amount, target_date, created_by, get_iran_time()))
-            target_id = cur.fetchone()[0]
-            conn.commit()
-            cache_targets.invalidate_all()
-            return True, target_id
-    except Exception as e:
-        logger.error(f"set_branch_target error: {e}")
-        if conn:
-            conn.rollback()
-        return False, str(e)
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_active_target(branch_id):
-    """دریافت هدف فعال یک شعبه"""
-    cached_key = f'target_{branch_id}'
-    cached = cache_targets.get(cached_key)
-    if cached is not None:
-        return cached
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, branch_id, target_amount, target_date, created_by, created_at
-                FROM branch_targets
-                WHERE branch_id = %s AND is_active = TRUE
-            """, (branch_id,))
-            result = cur.fetchone()
-            if result:
-                target = {
-                    'id': result[0],
-                    'branch_id': result[1],
-                    'target_amount': result[2],
-                    'target_date': result[3],
-                    'created_by': result[4],
-                    'created_at': result[5]
-                }
-                cache_targets.set(cached_key, target)
-                return target
-            return None
-    except Exception as e:
-        logger.error(f"get_active_target error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_branch_collection_since_date(branch_id, start_date):
-    """محاسبه مجموع وصولی یک شعبه از یک تاریخ مشخص به بعد"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COALESCE(SUM(total_amount), 0)
-                FROM collections
-                WHERE branch_id = %s AND shamsi_date >= %s
-            """, (branch_id, start_date))
-            return cur.fetchone()[0]
-    except Exception as e:
-        logger.error(f"get_branch_collection_since_date error: {e}")
-        return 0
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_target_progress(branch_id, target_date, target_amount):
-    """محاسبه پیشرفت هدف، فاصله از هدف و روزهای باقیمانده"""
-    shamsi_today = get_shamsi_date()
-    # مجموع وصولی از تاریخ ایجاد هدف تا امروز
-    collected = get_branch_collection_since_date(branch_id, target_date)
-    progress_percent = (collected / target_amount * 100) if target_amount > 0 else 0
-    # روزهای باقیمانده تا تاریخ هدف
-    try:
-        target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
-        today_obj = jdatetime.date(*map(int, shamsi_today.split('/')))
-        days_left = (target_date_obj - today_obj).days
-        if days_left < 0:
-            days_left = 0
-    except:
-        days_left = 0
-    remaining = target_amount - collected
-    if remaining < 0:
-        remaining = 0
-    return {
-        'collected': collected,
-        'target_amount': target_amount,
-        'progress_percent': progress_percent,
-        'remaining': remaining,
-        'days_left': days_left
-    }
-
-def get_all_active_targets():
-    """دریافت همه اهداف فعال به همراه اطلاعات شعبه"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT bt.id, bt.branch_id, b.name, bt.target_amount, bt.target_date,
-                       bt.created_at, u.full_name as created_by_name
-                FROM branch_targets bt
-                JOIN branches b ON bt.branch_id = b.id
-                LEFT JOIN users u ON bt.created_by = u.id
-                WHERE bt.is_active = TRUE
-                ORDER BY b.name
-            """)
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_all_active_targets error: {e}")
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def delete_target(target_id):
-    """حذف یک هدف (به‌طور کامل)"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            # ابتدا شناسه شعبه را برای غیرفعال‌سازی کش می‌گیریم
-            cur.execute("SELECT branch_id FROM branch_targets WHERE id = %s", (target_id,))
-            result = cur.fetchone()
-            if not result:
-                return False
-            branch_id = result[0]
-            cur.execute("DELETE FROM branch_targets WHERE id = %s", (target_id,))
-            conn.commit()
-            cache_targets.invalidate(f'target_{branch_id}')
-            cache_targets.invalidate_all()
-            return True
-    except Exception as e:
-        logger.error(f"delete_target error: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# ============================================================
 # توابع گزارش‌های تطبیقی و پیش‌بینی (با کش)
 # ============================================================
 def get_adaptive_comparison():
@@ -1944,7 +1775,6 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
             cache_adaptive.invalidate('adaptive')
             cache_forecast_all.invalidate('forecast_all')
             invalidate_branches_cache()
-            # غیرفعال کردن کش هدف (چون وصول جدید بر پیشرفت هدف تأثیر دارد)
             cache_targets.invalidate(f'target_{branch_id}')
             cache_targets.invalidate_all()
             if collection_id and get_instant_notification_status() and not is_holiday(shamsi_date):
@@ -2040,6 +1870,9 @@ def get_branch_10_day_report(branch_id):
         if conn:
             return_db_connection(conn)
 
+# =====================================================================
+# تابع اصلاح‌شده get_today_province_report (اضافه کردن شناسه شعبه)
+# =====================================================================
 def get_today_province_report(shamsi_date):
     cache_key = f'today_report_{shamsi_date}'
     cached = cache_today_report.get(cache_key)
@@ -2051,6 +1884,7 @@ def get_today_province_report(shamsi_date):
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT
+                    b.id,
                     b.name,
                     COALESCE(c.deputy_amount, 0) as deputy_amount,
                     COALESCE(c.others_amount, 0) as others_amount,
@@ -3025,8 +2859,173 @@ def get_deputy_late_analysis(days=30):
             return_db_connection(conn)
 
 # ============================================================
-# توابع گزارش پیشرفت اهداف (جدید)
+# توابع مدیریت اهداف وصولی (جدید)
 # ============================================================
+
+def set_branch_target(branch_id, target_amount, target_date, created_by):
+    """تعیین هدف جدید برای یک شعبه (هدف قبلی غیرفعال می‌شود)"""
+    target_date = normalize_digits(target_date)
+    if not validate_shamsi_date(target_date):
+        return False, "تاریخ هدف نامعتبر است"
+    if target_amount <= 0:
+        return False, "مبلغ هدف باید مثبت باشد"
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # غیرفعال کردن هدف قبلی
+            cur.execute("""
+                UPDATE branch_targets
+                SET is_active = FALSE, updated_at = %s
+                WHERE branch_id = %s AND is_active = TRUE
+            """, (get_iran_time(), branch_id))
+            # ایجاد هدف جدید
+            cur.execute("""
+                INSERT INTO branch_targets (branch_id, target_amount, target_date, created_by, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
+            """, (branch_id, target_amount, target_date, created_by, get_iran_time()))
+            target_id = cur.fetchone()[0]
+            conn.commit()
+            cache_targets.invalidate_all()
+            return True, target_id
+    except Exception as e:
+        logger.error(f"set_branch_target error: {e}")
+        if conn:
+            conn.rollback()
+        return False, str(e)
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_active_target(branch_id):
+    """دریافت هدف فعال یک شعبه"""
+    cached_key = f'target_{branch_id}'
+    cached = cache_targets.get(cached_key)
+    if cached is not None:
+        return cached
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, branch_id, target_amount, target_date, created_by, created_at
+                FROM branch_targets
+                WHERE branch_id = %s AND is_active = TRUE
+            """, (branch_id,))
+            result = cur.fetchone()
+            if result:
+                target = {
+                    'id': result[0],
+                    'branch_id': result[1],
+                    'target_amount': result[2],
+                    'target_date': result[3],
+                    'created_by': result[4],
+                    'created_at': result[5]
+                }
+                cache_targets.set(cached_key, target)
+                return target
+            return None
+    except Exception as e:
+        logger.error(f"get_active_target error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_branch_collection_since_date(branch_id, start_date):
+    """محاسبه مجموع وصولی یک شعبه از یک تاریخ مشخص به بعد"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(total_amount), 0)
+                FROM collections
+                WHERE branch_id = %s AND shamsi_date >= %s
+            """, (branch_id, start_date))
+            return cur.fetchone()[0]
+    except Exception as e:
+        logger.error(f"get_branch_collection_since_date error: {e}")
+        return 0
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_target_progress(branch_id, target_date, target_amount):
+    """محاسبه پیشرفت هدف، فاصله از هدف و روزهای باقیمانده"""
+    shamsi_today = get_shamsi_date()
+    # مجموع وصولی از تاریخ ایجاد هدف تا امروز
+    collected = get_branch_collection_since_date(branch_id, target_date)
+    progress_percent = (collected / target_amount * 100) if target_amount > 0 else 0
+    # روزهای باقیمانده تا تاریخ هدف
+    try:
+        target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
+        today_obj = jdatetime.date(*map(int, shamsi_today.split('/')))
+        days_left = (target_date_obj - today_obj).days
+        if days_left < 0:
+            days_left = 0
+    except:
+        days_left = 0
+    remaining = target_amount - collected
+    if remaining < 0:
+        remaining = 0
+    return {
+        'collected': collected,
+        'target_amount': target_amount,
+        'progress_percent': progress_percent,
+        'remaining': remaining,
+        'days_left': days_left
+    }
+
+def get_all_active_targets():
+    """دریافت همه اهداف فعال به همراه اطلاعات شعبه"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT bt.id, bt.branch_id, b.name, bt.target_amount, bt.target_date,
+                       bt.created_at, u.full_name as created_by_name
+                FROM branch_targets bt
+                JOIN branches b ON bt.branch_id = b.id
+                LEFT JOIN users u ON bt.created_by = u.id
+                WHERE bt.is_active = TRUE
+                ORDER BY b.name
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_all_active_targets error: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def delete_target(target_id):
+    """حذف یک هدف (به‌طور کامل)"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # ابتدا شناسه شعبه را برای غیرفعال‌سازی کش می‌گیریم
+            cur.execute("SELECT branch_id FROM branch_targets WHERE id = %s", (target_id,))
+            result = cur.fetchone()
+            if not result:
+                return False
+            branch_id = result[0]
+            cur.execute("DELETE FROM branch_targets WHERE id = %s", (target_id,))
+            conn.commit()
+            cache_targets.invalidate(f'target_{branch_id}')
+            cache_targets.invalidate_all()
+            return True
+    except Exception as e:
+        logger.error(f"delete_target error: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            return_db_connection(conn)
 
 def get_targets_progress_report():
     """گزارش پیشرفت همه اهداف فعال"""
@@ -3202,11 +3201,9 @@ def get_super_admin_keyboard():
             [{"text": "📝 ثبت مشکل"}, {"text": "📊 نظرسنجی"}],
             [{"text": "🔧 وضعیت ربات"}, {"text": "ℹ️ درباره توسعه‌دهنده"}],
             [{"text": "🔙 خروج"}, {"text": "❓ راهنما"}],
-            # دکمه‌های جدید برای گزارش‌های پیشرفته
             [{"text": "🏅 رتبه‌بندی دقت معاونان"}, {"text": "📈 روند دقت شعبه"}],
             [{"text": "📊 بهترین/بدترین دقت روز"}, {"text": "📊 مقایسه عملکرد شعبه با استان"}],
             [{"text": "⏰ تحلیل تاخیر معاونان"}],
-            # دکمه‌های جدید برای مدیریت اهداف
             [{"text": "🎯 مدیریت اهداف وصولی"}, {"text": "📊 گزارش پیشرفت اهداف"}],
             [{"text": "🏆 رتبه‌بندی تحقق هدف"}]
         ],
@@ -4708,14 +4705,12 @@ def handle_message(message):
                     diff_abs = item['diff_abs']
                     is_claimed_more = item['is_claimed_more']
 
-                    # محاسبه دقت با فرمول یکسان برای همه حالت‌ها
                     if actual < 0:
                         if claimed == 0 or abs_actual == 0:
                             accuracy = 0.0
                         else:
                             accuracy = (1 - (diff_abs / max(claimed, abs_actual))) * 100
                     else:
-                        # برای actual > 0 نیز دقت محاسبه می‌شود اما پیام هشدار داده می‌شود
                         if claimed == 0 or actual == 0:
                             accuracy = 0.0
                         else:
@@ -4882,7 +4877,6 @@ def handle_message(message):
                     return
                 shamsi_date = normalize_digits(text)
                 if validate_shamsi_date(shamsi_date):
-                    # بررسی اینکه تاریخ هدف از امروز بزرگتر باشد
                     today = get_shamsi_date()
                     try:
                         target_obj = jdatetime.date(*map(int, shamsi_date.split('/')))
@@ -4943,7 +4937,6 @@ def handle_message(message):
                     send_message(chat_id, "📭 هیچ هدف فعالی برای گزارش وجود ندارد.", get_super_admin_keyboard())
                     return
                 msg = "📊 **گزارش پیشرفت اهداف وصولی شعب**\n━━━━━━━━━━━━━━━━━━\n\n"
-                # مرتب‌سازی بر اساس درصد پیشرفت (نزولی)
                 sorted_report = sorted(report, key=lambda x: x['progress_percent'], reverse=True)
                 for idx, item in enumerate(sorted_report, 1):
                     branch_name = item['branch_name']
@@ -4968,7 +4961,6 @@ def handle_message(message):
                 if not report:
                     send_message(chat_id, "📭 هیچ هدف فعالی برای رتبه‌بندی وجود ندارد.", get_super_admin_keyboard())
                     return
-                # مرتب‌سازی بر اساس درصد پیشرفت (نزولی)
                 sorted_report = sorted(report, key=lambda x: x['progress_percent'], reverse=True)
                 msg = "🏆 **رتبه‌بندی شعب بر اساس تحقق هدف**\n━━━━━━━━━━━━━━━━━━\n\n"
                 medals = ["🥇", "🥈", "🥉"]
@@ -5918,14 +5910,12 @@ def handle_message(message):
                         msg += f"   📅 تاخیر: {perf['late']} روز\n"
                         msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   🏆 بهترین روز: {perf['best_day']//1_000_000:,.0f} میلیون ریال\n"
-                        # محاسبه میانگین دقت با اصلاح شرط - همه روزها لحاظ شوند
                         match_data = get_deputy_match_report(dep_id, 30)
                         if match_data:
                             total_match = 0
                             count = 0
                             for row in match_data:
-                                # حتی اگر دقت صفر باشد، در میانگین لحاظ شود
-                                total_match += row[3]  # row[3] مقدار دقت است
+                                total_match += row[3]
                                 count += 1
                             if count > 0:
                                 avg_match = total_match / count
@@ -6064,6 +6054,9 @@ def handle_message(message):
                     send_message(chat_id, "هیچ یادداشتی وجود ندارد.", keyboard)
                 return
 
+            # ============================================================
+            # بخش گزارش امروز (اصلاح‌شده با نمایش هدف)
+            # ============================================================
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
                 if is_holiday(shamsi_today):
@@ -6075,20 +6068,25 @@ def handle_message(message):
                     msg = f"📊 گزارش وصول امروز\n📅 تاریخ: {get_shamsi_date_formatted(shamsi_today)}\n━━━━━━━━━━━━━━━━━━\n\n"
                     total_province = 0
                     for idx, row in enumerate(report, 1):
-                        branch_name = row[0]
-                        dep = int(safe_format(row[1]))
-                        oth = int(safe_format(row[2]))
-                        tot = int(safe_format(row[3]))
+                        branch_id = row[0]
+                        branch_name = row[1]
+                        dep = int(safe_format(row[2]))
+                        oth = int(safe_format(row[3]))
+                        tot = int(safe_format(row[4]))
                         msg += f"{idx}. 🏢 {branch_name}\n"
                         msg += f"   👤 معاون: {dep//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   👥 همکاران: {oth//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   💰 جمع: {tot//1_000_000:,.0f} میلیون ریال\n"
-                        # اضافه کردن اطلاعات هدف برای شعب دارای هدف فعال
-                        target = get_active_target(int(row[0]))  # branch_id باید از قبل مشخص شود اما در این کوئری branch_id را نداریم
-                        # برای حل این مشکل باید کوئری اصلاح شود اما در اینجا برای نمایش نمونه، یک روش جایگزین استفاده می‌کنیم:
-                        # چون row فقط name, deputy, others, total را دارد، برای هر شعبه باید target را جداگانه بگیریم
-                        # در اینجا ما از تابع get_target_progress با branch_id استفاده می‌کنیم اما branch_id را نداریم.
-                        # بنابراین این بخش را بعداً اصلاح می‌کنیم.
+                        # دریافت هدف فعال شعبه
+                        target = get_active_target(branch_id)
+                        if target:
+                            progress = get_target_progress(branch_id, target['target_date'], target['target_amount'])
+                            msg += f"   🎯 هدف تا {get_shamsi_date_formatted(target['target_date'])}: وصول {target['target_amount']//1_000_000:,.0f} میلیون ریال\n"
+                            msg += f"   📊 پیشرفت: {progress['progress_percent']:.1f}% ({progress['collected']//1_000_000:,.0f} از {target['target_amount']//1_000_000:,.0f} میلیون ریال)\n"
+                            msg += f"   📅 روز باقیمانده تا پایان فرصت: {progress['days_left']} روز\n"
+                            msg += f"   📉 فاصله از هدف: {progress['remaining']//1_000_000:,.0f} میلیون ریال\n"
+                        else:
+                            msg += f"   🎯 هدفی برای این شعبه تعریف نشده است\n"
                         msg += "\n"
                         total_province += tot
                     msg += f"━━━━━━━━━━━━━━━━━━\n"
