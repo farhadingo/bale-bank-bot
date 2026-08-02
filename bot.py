@@ -2507,6 +2507,58 @@ def get_deputy_performance_report(user_id, days=30):
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# تابع اصلاح‌شده برای گزارش انطباق معاون - با فرمول دقیق
+# ============================================================
+def get_deputy_match_report(user_id, days=30):
+    """
+    دریافت گزارش انطباق خوداظهاری یک معاون با فرمول دقیق (مشابه گزارش یک‌روزه)
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # ابتدا شعبه معاون را پیدا می‌کنیم
+            cur.execute("SELECT branch_id FROM users WHERE id = %s", (user_id,))
+            branch = cur.fetchone()
+            if not branch:
+                return None
+            branch_id = branch[0]
+            shamsi_start = get_shamsi_date(-days)
+
+            # کوئری مستقیم با فرمول دقت صحیح
+            cur.execute("""
+                SELECT
+                    c.shamsi_date,
+                    c.total_amount as collected,
+                    a.total_actual as actual,
+                    CASE
+                        WHEN a.total_actual IS NULL OR c.total_amount IS NULL THEN 0
+                        WHEN ABS(a.total_actual) = 0 AND ABS(c.total_amount) = 0 THEN 100
+                        WHEN ABS(a.total_actual) = 0 AND ABS(c.total_amount) > 0 THEN 0
+                        WHEN ABS(a.total_actual) > 0 THEN 
+                            ROUND(
+                                (1 - (ABS(ABS(a.total_actual) - ABS(c.total_amount)) / NULLIF(ABS(a.total_actual), 0))) * 100,
+                                1
+                            )
+                        ELSE 0
+                    END as match_percent,
+                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
+                FROM collections c
+                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
+                WHERE c.branch_id = %s
+                AND c.shamsi_date >= %s
+                AND a.total_actual IS NOT NULL
+                ORDER BY c.shamsi_date DESC
+            """, (branch_id, shamsi_start))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_deputy_match_report error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
 def get_unreported_branches():
     conn = None
     try:
@@ -3282,47 +3334,6 @@ def get_deputy_by_employee_number(emp_num):
             return cur.fetchone()
     except Exception as e:
         logger.error(f"get_deputy_by_employee_number error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# رفع باگ شماره ۲: اصلاح تابع گزارش انطباق معاون
-def get_deputy_match_report(user_id, days=30):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT branch_id FROM users WHERE id = %s", (user_id,))
-            branch = cur.fetchone()
-            if not branch:
-                return None
-            branch_id = branch[0]
-            shamsi_start = get_shamsi_date(-days)
-            cur.execute("""
-                SELECT
-                    c.shamsi_date,
-                    c.total_amount as collected,
-                    a.total_actual as actual,
-                    CASE
-                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN 100
-                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
-                        WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
-                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
-                            ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 2)
-                        ELSE 0
-                    END as match_percent,
-                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
-                FROM collections c
-                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
-                WHERE c.branch_id = %s
-                AND c.shamsi_date >= %s
-                AND a.total_actual IS NOT NULL
-                ORDER BY c.shamsi_date DESC
-            """, (branch_id, shamsi_start))
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_deputy_match_report error: {e}")
         return None
     finally:
         if conn:
@@ -5093,12 +5104,13 @@ def handle_message(message):
                         msg += f"   📅 تاخیر: {perf['late']} روز\n"
                         msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   🏆 بهترین روز: {perf['best_day']//1_000_000:,.0f} میلیون ریال\n"
+                        # استفاده از تابع اصلاح‌شده get_deputy_match_report
                         match_data = get_deputy_match_report(dep_id, 30)
                         if match_data:
                             total_match = 0
                             count = 0
                             for row in match_data:
-                                if row[3] > 0:
+                                if row[3] > 0:  # ستون match_percent
                                     total_match += row[3]
                                     count += 1
                             if count > 0:
