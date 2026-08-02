@@ -2627,6 +2627,215 @@ def get_others_performance_summary():
             return_db_connection(conn)
 
 # ============================================================
+# توابع جدید برای گزارش‌های پیشرفته سوپرادمین
+# ============================================================
+
+def get_deputy_accuracy_ranking(days=30):
+    """رتبه‌بندی معاونان بر اساس میانگین دقت خوداظهاری در بازه مشخص"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    u.id,
+                    u.full_name,
+                    b.name as branch_name,
+                    COUNT(c.id) as total_days,
+                    COALESCE(AVG(
+                        CASE
+                            WHEN a.total_actual IS NULL THEN NULL
+                            WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                            WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                            WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                                (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                            WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
+                                (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                            ELSE NULL
+                        END
+                    ), 0) as avg_accuracy
+                FROM users u
+                JOIN branches b ON u.branch_id = b.id
+                LEFT JOIN collections c ON u.id = c.recorded_by AND c.shamsi_date >= %s
+                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
+                WHERE u.role = 'deputy'
+                GROUP BY u.id, u.full_name, b.name
+                HAVING COUNT(c.id) > 0
+                ORDER BY avg_accuracy DESC
+            """, (get_shamsi_date(-days),))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_deputy_accuracy_ranking: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_branch_accuracy_trend(branch_id, days=30):
+    """روند دقت روزانه یک شعبه در بازه مشخص"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    c.shamsi_date,
+                    c.total_amount as collected,
+                    a.total_actual as actual,
+                    CASE
+                        WHEN a.total_actual IS NULL THEN NULL
+                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                        WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                            (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
+                            (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                        ELSE NULL
+                    END as accuracy
+                FROM collections c
+                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
+                WHERE c.branch_id = %s AND c.shamsi_date >= %s
+                ORDER BY c.shamsi_date DESC
+            """, (branch_id, get_shamsi_date(-days)))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_branch_accuracy_trend: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_best_worst_accuracy_branches(shamsi_date, limit=5):
+    """بهترین و بدترین دقت خوداظهاری در یک تاریخ مشخص"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    b.name,
+                    c.total_amount as collected,
+                    a.total_actual as actual,
+                    CASE
+                        WHEN a.total_actual IS NULL THEN NULL
+                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                        WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                            (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
+                            (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                        ELSE NULL
+                    END as accuracy
+                FROM branches b
+                JOIN collections c ON b.id = c.branch_id AND c.shamsi_date = %s
+                LEFT JOIN actual_stats a ON b.id = a.branch_id AND a.shamsi_date = %s
+                WHERE a.total_actual IS NOT NULL
+                ORDER BY accuracy DESC NULLS LAST
+                LIMIT %s
+            """, (shamsi_date, shamsi_date, limit))
+            best = cur.fetchall()
+            cur.execute("""
+                SELECT
+                    b.name,
+                    c.total_amount as collected,
+                    a.total_actual as actual,
+                    CASE
+                        WHEN a.total_actual IS NULL THEN NULL
+                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                        WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                            (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
+                            (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount))
+                        ELSE NULL
+                    END as accuracy
+                FROM branches b
+                JOIN collections c ON b.id = c.branch_id AND c.shamsi_date = %s
+                LEFT JOIN actual_stats a ON b.id = a.branch_id AND a.shamsi_date = %s
+                WHERE a.total_actual IS NOT NULL
+                ORDER BY accuracy ASC NULLS LAST
+                LIMIT %s
+            """, (shamsi_date, shamsi_date, limit))
+            worst = cur.fetchall()
+            return best, worst
+    except Exception as e:
+        logger.error(f"get_best_worst_accuracy_branches: {e}")
+        return [], []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_branch_performance_vs_avg(branch_id, days=30):
+    """مقایسه عملکرد یک شعبه با میانگین کل استان"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            shamsi_start = get_shamsi_date(-days)
+            # میانگین استان
+            cur.execute("""
+                SELECT AVG(total_amount) FROM collections WHERE shamsi_date >= %s
+            """, (shamsi_start,))
+            avg_province = cur.fetchone()[0] or 0
+            # عملکرد شعبه
+            cur.execute("""
+                SELECT
+                    COUNT(*) as days,
+                    AVG(total_amount) as avg_amount,
+                    SUM(total_amount) as total_amount
+                FROM collections
+                WHERE branch_id = %s AND shamsi_date >= %s
+            """, (branch_id, shamsi_start))
+            branch_stats = cur.fetchone()
+            if not branch_stats or branch_stats[0] == 0:
+                return None
+            days, avg_branch, total_branch = branch_stats
+            return {
+                'days': days,
+                'avg_branch': avg_branch,
+                'total_branch': total_branch,
+                'avg_province': avg_province,
+                'diff_avg': avg_branch - avg_province,
+                'diff_percent': ((avg_branch - avg_province) / avg_province * 100) if avg_province > 0 else 0
+            }
+    except Exception as e:
+        logger.error(f"get_branch_performance_vs_avg: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_deputy_late_analysis(days=30):
+    """تحلیل تاخیر در ثبت وصول معاونان"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    u.id,
+                    u.full_name,
+                    b.name as branch_name,
+                    COUNT(c.id) as total_days,
+                    SUM(CASE WHEN EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') >= 15 THEN 1 ELSE 0 END) as late_days,
+                    ROUND(100.0 * SUM(CASE WHEN EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') >= 15 THEN 1 ELSE 0 END) / NULLIF(COUNT(c.id), 0), 1) as late_percent
+                FROM users u
+                JOIN branches b ON u.branch_id = b.id
+                LEFT JOIN collections c ON u.id = c.recorded_by AND c.shamsi_date >= %s
+                WHERE u.role = 'deputy'
+                GROUP BY u.id, u.full_name, b.name
+                HAVING COUNT(c.id) > 0
+                ORDER BY late_percent DESC
+            """, (get_shamsi_date(-days),))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_deputy_late_analysis: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
 # ارسال پیام و عکس - با پشتیبانی از Markdown و Escape و برش هوشمند
 # ============================================================
 def send_message(chat_id, text, reply_markup=None, remove_keyboard=False, parse_mode="Markdown", escape_user_text=False):
@@ -2777,7 +2986,11 @@ def get_super_admin_keyboard():
             [{"text": "📊 مقایسه انطباق"}, {"text": "📊 ثبت آمار واقعی"}],
             [{"text": "📝 ثبت مشکل"}, {"text": "📊 نظرسنجی"}],
             [{"text": "🔧 وضعیت ربات"}, {"text": "ℹ️ درباره توسعه‌دهنده"}],
-            [{"text": "🔙 خروج"}, {"text": "❓ راهنما"}]
+            [{"text": "🔙 خروج"}, {"text": "❓ راهنما"}],
+            # دکمه‌های جدید برای گزارش‌های پیشرفته
+            [{"text": "🏅 رتبه‌بندی دقت معاونان"}, {"text": "📈 روند دقت شعبه"}],
+            [{"text": "📊 بهترین/بدترین دقت روز"}, {"text": "📊 مقایسه عملکرد شعبه با استان"}],
+            [{"text": "⏰ تحلیل تاخیر معاونان"}]
         ],
         "resize_keyboard": True
     }
@@ -3287,7 +3500,9 @@ def get_deputy_by_employee_number(emp_num):
         if conn:
             return_db_connection(conn)
 
-# رفع باگ شماره ۲: اصلاح تابع گزارش انطباق معاون
+# ============================================================
+# تابع اصلاح‌شده get_deputy_match_report (رفع باگ دقت)
+# ============================================================
 def get_deputy_match_report(user_id, days=30):
     conn = None
     try:
@@ -3305,9 +3520,11 @@ def get_deputy_match_report(user_id, days=30):
                     c.total_amount as collected,
                     a.total_actual as actual,
                     CASE
-                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN 100
+                        WHEN a.total_actual IS NULL THEN NULL
                         WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
                         WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                            ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 2)
                         WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
                             ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 2)
                         ELSE 0
@@ -4273,37 +4490,44 @@ def handle_message(message):
                     diff_abs = item['diff_abs']
                     is_claimed_more = item['is_claimed_more']
 
+                    # محاسبه دقت با فرمول یکسان برای همه حالت‌ها
                     if actual < 0:
                         if claimed == 0 or abs_actual == 0:
                             accuracy = 0.0
                         else:
                             accuracy = (1 - (diff_abs / max(claimed, abs_actual))) * 100
-
-                        if accuracy >= 95:
-                            emoji = "✅"
-                        elif accuracy >= 80:
-                            emoji = "🟢"
-                        elif accuracy >= 50:
-                            emoji = "🟡"
+                    else:
+                        # برای actual > 0 نیز دقت محاسبه می‌شود اما پیام هشدار داده می‌شود
+                        if claimed == 0 or actual == 0:
+                            accuracy = 0.0
                         else:
-                            emoji = "🔴"
+                            accuracy = (min(claimed, actual) / max(claimed, actual)) * 100
 
-                        diff_text = "بیشتر" if is_claimed_more else "کمتر"
+                    if accuracy >= 95:
+                        emoji = "✅"
+                    elif accuracy >= 80:
+                        emoji = "🟢"
+                    elif accuracy >= 50:
+                        emoji = "🟡"
+                    else:
+                        emoji = "🔴"
 
-                        msg += f"🏢 **{branch_name}**\n"
-                        msg += f"📝 ادعای وصول معاون: {claimed//1_000_000:,.0f} میلیون ریال\n"
+                    diff_text = "بیشتر" if is_claimed_more else "کمتر" if is_claimed_more is not None else ""
+
+                    msg += f"🏢 **{branch_name}**\n"
+                    msg += f"📝 ادعای وصول معاون: {claimed//1_000_000:,.0f} میلیون ریال\n"
+                    if actual < 0:
                         msg += f"📉 کاهش واقعی مطالبات: {abs_actual//1_000_000:,.0f} میلیون ریال\n"
+                    else:
+                        msg += f"📈 افزایش واقعی مطالبات: {actual//1_000_000:,.0f} میلیون ریال\n"
+                    if actual < 0:
                         msg += f"↕️ اختلاف: {diff_abs//1_000_000:,.0f} میلیون ریال (ادعا {diff_text} از واقعیت بوده)\n"
-                        msg += f"🎯 دقت خوداظهاری: {accuracy:.1f}% {emoji}\n\n"
+                    msg += f"🎯 دقت خوداظهاری: {accuracy:.1f}% {emoji}\n\n"
 
+                    if actual < 0:
                         negative_actual_branches.append(branch_name)
                         negative_accuracies.append(accuracy)
-
                     else:
-                        msg += f"🏢 **{branch_name}**\n"
-                        msg += f"📝 ادعای وصول معاون: {claimed//1_000_000:,.0f} میلیون ریال\n"
-                        msg += f"📈 افزایش واقعی مطالبات: {actual//1_000_000:,.0f} میلیون ریال\n"
-                        msg += f"⚠️ با وجود ادعای وصول {claimed//1_000_000:,.0f} میلیون ریالی، مانده مطالبات این شعبه در واقع {actual//1_000_000:,.0f} میلیون ریال بیشتر شده است.\n\n"
                         positive_actual_branches.append(branch_name)
 
                 msg += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4384,7 +4608,13 @@ def handle_message(message):
                 "   • فعال/غیرفعال کردن قابلیت‌ها\n"
                 "   • ایجاد و مدیریت نظرسنجی‌ها\n"
                 "   • ثبت آمار واقعی وصول (هر شعبه یک عدد)\n"
-                "   • مشاهده نمودارهای تحلیلی و انطباق\n\n"
+                "   • مشاهده نمودارهای تحلیلی و انطباق\n"
+                "   • **گزارش‌های پیشرفته جدید:**\n"
+                "      - رتبه‌بندی معاونان بر اساس دقت خوداظهاری\n"
+                "      - روند دقت یک شعبه در بازه زمانی\n"
+                "      - بهترین/بدترین دقت در یک روز مشخص\n"
+                "      - مقایسه عملکرد شعبه با میانگین استان\n"
+                "      - تحلیل تاخیر در ثبت وصول معاونان\n\n"
                 "💰 **واحد پول:** تمام مبالغ به **میلیون ریال** است.\n"
                 "🔸 در هر مرحله می‌توانید با دکمه «انصراف» به منو برگردید.\n"
                 "🔸 برای خروج کامل، گزینه «خروج» را انتخاب کنید."
@@ -5051,6 +5281,55 @@ def handle_message(message):
                 send_message(chat_id, "📅 لطفاً **تاریخ** مورد نظر برای ثبت آمار واقعی را به فرمت YYYY/MM/DD وارد کنید:\n\n(مثلاً 1403/01/15)", get_cancel_keyboard())
                 return
 
+            # ===== گزارش‌های جدید سوپرادمین =====
+            if text == "🏅 رتبه‌بندی دقت معاونان":
+                ranking = get_deputy_accuracy_ranking(30)
+                if not ranking:
+                    send_message(chat_id, "📭 داده‌های کافی برای رتبه‌بندی دقت وجود ندارد.", get_super_admin_keyboard())
+                    return
+                msg = "🏅 **رتبه‌بندی معاونان بر اساس دقت خوداظهاری (۳۰ روز اخیر)**\n━━━━━━━━━━━━━━━━━━\n\n"
+                for idx, row in enumerate(ranking, 1):
+                    dep_id, name, branch, days, avg_acc = row
+                    medal = "🥇" if idx == 1 else "🥈" if idx == 2 else "🥉" if idx == 3 else f"{idx}."
+                    msg += f"{medal} {name} - {branch}\n"
+                    msg += f"   📊 تعداد روزهای ثبت: {days}\n"
+                    msg += f"   🎯 میانگین دقت: {avg_acc:.1f}%\n\n"
+                send_message(chat_id, msg, get_super_admin_keyboard())
+                return
+
+            if text == "📈 روند دقت شعبه":
+                user_states[chat_id]["state"] = "WAITING_FOR_BRANCH_ACCURACY"
+                user_states[chat_id]["accuracy_context"] = "trend"
+                send_message(chat_id, "🏢 لطفاً **نام شعبه** مورد نظر را برای مشاهده روند دقت وارد کنید:", get_cancel_keyboard())
+                return
+
+            if text == "📊 بهترین/بدترین دقت روز":
+                user_states[chat_id]["state"] = "WAITING_FOR_BRANCH_ACCURACY"
+                user_states[chat_id]["accuracy_context"] = "best_worst"
+                send_message(chat_id, "📅 لطفاً **تاریخ** مورد نظر را به فرمت YYYY/MM/DD وارد کنید:", get_cancel_keyboard())
+                return
+
+            if text == "📊 مقایسه عملکرد شعبه با استان":
+                user_states[chat_id]["state"] = "WAITING_FOR_BRANCH_ACCURACY"
+                user_states[chat_id]["accuracy_context"] = "compare_avg"
+                send_message(chat_id, "🏢 لطفاً **نام شعبه** مورد نظر را برای مقایسه با میانگین استان وارد کنید:", get_cancel_keyboard())
+                return
+
+            if text == "⏰ تحلیل تاخیر معاونان":
+                late_data = get_deputy_late_analysis(30)
+                if not late_data:
+                    send_message(chat_id, "📭 داده‌های کافی برای تحلیل تاخیر وجود ندارد.", get_super_admin_keyboard())
+                    return
+                msg = "⏰ **تحلیل تاخیر در ثبت وصول معاونان (۳۰ روز اخیر)**\n━━━━━━━━━━━━━━━━━━\n\n"
+                for idx, row in enumerate(late_data, 1):
+                    dep_id, name, branch, total_days, late_days, late_percent = row
+                    emoji = "🔴" if late_percent > 30 else "🟡" if late_percent > 15 else "🟢"
+                    msg += f"{idx}. {name} - {branch}\n"
+                    msg += f"   📅 تعداد روزهای ثبت: {total_days}\n"
+                    msg += f"   ⏰ تاخیر: {late_days} روز ({late_percent:.1f}%) {emoji}\n\n"
+                send_message(chat_id, msg, get_super_admin_keyboard())
+                return
+
         # ============================================================
         # ادامه منوی ادمین
         # ============================================================
@@ -5093,14 +5372,15 @@ def handle_message(message):
                         msg += f"   📅 تاخیر: {perf['late']} روز\n"
                         msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   🏆 بهترین روز: {perf['best_day']//1_000_000:,.0f} میلیون ریال\n"
+                        # محاسبه میانگین دقت با اصلاح شرط - همه روزها لحاظ شوند
                         match_data = get_deputy_match_report(dep_id, 30)
                         if match_data:
                             total_match = 0
                             count = 0
                             for row in match_data:
-                                if row[3] > 0:
-                                    total_match += row[3]
-                                    count += 1
+                                # حتی اگر دقت صفر باشد، در میانگین لحاظ شود
+                                total_match += row[3]  # row[3] مقدار دقت است
+                                count += 1
                             if count > 0:
                                 avg_match = total_match / count
                                 msg += f"   📊 میانگین انطباق با آمار واقعی: {avg_match:.1f}%\n"
