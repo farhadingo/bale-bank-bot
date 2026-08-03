@@ -9,6 +9,7 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify
 import jdatetime
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,6 +30,8 @@ import traceback
 from collections import deque
 from functools import lru_cache
 import time as time_module
+import pickle
+import atexit
 
 # ============================================================
 # تنظیمات لاگین با چرخش فایل
@@ -89,7 +92,7 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=PORT)
 
 # ============================================================
-# Session با Keep-Alive - بدون Retry روی POST
+# Session با Keep-Alive و Retry روی GET
 # ============================================================
 def create_session():
     session = requests.Session()
@@ -107,41 +110,91 @@ def create_session():
 requests_session = create_session()
 
 # ============================================================
-# Connection Pool دیتابیس
+# Connection Pool دیتابیس با تشخیص سلامت
 # ============================================================
-try:
-    db_pool = psycopg2.pool.ThreadedConnectionPool(5, 30, DB_URL)
-    logger.info("✅ ThreadedConnectionPool created with min=5, max=30.")
-except Exception as e:
-    logger.error(f"❌ Pool error: {e}")
-    db_pool = None
+class SafeConnectionPool:
+    def __init__(self, minconn=5, maxconn=30, dsn=None):
+        self.dsn = dsn
+        self.minconn = minconn
+        self.maxconn = maxconn
+        self._pool = None
+        self._lock = threading.RLock()
+        self._create_pool()
+
+    def _create_pool(self):
+        try:
+            self._pool = psycopg2.pool.ThreadedConnectionPool(
+                self.minconn, self.maxconn, self.dsn
+            )
+            logger.info("✅ Connection pool created")
+        except Exception as e:
+            logger.error(f"❌ Failed to create pool: {e}")
+            self._pool = None
+
+    def getconn(self):
+        with self._lock:
+            if self._pool is None:
+                self._create_pool()
+            if self._pool is not None:
+                try:
+                    return self._pool.getconn()
+                except Exception as e:
+                    logger.error(f"Pool getconn error: {e}, falling back to direct connect")
+                    return psycopg2.connect(self.dsn)
+            return psycopg2.connect(self.dsn)
+
+    def putconn(self, conn):
+        if conn is None:
+            return
+        with self._lock:
+            if self._pool is not None:
+                try:
+                    self._pool.putconn(conn)
+                    return
+                except Exception as e:
+                    logger.error(f"Pool putconn error: {e}, closing directly")
+            try:
+                conn.close()
+            except:
+                pass
+
+db_pool = SafeConnectionPool(5, 30, DB_URL)
 
 # ============================================================
-# کش‌های هوشمند با TTL
+# کش‌های Thread-Safe با قفل
 # ============================================================
 class TTLCache:
     def __init__(self, ttl_seconds=10):
         self._cache = {}
         self._timestamps = {}
         self._ttl = ttl_seconds
+        self._lock = threading.RLock()
 
     def get(self, key):
-        if key in self._cache:
-            if time_module.time() - self._timestamps[key] < self._ttl:
-                return self._cache[key]
-            else:
-                self.invalidate(key)
-        return None
+        with self._lock:
+            if key in self._cache:
+                if time_module.time() - self._timestamps[key] < self._ttl:
+                    return self._cache[key]
+                else:
+                    self._invalidate(key)
+            return None
 
     def set(self, key, value):
-        self._cache[key] = value
-        self._timestamps[key] = time_module.time()
+        with self._lock:
+            self._cache[key] = value
+            self._timestamps[key] = time_module.time()
 
     def invalidate(self, key=None):
-        if key is None:
-            self._cache.clear()
-            self._timestamps.clear()
-        elif key in self._cache:
+        with self._lock:
+            if key is None:
+                self._cache.clear()
+                self._timestamps.clear()
+            elif key in self._cache:
+                del self._cache[key]
+                del self._timestamps[key]
+
+    def _invalidate(self, key):
+        if key in self._cache:
             del self._cache[key]
             del self._timestamps[key]
 
@@ -157,16 +210,228 @@ cache_10day_report = TTLCache(ttl_seconds=60)
 cache_adaptive = TTLCache(ttl_seconds=60)
 cache_forecast_all = TTLCache(ttl_seconds=120)
 cache_targets = TTLCache(ttl_seconds=60)
-cache_admins = TTLCache(ttl_seconds=300)  # کش برای لیست ادمین‌ها
+cache_admins = TTLCache(ttl_seconds=300)
 
 # ============================================================
-# قفل برای Thread-Safe بودن user_states
+# State Management با قفل
 # ============================================================
 user_states_lock = threading.RLock()
 user_states = {}
 
 # ============================================================
-# توابع کش‌شده
+# مدیریت offset با ذخیره در فایل
+# ============================================================
+OFFSET_FILE = "offset.dat"
+
+def save_offset(offset):
+    try:
+        with open(OFFSET_FILE, 'wb') as f:
+            pickle.dump(offset, f)
+    except Exception as e:
+        logger.error(f"Failed to save offset: {e}")
+
+def load_offset():
+    try:
+        if os.path.exists(OFFSET_FILE):
+            with open(OFFSET_FILE, 'rb') as f:
+                return pickle.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load offset: {e}")
+    return 0
+
+# ============================================================
+# محدودکننده تردها
+# ============================================================
+executor = ThreadPoolExecutor(max_workers=5)
+
+# ============================================================
+# توابع کمکی
+# ============================================================
+PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹'
+ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩'
+ENGLISH_DIGITS = '0123456789'
+DIGIT_MAP = str.maketrans(PERSIAN_DIGITS + ARABIC_DIGITS, ENGLISH_DIGITS + ENGLISH_DIGITS)
+
+def normalize_digits(text):
+    if not text:
+        return text
+    text = str(text).translate(DIGIT_MAP)
+    text = text.replace(',', '').replace('،', '').replace(' ', '')
+    return text
+
+def parse_number(text):
+    try:
+        if not text or text.strip() == '':
+            return None
+        text = str(text).strip()
+        # پشتیبانی از هر دو حالت -۵۰۰ و ۵۰۰-
+        if text.endswith('-'):
+            text = '-' + text[:-1]
+        text = normalize_digits(text)
+        if not text or text == '-':
+            return None
+        if '.' in text:
+            return int(float(text))
+        return int(text)
+    except Exception as e:
+        logger.error(f"parse_number error for '{text}': {e}")
+        return None
+
+def escape_markdown(text):
+    if not text:
+        return ""
+    # فقط کاراکترهای ضروری برای مارک‌داون عادی
+    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`']
+    for char in escape_chars:
+        text = text.replace(char, '\\' + char)
+    return text
+
+def split_text_safely(text, max_len=4000):
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        cut = max_len
+        for sep in ['\n\n', '\n', '. ', '، ', ' ']:
+            pos = text.rfind(sep, 0, cut)
+            if pos > cut - 50:
+                cut = pos + len(sep)
+                break
+        chunks.append(text[:cut])
+        text = text[cut:]
+    return chunks
+
+# ============================================================
+# تنظیم فونت فارسی (یک‌بار در startup)
+# ============================================================
+_font_initialized = False
+
+def setup_persian_font_once():
+    global _font_initialized
+    if _font_initialized:
+        return
+    try:
+        font_paths = [
+            '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Regular.ttf',
+            '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Medium.ttf',
+            '/usr/share/fonts/opentype/vazirmatn/Vazirmatn-Regular.otf',
+            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+            '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+            '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',
+            '/usr/share/fonts/truetype/ubuntu/Ubuntu-Regular.ttf',
+            '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
+            '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+            '/usr/share/fonts/truetype/arphic/uming.ttc',
+            '/usr/share/fonts/truetype/ipafont/ipag.ttf',
+        ]
+        plt.rcParams['font.family'] = 'sans-serif'
+        plt.rcParams['axes.unicode_minus'] = False
+
+        for path in font_paths:
+            if os.path.exists(path):
+                fm.fontManager.addfont(path)
+                prop = fm.FontProperties(fname=path)
+                plt.rcParams['font.family'] = prop.get_name()
+                logger.info(f"✅ Font loaded: {path}")
+                _font_initialized = True
+                return
+
+        plt.rcParams['font.family'] = ['DejaVu Sans', 'Liberation Sans', 'sans-serif']
+        logger.warning("⚠️ No Persian font found, using fallback fonts")
+        _font_initialized = True
+    except Exception as e:
+        logger.error(f"❌ Font setup error: {e}")
+        plt.rcParams['font.family'] = 'sans-serif'
+        _font_initialized = True
+
+setup_persian_font_once()
+
+def reshape_persian(text):
+    if not text:
+        return ""
+    try:
+        reshaped = arabic_reshaper.reshape(str(text))
+        return get_display(reshaped)
+    except Exception:
+        return str(text)
+
+# ============================================================
+# توابع تاریخ
+# ============================================================
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+def get_iran_time():
+    return datetime.now(IRAN_TZ)
+
+def get_shamsi_date(days_offset=0):
+    now = get_iran_time() + timedelta(days=days_offset)
+    shamsi = jdatetime.datetime.fromgregorian(datetime=now)
+    return f"{shamsi.year}/{shamsi.month:02d}/{shamsi.day:02d}"
+
+def get_shamsi_date_formatted(shamsi_str):
+    if not shamsi_str:
+        return "نامعلوم"
+    parts = shamsi_str.split('/')
+    if len(parts) != 3:
+        return shamsi_str
+    year, month, day = parts
+    month = month.zfill(2)
+    day = day.zfill(2)
+    months = {
+        '01':'فروردین','02':'اردیبهشت','03':'خرداد',
+        '04':'تیر','05':'مرداد','06':'شهریور',
+        '07':'مهر','08':'آبان','09':'آذر',
+        '10':'دی','11':'بهمن','12':'اسفند'
+    }
+    return f"{int(day)} {months.get(month, '')} {year}"
+
+def safe_format(value, default="0"):
+    return value if value is not None else default
+
+def validate_shamsi_date(shamsi_str):
+    shamsi_str = normalize_digits(shamsi_str)
+    if not re.match(r'^\d{4}/\d{2}/\d{2}$', shamsi_str):
+        return False
+    try:
+        year, month, day = map(int, shamsi_str.split('/'))
+        jdatetime.date(year, month, day)
+        return True
+    except Exception:
+        return False
+
+def is_last_day_of_shamsi_month(shamsi_date_str):
+    try:
+        parts = shamsi_date_str.split('/')
+        year, month, day = map(int, parts)
+        try:
+            next_day = jdatetime.date(year, month, day) + timedelta(days=1)
+            return next_day.month != month
+        except Exception as e:
+            logger.error(f"is_last_day_of_shamsi_month: error calculating next day: {e}")
+            return False
+    except Exception as e:
+        logger.error(f"is_last_day_of_shamsi_month: invalid date format: {shamsi_date_str}, error: {e}")
+        return False
+
+def get_shamsi_month_range():
+    today = get_iran_time()
+    shamsi_today = jdatetime.datetime.fromgregorian(datetime=today)
+    first_day = jdatetime.date(shamsi_today.year, shamsi_today.month, 1)
+    if shamsi_today.month == 12:
+        next_month = jdatetime.date(shamsi_today.year + 1, 1, 1)
+    else:
+        next_month = jdatetime.date(shamsi_today.year, shamsi_today.month + 1, 1)
+    last_day = next_month - timedelta(days=1)
+    return (
+        f"{first_day.year}/{first_day.month:02d}/{first_day.day:02d}",
+        f"{last_day.year}/{last_day.month:02d}/{last_day.day:02d}"
+    )
+
+# ============================================================
+# توابع مدیریت تنظیمات
 # ============================================================
 def get_bot_status_db():
     conn = None
@@ -192,6 +457,31 @@ def get_cached_bot_status():
     value = get_bot_status_db()
     cache_bot_status.set('bot_status', value)
     return value
+
+def get_bot_status():
+    return get_cached_bot_status()
+
+def set_bot_status(status):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO settings (key, value, updated_at)
+                VALUES ('bot_status', %s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+            """, ('active' if status else 'inactive', get_iran_time()))
+            conn.commit()
+            cache_bot_status.set('bot_status', status)
+            return True
+    except Exception as e:
+        logger.error(f"set_bot_status: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            return_db_connection(conn)
 
 def get_feature_setting(key, default='active'):
     cache_key = f'feature_{key}'
@@ -236,267 +526,7 @@ def set_feature_setting(key, value):
         if conn:
             return_db_connection(conn)
 
-def get_all_branches():
-    cached = cache_branches.get('branches')
-    if cached is not None:
-        return cached
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM branches ORDER BY name")
-            result = cur.fetchall()
-            cache_branches.set('branches', result)
-            return result
-    except Exception as e:
-        logger.error(f"get_all_branches: {e}")
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def invalidate_branches_cache():
-    cache_branches.invalidate('branches')
-
-# ============================================================
-# State Management
-# ============================================================
-processed_updates = deque(maxlen=2000)
-processed_set = set()
-
-def get_db_connection():
-    if db_pool:
-        try:
-            return db_pool.getconn()
-        except:
-            return psycopg2.connect(DB_URL)
-    return psycopg2.connect(DB_URL)
-
-def return_db_connection(conn):
-    if db_pool and conn:
-        try:
-            db_pool.putconn(conn)
-        except:
-            conn.close()
-    elif conn:
-        conn.close()
-
-# ============================================================
-# توابع کمکی
-# ============================================================
-PERSIAN_DIGITS = '۰۱۲۳۴۵۶۷۸۹'
-ARABIC_DIGITS = '٠١٢٣٤٥٦٧٨٩'
-ENGLISH_DIGITS = '0123456789'
-DIGIT_MAP = str.maketrans(PERSIAN_DIGITS + ARABIC_DIGITS, ENGLISH_DIGITS + ENGLISH_DIGITS)
-
-def normalize_digits(text):
-    if not text:
-        return text
-    text = str(text).translate(DIGIT_MAP)
-    text = text.replace(',', '').replace('،', '').replace(' ', '')
-    return text
-
-def parse_number(text):
-    try:
-        if not text or text.strip() == '':
-            return None
-        text = str(text).strip()
-        if text.endswith('-'):
-            text = '-' + text[:-1]
-        text = normalize_digits(text)
-        if not text or text == '-':
-            return None
-        if '.' in text:
-            return int(float(text))
-        return int(text)
-    except Exception as e:
-        logger.error(f"parse_number error for '{text}': {e}")
-        return None
-
-def escape_markdown(text):
-    if not text:
-        return ""
-    # فقط کاراکترهای واقعاً ضروری برای مارک‌داون عادی
-    escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`']
-    for char in escape_chars:
-        text = text.replace(char, '\\' + char)
-    return text
-
-def split_text_safely(text, max_len=4000):
-    if len(text) <= max_len:
-        return [text]
-    chunks = []
-    while text:
-        if len(text) <= max_len:
-            chunks.append(text)
-            break
-        cut = max_len
-        for sep in ['\n\n', '\n', '. ', '، ', ' ']:
-            pos = text.rfind(sep, 0, cut)
-            if pos > cut - 50:
-                cut = pos + len(sep)
-                break
-        chunks.append(text[:cut])
-        text = text[cut:]
-    return chunks
-
-# ============================================================
-# تنظیم فونت فارسی برای Matplotlib
-# ============================================================
-def setup_persian_font():
-    try:
-        font_paths = [
-            '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Regular.ttf',
-            '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Medium.ttf',
-            '/usr/share/fonts/opentype/vazirmatn/Vazirmatn-Regular.otf',
-            '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-            '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-            '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',
-            '/usr/share/fonts/truetype/ubuntu/Ubuntu-Regular.ttf',
-            '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
-            '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
-            '/usr/share/fonts/truetype/arphic/uming.ttc',
-            '/usr/share/fonts/truetype/ipafont/ipag.ttf',
-        ]
-        plt.rcParams['font.family'] = 'sans-serif'
-        plt.rcParams['axes.unicode_minus'] = False
-
-        for path in font_paths:
-            if os.path.exists(path):
-                fm.fontManager.addfont(path)
-                prop = fm.FontProperties(fname=path)
-                plt.rcParams['font.family'] = prop.get_name()
-                logger.info(f"✅ Font loaded: {path}")
-                return True
-
-        plt.rcParams['font.family'] = ['DejaVu Sans', 'Liberation Sans', 'sans-serif']
-        logger.warning("⚠️ No Persian font found, using fallback fonts")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Font setup error: {e}")
-        plt.rcParams['font.family'] = 'sans-serif'
-        return False
-
-def reshape_persian(text):
-    if not text:
-        return ""
-    try:
-        reshaped = arabic_reshaper.reshape(str(text))
-        return get_display(reshaped)
-    except:
-        return str(text)
-
-# ============================================================
-# توابع تاریخ
-# ============================================================
-IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
-
-def get_iran_time():
-    return datetime.now(IRAN_TZ)
-
-def get_shamsi_date(days_offset=0):
-    now = get_iran_time() + timedelta(days=days_offset)
-    shamsi = jdatetime.datetime.fromgregorian(datetime=now)
-    return f"{shamsi.year}/{shamsi.month:02d}/{shamsi.day:02d}"
-
-def get_shamsi_date_formatted(shamsi_str):
-    if not shamsi_str:
-        return "نامعلوم"
-    parts = shamsi_str.split('/')
-    if len(parts) != 3:
-        return shamsi_str
-    year, month, day = parts
-    month = normalize_digits(month).zfill(2)
-    day = normalize_digits(day)
-    months = {
-        '01':'فروردین','02':'اردیبهشت','03':'خرداد',
-        '04':'تیر','05':'مرداد','06':'شهریور',
-        '07':'مهر','08':'آبان','09':'آذر',
-        '10':'دی','11':'بهمن','12':'اسفند'
-    }
-    return f"{int(day)} {months.get(month, '')} {year}"
-
-def safe_format(value, default="0"):
-    return value if value is not None else default
-
-def parse_shamsi_to_date(shamsi_str):
-    shamsi_str = normalize_digits(shamsi_str)
-    if not re.match(r'^\d{4}/\d{2}/\d{2}$', shamsi_str):
-        return None
-    try:
-        year, month, day = map(int, shamsi_str.split('/'))
-        jdatetime.date(year, month, day)
-        return jdatetime.date(year, month, day).togregorian()
-    except:
-        return None
-
-def is_last_day_of_shamsi_month(shamsi_date_str):
-    try:
-        parts = shamsi_date_str.split('/')
-        year, month, day = map(int, parts)
-        try:
-            next_day = jdatetime.date(year, month, day) + timedelta(days=1)
-            return next_day.month != month
-        except Exception as e:
-            logger.error(f"is_last_day_of_shamsi_month: error calculating next day: {e}")
-            return False
-    except Exception as e:
-        logger.error(f"is_last_day_of_shamsi_month: invalid date format: {shamsi_date_str}, error: {e}")
-        return False
-
-def get_shamsi_month_range():
-    today = get_iran_time()
-    shamsi_today = jdatetime.datetime.fromgregorian(datetime=today)
-    first_day = jdatetime.date(shamsi_today.year, shamsi_today.month, 1)
-    if shamsi_today.month == 12:
-        next_month = jdatetime.date(shamsi_today.year + 1, 1, 1)
-    else:
-        next_month = jdatetime.date(shamsi_today.year, shamsi_today.month + 1, 1)
-    last_day = next_month - timedelta(days=1)
-    return (
-        f"{first_day.year}/{first_day.month:02d}/{first_day.day:02d}",
-        f"{last_day.year}/{last_day.month:02d}/{last_day.day:02d}"
-    )
-
-def validate_shamsi_date(shamsi_str):
-    shamsi_str = normalize_digits(shamsi_str)
-    if not re.match(r'^\d{4}/\d{2}/\d{2}$', shamsi_str):
-        return False
-    try:
-        year, month, day = map(int, shamsi_str.split('/'))
-        jdatetime.date(year, month, day)
-        return True
-    except:
-        return False
-
-# ============================================================
-# توابع مدیریت تنظیمات
-# ============================================================
-def get_bot_status():
-    return get_cached_bot_status()
-
-def set_bot_status(status):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO settings (key, value, updated_at)
-                VALUES ('bot_status', %s, %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
-            """, ('active' if status else 'inactive', get_iran_time()))
-            conn.commit()
-            cache_bot_status.set('bot_status', status)
-            return True
-    except Exception as e:
-        logger.error(f"set_bot_status: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_db_connection(conn)
-
+# توابع وضعیت‌های خودکار
 def get_auto_reminder_status():
     return get_feature_setting('auto_reminder', 'active') == 'active'
 def set_auto_reminder_status(status):
@@ -963,13 +993,11 @@ def create_all_tables_if_not_exists():
                     is_active BOOLEAN DEFAULT TRUE
                 )
             """)
-            # ایندکس یکتای شرطی برای اهداف فعال
             cur.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_target
                 ON branch_targets(branch_id)
                 WHERE is_active = TRUE
             """)
-            # ایندکس‌های بهینه‌سازی
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_branch_date ON collections(branch_id, shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_shamsi ON collections(shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id);")
@@ -985,6 +1013,40 @@ def create_all_tables_if_not_exists():
             return_db_connection(conn)
 
 create_all_tables_if_not_exists()
+
+# ============================================================
+# توابع دیتابیس پایه با مدیریت صحیح connection pool
+# ============================================================
+def get_db_connection():
+    return db_pool.getconn()
+
+def return_db_connection(conn):
+    db_pool.putconn(conn)
+
+# ============================================================
+# توابع کش‌شده برای داده‌های دیتابیس
+# ============================================================
+def get_all_branches():
+    cached = cache_branches.get('branches')
+    if cached is not None:
+        return cached
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM branches ORDER BY name")
+            result = cur.fetchall()
+            cache_branches.set('branches', result)
+            return result
+    except Exception as e:
+        logger.error(f"get_all_branches: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def invalidate_branches_cache():
+    cache_branches.invalidate('branches')
 
 # ============================================================
 # توابع آمار واقعی
@@ -1077,12 +1139,13 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             claimed = collection[0] if collection else 0
             actual_raw = actual[0]
 
+            # برای حالتی که actual > 0 باشد هم اطلاعات را برگردان
             return {
                 'claimed': claimed,
                 'actual': actual_raw,
                 'abs_actual': abs(actual_raw),
                 'diff_abs': abs(abs(claimed) - abs(actual_raw)),
-                'is_claimed_more': abs(claimed) > abs(actual_raw) if actual_raw < 0 else None
+                'is_claimed_more': abs(claimed) > abs(actual_raw) if actual_raw != 0 else None
             }
     except Exception as e:
         logger.error(f"compare_collection_with_actual error: {e}")
@@ -1171,7 +1234,7 @@ def get_forecast(branch_id=None, days=7):
                         greg = jdatetime.date(year, month, day).togregorian()
                         dates.append(greg.toordinal())
                         amounts.append(float(row[1] or 0))
-                    except Exception as e:
+                    except Exception:
                         continue
             if len(dates) < 3:
                 return None, {'error': f'تعداد داده‌های معتبر: {len(dates)} (حداقل ۳ روز نیاز است)'}
@@ -1256,71 +1319,72 @@ def get_forecast_for_all_branches(days=7):
             return_db_connection(conn)
 
 # ============================================================
-# توابع نمودار
+# توابع نمودار (با مدیریت صحیح plt.close)
 # ============================================================
 def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
     try:
-        setup_persian_font()
         plt.figure(figsize=figsize)
+        try:
+            title_fa = reshape_persian(title)
+            x_label_fa = reshape_persian(x_label)
+            y_label_fa = reshape_persian(y_label)
 
-        title_fa = reshape_persian(title)
-        x_label_fa = reshape_persian(x_label)
-        y_label_fa = reshape_persian(y_label)
+            labels = [reshape_persian(str(lbl)) for lbl in data['labels']]
+            values = [float(v) if v is not None else 0 for v in data['values']]
 
-        labels = [reshape_persian(str(lbl)) for lbl in data['labels']]
-        values = [float(v) if v is not None else 0 for v in data['values']]
+            plt.xticks(rotation=45, ha='right', fontsize=10)
 
-        plt.xticks(rotation=45, ha='right', fontsize=10)
+            if chart_type == 'bar':
+                plt.bar(labels, values, color='skyblue', edgecolor='navy')
+                max_val = max(values) if values else 1
+                for i, v in enumerate(values):
+                    if v > 0:
+                        plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
+                                ha='center', va='bottom', fontsize=8)
+            elif chart_type == 'line':
+                plt.plot(labels, values, marker='o', linestyle='-', color='blue', linewidth=2, markersize=8)
+                max_val = max(values) if values else 1
+                for i, v in enumerate(values):
+                    if v > 0:
+                        plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
+                                ha='center', va='bottom', fontsize=8)
+            elif chart_type == 'pie':
+                non_zero = [(l, v) for l, v in zip(labels, values) if v > 0]
+                if non_zero:
+                    labels, values = zip(*non_zero)
+                    plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
+                else:
+                    plt.pie([1], labels=['داده‌ای وجود ندارد'], colors=['lightgray'])
+            elif chart_type == 'horizontal':
+                plt.barh(labels, values, color='skyblue', edgecolor='navy')
+                max_val = max(values) if values else 1
+                for i, v in enumerate(values):
+                    if v > 0:
+                        plt.text(v + 0.02*max_val, i, f"{int(v)//1_000_000:,.0f}",
+                                va='center', fontsize=8)
+            elif chart_type == 'stacked':
+                if 'values2' in data:
+                    values2 = [float(v) if v is not None else 0 for v in data['values2']]
+                    plt.bar(labels, values, label='معاون', color='blue', alpha=0.7)
+                    plt.bar(labels, values2, label='همکاران', color='orange', alpha=0.7, bottom=values)
+                    plt.legend()
+                else:
+                    plt.bar(labels, values, color='skyblue')
 
-        if chart_type == 'bar':
-            plt.bar(labels, values, color='skyblue', edgecolor='navy')
-            max_val = max(values) if values else 1
-            for i, v in enumerate(values):
-                if v > 0:
-                    plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
-                            ha='center', va='bottom', fontsize=8)
-        elif chart_type == 'line':
-            plt.plot(labels, values, marker='o', linestyle='-', color='blue', linewidth=2, markersize=8)
-            max_val = max(values) if values else 1
-            for i, v in enumerate(values):
-                if v > 0:
-                    plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
-                            ha='center', va='bottom', fontsize=8)
-        elif chart_type == 'pie':
-            non_zero = [(l, v) for l, v in zip(labels, values) if v > 0]
-            if non_zero:
-                labels, values = zip(*non_zero)
-                plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
-            else:
-                plt.pie([1], labels=['داده‌ای وجود ندارد'], colors=['lightgray'])
-        elif chart_type == 'horizontal':
-            plt.barh(labels, values, color='skyblue', edgecolor='navy')
-            max_val = max(values) if values else 1
-            for i, v in enumerate(values):
-                if v > 0:
-                    plt.text(v + 0.02*max_val, i, f"{int(v)//1_000_000:,.0f}",
-                            va='center', fontsize=8)
-        elif chart_type == 'stacked':
-            if 'values2' in data:
-                values2 = [float(v) if v is not None else 0 for v in data['values2']]
-                plt.bar(labels, values, label='معاون', color='blue', alpha=0.7)
-                plt.bar(labels, values2, label='همکاران', color='orange', alpha=0.7, bottom=values)
-                plt.legend()
-            else:
-                plt.bar(labels, values, color='skyblue')
+            plt.title(title_fa, fontsize=14, fontweight='bold')
+            plt.xlabel(x_label_fa)
+            plt.ylabel(y_label_fa)
 
-        plt.title(title_fa, fontsize=14, fontweight='bold')
-        plt.xlabel(x_label_fa)
-        plt.ylabel(y_label_fa)
-
-        plt.tight_layout()
-        img_bytes = io.BytesIO()
-        plt.savefig(img_bytes, format='png', dpi=120, bbox_inches='tight')
-        plt.close()
-        img_bytes.seek(0)
-        return img_bytes.getvalue()
+            plt.tight_layout()
+            img_bytes = io.BytesIO()
+            plt.savefig(img_bytes, format='png', dpi=120, bbox_inches='tight')
+            img_bytes.seek(0)
+            return img_bytes.getvalue()
+        finally:
+            plt.close()
     except Exception as e:
         logger.error(f"generate_chart error: {e}\n{traceback.format_exc()}")
+        plt.close()
         return None
 
 def generate_branch_chart(branch_id, days=10):
@@ -1427,7 +1491,6 @@ def get_analytical_chart_data(chart_type, days=10):
                     'values': [row[1] for row in reversed(data)]
                 }
             elif chart_type == 'match_analysis':
-                # اصلاح تقسیم بر صفر با NULLIF
                 cur.execute("""
                     SELECT
                         b.name,
@@ -1630,6 +1693,28 @@ def get_all_notes_with_collection(limit=50):
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# توابع مدیریت وصولی‌ها
+# ============================================================
+def check_existing_collection(branch_id, shamsi_date):
+    shamsi_date = normalize_digits(shamsi_date)
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, deputy_amount, others_amount
+                FROM collections
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"check_existing_collection: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
 def save_or_update_collection_with_note(branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id, note_text=None, update_existing=False):
     conn = None
     created_at_iran = get_iran_time()
@@ -1679,11 +1764,10 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
             cache_targets.invalidate(f'target_{branch_id}')
             cache_targets.invalidate_all()
             if collection_id and get_instant_notification_status() and not is_holiday(shamsi_date):
-                threading.Thread(
-                    target=send_instant_notification_async,
-                    args=(branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id),
-                    daemon=True
-                ).start()
+                executor.submit(
+                    send_instant_notification_async,
+                    branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id
+                )
             return True, collection_id
     except Exception as e:
         logger.error(f"save_or_update_collection_with_note: {e}")
@@ -1703,7 +1787,6 @@ def send_instant_notification_async(branch_id, deputy_amount, others_amount, sha
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            # دریافت همه ادمین‌ها با یک کوئری
             cur.execute("""
                 SELECT telegram_id FROM users
                 WHERE (role IN ('admin', 'super_admin') OR is_super_admin = TRUE)
@@ -1735,46 +1818,9 @@ def send_instant_notification_async(branch_id, deputy_amount, others_amount, sha
         if conn:
             return_db_connection(conn)
 
-def check_existing_collection(branch_id, shamsi_date):
-    shamsi_date = normalize_digits(shamsi_date)
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, deputy_amount, others_amount
-                FROM collections
-                WHERE branch_id = %s AND shamsi_date = %s
-            """, (branch_id, shamsi_date))
-            return cur.fetchone()
-    except Exception as e:
-        logger.error(f"check_existing_collection: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_branch_10_day_report(branch_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT shamsi_date, deputy_amount, others_amount, total_amount
-                FROM collections
-                WHERE branch_id = %s
-                ORDER BY shamsi_date DESC
-                LIMIT 10
-            """, (branch_id,))
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_branch_10_day_report: {e}")
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# اصلاح تابع get_today_province_report برای گرفتن هدف و وصولی‌ها در یک کوئری (رفع N+1)
+# ============================================================
+# توابع گزارش‌گیری
+# ============================================================
 def get_today_province_report(shamsi_date):
     cache_key = f'today_report_{shamsi_date}'
     cached = cache_today_report.get(cache_key)
@@ -1907,7 +1953,6 @@ def get_detailed_report(shamsi_date):
         if conn:
             return_db_connection(conn)
 
-# اصلاح تابع get_branch_performance برای رفع خطای SQL
 def get_branch_performance(branch_id, days=10):
     conn = None
     try:
@@ -2549,7 +2594,7 @@ def get_others_performance_summary():
             return_db_connection(conn)
 
 # ============================================================
-# توابع جدید برای گزارش‌های پیشرفته سوپرادمین
+# توابع گزارش‌های پیشرفته سوپرادمین
 # ============================================================
 def get_deputy_accuracy_ranking(days=30):
     conn = None
@@ -2851,9 +2896,8 @@ def get_target_progress(branch_id, target_date, target_amount, created_at=None):
         target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
         today_obj = jdatetime.date(*map(int, shamsi_today.split('/')))
         days_left = (target_date_obj - today_obj).days
-        if days_left < 0:
-            days_left = 0
-    except:
+        # اگر منفی باشد، مقدار منفی را نگه می‌داریم تا نشان دهیم هدف منقضی شده
+    except Exception:
         days_left = 0
     remaining = target_amount - collected
     if remaining < 0:
@@ -2934,12 +2978,23 @@ def get_targets_progress_report():
     return report
 
 # ============================================================
-# ارسال پیام و عکس
+# ارسال پیام و عکس (با کش شدن وضعیت سوپرادمین)
 # ============================================================
+def is_super_admin_user(chat_id):
+    user = find_user_by_telegram_id(chat_id)
+    if user:
+        return user[7]
+    return False
+
 def send_message(chat_id, text, reply_markup=None, remove_keyboard=False, parse_mode="Markdown", escape_user_text=False):
-    if not get_bot_status() and not is_super_admin_user(chat_id):
-        send_maintenance_message(chat_id)
-        return None
+    # وضعیت ربات: فقط سوپرادمین می‌تواند در حالت غیرفعال پیام بفرستد
+    bot_status = get_bot_status()
+    if not bot_status:
+        # بررسی سریع سوپرادمین (با کش)
+        user = find_user_by_telegram_id(chat_id)
+        if not user or not user[7]:
+            send_maintenance_message(chat_id)
+            return None
 
     if escape_user_text:
         text = escape_markdown(text)
@@ -2991,9 +3046,12 @@ def send_message_chunk(chat_id, text, reply_markup=None, remove_keyboard=False, 
         logger.error(f"send_message_chunk error: {e}")
 
 def send_photo(chat_id, photo_bytes, caption="", reply_markup=None):
-    if not get_bot_status() and not is_super_admin_user(chat_id):
-        send_maintenance_message(chat_id)
-        return None
+    bot_status = get_bot_status()
+    if not bot_status:
+        user = find_user_by_telegram_id(chat_id)
+        if not user or not user[7]:
+            send_maintenance_message(chat_id)
+            return None
     if not photo_bytes:
         logger.error("send_photo: photo_bytes is None or empty")
         return None
@@ -3019,14 +3077,8 @@ def send_maintenance_message(chat_id):
     payload = {"chat_id": chat_id, "text": msg, "parse_mode": "Markdown", "reply_markup": {"remove_keyboard": True}}
     try:
         requests_session.post(url, json=payload, timeout=10)
-    except:
+    except Exception:
         pass
-
-def is_super_admin_user(chat_id):
-    user = find_user_by_telegram_id(chat_id)
-    if user:
-        return user[7]
-    return False
 
 # ============================================================
 # کیبوردها (بدون دکمه‌های نظرسنجی)
@@ -3342,7 +3394,7 @@ def send_monthly_report_to_all():
             send_message(chat_id, msg)
 
 # ============================================================
-# توابع کمکی برای Threading در کارهای سنگین
+# توابع کمکی برای Threading با محدودیت ترد
 # ============================================================
 def generate_and_send_branch_chart(chat_id, branch_id, branch_name, role, is_super_admin):
     try:
@@ -3640,7 +3692,7 @@ def get_deputy_match_report(user_id, days=30):
             return_db_connection(conn)
 
 # ============================================================
-# پردازش پیام‌ها (بدون بخش نظرسنجی)
+# پردازش پیام‌ها (بدون بخش نظرسنجی - کامل حذف شده)
 # ============================================================
 def handle_message(message):
     try:
@@ -3994,7 +4046,6 @@ def handle_message(message):
                     keyboard = get_super_admin_keyboard()
                 send_message(chat_id, "❌ عملیات لغو شد.", keyboard)
                 return
-            safe_text = escape_markdown(text)
             if save_problem(user_db_id, text, "general"):
                 send_message(chat_id, "✅ مشکل شما با موفقیت ثبت شد. تیم پشتیبانی در اسرع وقت بررسی خواهد کرد.", get_admin_keyboard() if role == 'admin' else get_deputy_keyboard())
                 log_user_activity(user_db_id, "add_problem", f"ثبت مشکل: {text[:50]}...")
@@ -4166,11 +4217,13 @@ def handle_message(message):
                 for target in targets:
                     target_id, branch_id, branch_name, target_amount, target_date, created_at, created_by_name = target
                     progress = get_target_progress(branch_id, target_date, target_amount, created_at)
+                    days_left_display = progress['days_left']
+                    days_text = f"{days_left_display} روز" if days_left_display >= 0 else f"{abs(days_left_display)} روز گذشته"
                     msg += f"🏢 {branch_name}\n"
                     msg += f"   💰 هدف: {target_amount//1_000_000:,.0f} میلیون ریال\n"
                     msg += f"   📅 تاریخ هدف: {get_shamsi_date_formatted(target_date)}\n"
                     msg += f"   📊 پیشرفت: {progress['progress_percent']:.1f}% ({progress['collected']//1_000_000:,.0f} از {target_amount//1_000_000:,.0f} میلیون ریال)\n"
-                    msg += f"   📅 روز باقیمانده: {progress['days_left']} روز\n"
+                    msg += f"   📅 زمان باقیمانده: {days_text}\n"
                     msg += f"   📉 فاصله از هدف: {progress['remaining']//1_000_000:,.0f} میلیون ریال\n"
                     msg += f"   👤 ثبت‌کننده: {created_by_name or 'نامشخص'}\n\n"
                 send_message(chat_id, msg, get_super_admin_keyboard())
@@ -4213,7 +4266,7 @@ def handle_message(message):
                         send_message(chat_id, f"🏢 شعبه {branch_name} انتخاب شد.\n\n✏️ لطفاً **مبلغ هدف** را به **میلیون ریال** وارد کنید:", get_cancel_keyboard())
                     else:
                         send_message(chat_id, "❌ شماره نامعتبر. لطفاً مجدداً تلاش کنید.", get_cancel_keyboard())
-                except:
+                except Exception:
                     send_message(chat_id, "❌ لطفاً یک عدد معتبر وارد کنید.", get_cancel_keyboard())
                 return
 
@@ -4231,7 +4284,7 @@ def handle_message(message):
                         user_states[chat_id]["target_amount"] = amount
                         user_states[chat_id]["state"] = "WAITING_FOR_TARGET_DATE"
                     send_message(chat_id, f"✅ مبلغ هدف {amount:,.0f} میلیون ریال ثبت شد.\n\n📅 لطفاً **تاریخ هدف** را به فرمت YYYY/MM/DD وارد کنید (مثلاً ۱۴۰۴/۰۶/۳۱):", get_cancel_keyboard())
-                except:
+                except Exception:
                     send_message(chat_id, "❌ لطفاً یک عدد مثبت معتبر وارد کنید.", get_cancel_keyboard())
                 return
 
@@ -4250,7 +4303,7 @@ def handle_message(message):
                         if target_obj <= today_obj:
                             send_message(chat_id, "❌ تاریخ هدف باید بزرگتر از تاریخ امروز باشد.", get_cancel_keyboard())
                             return
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ خطا در بررسی تاریخ.", get_cancel_keyboard())
                         return
                     branch_id = user_state.get("target_branch_id")
@@ -4293,7 +4346,7 @@ def handle_message(message):
                     else:
                         send_message(chat_id, "❌ شماره نامعتبر.", get_cancel_keyboard())
                         return
-                except:
+                except Exception:
                     send_message(chat_id, "❌ لطفاً یک عدد معتبر وارد کنید.", get_cancel_keyboard())
                     return
                 with user_states_lock:
@@ -4315,12 +4368,13 @@ def handle_message(message):
                     progress = item['progress_percent']
                     remaining = item['remaining']
                     days_left = item['days_left']
+                    days_text = f"{days_left} روز" if days_left >= 0 else f"{abs(days_left)} روز گذشته"
                     emoji = "✅" if progress >= 80 else "🟢" if progress >= 50 else "🟡" if progress >= 30 else "🔴"
                     msg += f"{idx}. 🏢 {branch_name}\n"
                     msg += f"   💰 هدف: {target_amount//1_000_000:,.0f} میلیون ریال\n"
                     msg += f"   📅 تاریخ هدف: {get_shamsi_date_formatted(target_date)}\n"
                     msg += f"   📊 پیشرفت: {progress:.1f}% ({collected//1_000_000:,.0f} از {target_amount//1_000_000:,.0f} میلیون ریال) {emoji}\n"
-                    msg += f"   📅 روز باقیمانده: {days_left} روز\n"
+                    msg += f"   📅 زمان باقیمانده: {days_text}\n"
                     msg += f"   📉 فاصله از هدف: {remaining//1_000_000:,.0f} میلیون ریال\n\n"
                 send_message(chat_id, msg, get_super_admin_keyboard())
                 return
@@ -4339,11 +4393,12 @@ def handle_message(message):
                     target_amount = item['target_amount']
                     collected = item['collected']
                     days_left = item['days_left']
+                    days_text = f"{days_left} روز" if days_left >= 0 else f"{abs(days_left)} روز گذشته"
                     medal = medals[idx-1] if idx <= 3 else f"{idx}."
                     msg += f"{medal} {branch_name}\n"
                     msg += f"   📊 تحقق هدف: {progress:.1f}%\n"
                     msg += f"   💰 جمع وصول: {collected//1_000_000:,.0f} از {target_amount//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"   📅 روز باقیمانده: {days_left} روز\n\n"
+                    msg += f"   📅 زمان باقیمانده: {days_text}\n\n"
                 send_message(chat_id, msg, get_super_admin_keyboard())
                 return
 
@@ -4433,7 +4488,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۸.۷ (رفع باگ‌ها و حذف نظرسنجی)\n"
+                "📅 نسخه: ۸.۷ (رفع باگ‌ها و بهینه‌سازی)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
@@ -4571,7 +4626,7 @@ def handle_message(message):
                             log_user_activity(user_db_id, "resolve_problem", f"بستن مشکل {problem_id}")
                         else:
                             send_message(chat_id, "❌ خطا در بستن مشکل.", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /resolve_problem [problem_id]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /resolve_problem [problem_id]", get_super_admin_keyboard())
@@ -4602,7 +4657,7 @@ def handle_message(message):
                     full_name = parts[1].strip()
                     try:
                         branch_id = int(parts[2].strip())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ شناسه شعبه باید عدد باشد.", get_super_admin_keyboard())
                         return
                     title = parts[3].strip()
@@ -4655,7 +4710,7 @@ def handle_message(message):
                         elif field == 'branch_id':
                             try:
                                 branch_id = int(value)
-                            except:
+                            except Exception:
                                 send_message(chat_id, "❌ شناسه شعبه باید عدد باشد.", get_super_admin_keyboard())
                                 return
                             branches = get_all_branches()
@@ -4686,7 +4741,7 @@ def handle_message(message):
                             log_user_activity(user_db_id, "delete_deputy", f"حذف معاون با شناسه {user_id}")
                         else:
                             send_message(chat_id, f"❌ {msg}", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /delete_deputy [user_id]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /delete_deputy [user_id]", get_super_admin_keyboard())
@@ -4811,7 +4866,7 @@ def handle_message(message):
                                 send_message(chat_id, "❌ خطا در تغییر نقش.", get_super_admin_keyboard())
                         else:
                             send_message(chat_id, "❌ نقش نامعتبر. فقط admin, deputy یا super_admin مجاز است.", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /edit_role [user_id] [role]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /edit_role [user_id] [role]", get_super_admin_keyboard())
@@ -4827,7 +4882,7 @@ def handle_message(message):
                             send_message(chat_id, f"✅ شعبه کاربر {user_id} به {branch_id} تغییر یافت.", get_super_admin_keyboard())
                         else:
                             send_message(chat_id, "❌ خطا در تغییر شعبه.", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /edit_branch [user_id] [branch_id]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /edit_branch [user_id] [branch_id]", get_super_admin_keyboard())
@@ -4843,7 +4898,7 @@ def handle_message(message):
                             send_message(chat_id, f"✅ {msg}", get_super_admin_keyboard())
                         else:
                             send_message(chat_id, f"❌ {msg}", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /delete_user [user_id]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /delete_user [user_id]", get_super_admin_keyboard())
@@ -4858,7 +4913,7 @@ def handle_message(message):
                             send_message(chat_id, f"✅ گزارش {col_id} حذف شد.", get_super_admin_keyboard())
                         else:
                             send_message(chat_id, "❌ خطا در حذف گزارش.", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /delete_collection [id]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /delete_collection [id]", get_super_admin_keyboard())
@@ -4875,7 +4930,7 @@ def handle_message(message):
                             send_message(chat_id, f"✅ گزارش {col_id} به‌روزرسانی شد.", get_super_admin_keyboard())
                         else:
                             send_message(chat_id, "❌ خطا در ویرایش گزارش.", get_super_admin_keyboard())
-                    except:
+                    except Exception:
                         send_message(chat_id, "❌ فرمت: /edit_collection [id] [deputy_amount_millions] [others_amount_millions]", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ فرمت: /edit_collection [id] [deputy_amount_millions] [others_amount_millions]", get_super_admin_keyboard())
@@ -5263,11 +5318,7 @@ def handle_message(message):
                     send_message(chat_id, "📅 امروز تعطیل است، داده‌های کافی برای پیش‌بینی وجود ندارد.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
                     return
                 send_message(chat_id, "⏳ در حال تحلیل داده‌ها و پیش‌بینی عملکرد هر شعبه... لطفاً چند لحظه صبر کنید.")
-                threading.Thread(
-                    target=generate_and_send_forecast,
-                    args=(chat_id, role, is_super_admin),
-                    daemon=True
-                ).start()
+                executor.submit(generate_and_send_forecast, chat_id, role, is_super_admin)
                 return
 
             if text == "📊 نمودار استان":
@@ -5275,11 +5326,7 @@ def handle_message(message):
                     send_message(chat_id, "🔴 گزارش‌های نموداری در حال حاضر غیرفعال است.", get_admin_keyboard() if role == 'admin' else get_super_admin_keyboard())
                     return
                 send_message(chat_id, "⏳ در حال تولید نمودار استان... لطفاً چند لحظه صبر کنید.")
-                threading.Thread(
-                    target=generate_and_send_province_chart,
-                    args=(chat_id, role, is_super_admin),
-                    daemon=True
-                ).start()
+                executor.submit(generate_and_send_province_chart, chat_id, role, is_super_admin)
                 return
 
             if text == "📊 نمودار شعبه":
@@ -5362,25 +5409,21 @@ def handle_message(message):
                         msg += f"   👥 همکاران: {oth//1_000_000:,.0f} میلیون ریال\n"
                         msg += f"   💰 جمع: {tot//1_000_000:,.0f} میلیون ریال\n"
                         
-                        # نمایش هدف اگر وجود داشته باشد
                         if target_amount is not None and target_date is not None:
-                            # محاسبه پیشرفت با استفاده از collected_since_target که در کوئری محاسبه شده
                             progress_percent = (collected_since_target / target_amount * 100) if target_amount > 0 else 0
-                            # محاسبه روزهای باقیمانده
                             try:
                                 target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
                                 today_obj = jdatetime.date(*map(int, shamsi_today.split('/')))
                                 days_left = (target_date_obj - today_obj).days
-                                if days_left < 0:
-                                    days_left = 0
-                            except:
+                            except Exception:
                                 days_left = 0
                             remaining = target_amount - collected_since_target
                             if remaining < 0:
                                 remaining = 0
+                            days_text = f"{days_left} روز" if days_left >= 0 else f"{abs(days_left)} روز گذشته"
                             msg += f"   🎯 هدف تا {get_shamsi_date_formatted(target_date)}: وصول {target_amount//1_000_000:,.0f} میلیون ریال\n"
                             msg += f"   📊 پیشرفت: {progress_percent:.1f}% ({collected_since_target//1_000_000:,.0f} از {target_amount//1_000_000:,.0f} میلیون ریال)\n"
-                            msg += f"   📅 روز باقیمانده تا پایان فرصت: {days_left} روز\n"
+                            msg += f"   📅 زمان باقیمانده تا پایان فرصت: {days_text}\n"
                             msg += f"   📉 فاصله از هدف: {remaining//1_000_000:,.0f} میلیون ریال\n"
                         else:
                             msg += f"   🎯 هدفی برای این شعبه تعریف نشده است\n"
@@ -5573,11 +5616,7 @@ def handle_message(message):
                         if result:
                             branch_id = result[0]
                             send_message(chat_id, "⏳ در حال تولید نمودار... لطفاً چند لحظه صبر کنید.")
-                            threading.Thread(
-                                target=generate_and_send_branch_chart,
-                                args=(chat_id, branch_id, text, role, is_super_admin),
-                                daemon=True
-                            ).start()
+                            executor.submit(generate_and_send_branch_chart, chat_id, branch_id, text, role, is_super_admin)
                             with user_states_lock:
                                 user_states[chat_id]["state"] = "LOGGED_IN"
                             return
@@ -5609,11 +5648,7 @@ def handle_message(message):
                 chart_key = chart_type_map.get(text)
                 if chart_key:
                     send_message(chat_id, "⏳ در حال تولید نمودار تحلیلی... لطفاً چند لحظه صبر کنید.")
-                    threading.Thread(
-                        target=generate_and_send_analytical_chart,
-                        args=(chat_id, chart_key, role, is_super_admin),
-                        daemon=True
-                    ).start()
+                    executor.submit(generate_and_send_analytical_chart, chat_id, chart_key, role, is_super_admin)
                 else:
                     send_message(chat_id, "❌ گزینه نامعتبر.", get_cancel_keyboard())
                 with user_states_lock:
@@ -5673,14 +5708,12 @@ def handle_message(message):
                         diff_abs = item['diff_abs']
                         is_claimed_more = item['is_claimed_more']
 
-                        # محاسبه دقت با فرمول یکسان برای همه حالت‌ها
                         if actual < 0:
                             if claimed == 0 or abs_actual == 0:
                                 accuracy = 0.0
                             else:
                                 accuracy = (1 - (diff_abs / max(claimed, abs_actual))) * 100
                         else:
-                            # برای actual > 0 نیز دقت محاسبه می‌شود
                             if claimed == 0 or actual == 0:
                                 accuracy = 0.0
                             else:
@@ -5724,7 +5757,7 @@ def handle_message(message):
                         msg += f"📉 شعب با کاهش واقعی مطالبات: ۰ شعبه\n"
 
                     if positive_actual_branches:
-                        msg += f"📈 شعب با افزایش واقعی مطالبات (ادعای وصول در حالی که بدهی مشتریان بیشتر شده): {len(positive_actual_branches)} شعبه\n"
+                        msg += f"📈 شعب با افزایش واقعی مطالبات: {len(positive_actual_branches)} شعبه\n"
                     else:
                         msg += f"📈 شعب با افزایش واقعی مطالبات: ۰ شعبه\n"
 
@@ -5853,7 +5886,7 @@ def handle_message(message):
                     else:
                         send_message(chat_id, "❌ شماره نامعتبر.", get_cancel_keyboard())
                         return
-                except:
+                except Exception:
                     send_message(chat_id, "❌ لطفاً یک عدد معتبر وارد کنید.", get_cancel_keyboard())
                     return
                 with user_states_lock:
@@ -6061,7 +6094,7 @@ def handle_message(message):
         logger.error(f"❌ handle_message error: {e}", exc_info=True)
         try:
             send_message(message['chat']['id'], "❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
-        except:
+        except Exception:
             pass
 
 # ============================================================
@@ -6109,15 +6142,18 @@ def start_scheduler():
     logger.info("✅ Scheduler started")
 
 # ============================================================
-# Main Polling Loop
+# Main Polling Loop با ذخیره offset
 # ============================================================
 def main():
     global requests_session, processed_set
-    offset = 0
-    logger.info("🤖 Bot started successfully!")
+    offset = load_offset()
+    logger.info(f"🤖 Bot started successfully with offset: {offset}")
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"🌐 Flask server started on port {PORT}")
     start_scheduler()
+    
+    atexit.register(lambda: save_offset(offset))
+    
     while True:
         try:
             url = f"{BASE_URL}/getUpdates"
@@ -6138,10 +6174,10 @@ def main():
                         if "message" in update:
                             handle_message(update["message"])
                         offset = update_id + 1
+                        save_offset(offset)
                 else:
                     if data.get("error_code") == 409:
                         logger.warning("⚠️ Conflict (409) – another instance is running. Resetting offset...")
-                        # دریافت آخرین آپدیت و تنظیم offset
                         try:
                             res2 = requests_session.get(f"{BASE_URL}/getUpdates", timeout=10)
                             if res2.status_code == 200:
@@ -6150,11 +6186,12 @@ def main():
                                     last_update = data2["result"][-1]
                                     offset = last_update["update_id"] + 1
                                     logger.info(f"✅ Offset reset to {offset}")
+                                    save_offset(offset)
                                 else:
                                     offset = 0
                             else:
                                 offset = 0
-                        except:
+                        except Exception:
                             offset = 0
                         time.sleep(3)
                     else:
