@@ -9,7 +9,7 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify
 import jdatetime
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,37 +22,31 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import numpy as np
-from PIL import Image
 import arabic_reshaper
 from bidi.algorithm import get_display
 import os.path
 import traceback
 from collections import deque
-from functools import lru_cache
 import time as time_module
 import pickle
 import atexit
 
 # ============================================================
-# تنظیمات لاگین با چرخش فایل
+# تنظیمات لاگین
 # ============================================================
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
 if logger.hasHandlers():
     logger.handlers.clear()
-
 file_handler = RotatingFileHandler(
     "bot.log", maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
 )
 file_handler.setLevel(logging.INFO)
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
-
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
-
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
@@ -63,36 +57,30 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD")
-
 if not BOT_TOKEN or not DB_URL:
     logger.error("❌ BOT_TOKEN and DATABASE_URL are required!")
     exit(1)
-
 if not SUPER_ADMIN_PASSWORD:
     logger.error("❌ SUPER_ADMIN_PASSWORD environment variable is required!")
     exit(1)
-
 BASE_URL = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
 logger.info(f"✅ Bale API URL: {BASE_URL}")
 
 # ============================================================
-# اپلیکیشن Flask برای Health Check
+# Flask
 # ============================================================
 flask_app = Flask(__name__)
-
 @flask_app.route('/health')
 def health():
     return jsonify({"status": "healthy", "timestamp": time.time()})
-
 @flask_app.route('/')
 def root():
     return jsonify({"message": "Bot is running", "status": "active"})
-
 def run_flask():
     flask_app.run(host='0.0.0.0', port=PORT)
 
 # ============================================================
-# Session با Keep-Alive و Retry روی GET
+# Session
 # ============================================================
 def create_session():
     session = requests.Session()
@@ -106,11 +94,10 @@ def create_session():
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
-
 requests_session = create_session()
 
 # ============================================================
-# Connection Pool دیتابیس با تشخیص سلامت
+# Connection Pool با مدیریت ایمن
 # ============================================================
 class SafeConnectionPool:
     def __init__(self, minconn=5, maxconn=30, dsn=None):
@@ -120,7 +107,6 @@ class SafeConnectionPool:
         self._pool = None
         self._lock = threading.RLock()
         self._create_pool()
-
     def _create_pool(self):
         try:
             self._pool = psycopg2.pool.ThreadedConnectionPool(
@@ -130,7 +116,6 @@ class SafeConnectionPool:
         except Exception as e:
             logger.error(f"❌ Failed to create pool: {e}")
             self._pool = None
-
     def getconn(self):
         with self._lock:
             if self._pool is None:
@@ -142,7 +127,6 @@ class SafeConnectionPool:
                     logger.error(f"Pool getconn error: {e}, falling back to direct connect")
                     return psycopg2.connect(self.dsn)
             return psycopg2.connect(self.dsn)
-
     def putconn(self, conn):
         if conn is None:
             return
@@ -161,7 +145,16 @@ class SafeConnectionPool:
 db_pool = SafeConnectionPool(5, 30, DB_URL)
 
 # ============================================================
-# کش‌های Thread-Safe با قفل
+# توابع اتصال به دیتابیس
+# ============================================================
+def get_db_connection():
+    return db_pool.getconn()
+
+def return_db_connection(conn):
+    db_pool.putconn(conn)
+
+# ============================================================
+# کش‌های Thread-Safe
 # ============================================================
 class TTLCache:
     def __init__(self, ttl_seconds=10):
@@ -169,21 +162,15 @@ class TTLCache:
         self._timestamps = {}
         self._ttl = ttl_seconds
         self._lock = threading.RLock()
-
     def get(self, key):
         with self._lock:
-            if key in self._cache:
-                if time_module.time() - self._timestamps[key] < self._ttl:
-                    return self._cache[key]
-                else:
-                    self._invalidate(key)
+            if key in self._cache and time_module.time() - self._timestamps[key] < self._ttl:
+                return self._cache[key]
             return None
-
     def set(self, key, value):
         with self._lock:
             self._cache[key] = value
             self._timestamps[key] = time_module.time()
-
     def invalidate(self, key=None):
         with self._lock:
             if key is None:
@@ -192,12 +179,6 @@ class TTLCache:
             elif key in self._cache:
                 del self._cache[key]
                 del self._timestamps[key]
-
-    def _invalidate(self, key):
-        if key in self._cache:
-            del self._cache[key]
-            del self._timestamps[key]
-
     def invalidate_all(self):
         self.invalidate(None)
 
@@ -213,34 +194,15 @@ cache_targets = TTLCache(ttl_seconds=60)
 cache_admins = TTLCache(ttl_seconds=300)
 
 # ============================================================
-# State Management با قفل
+# State Management و متغیرهای سراسری
 # ============================================================
 user_states_lock = threading.RLock()
 user_states = {}
+processed_updates = deque(maxlen=2000)
+processed_set = set()
 
 # ============================================================
-# مدیریت offset با ذخیره در فایل
-# ============================================================
-OFFSET_FILE = "offset.dat"
-
-def save_offset(offset):
-    try:
-        with open(OFFSET_FILE, 'wb') as f:
-            pickle.dump(offset, f)
-    except Exception as e:
-        logger.error(f"Failed to save offset: {e}")
-
-def load_offset():
-    try:
-        if os.path.exists(OFFSET_FILE):
-            with open(OFFSET_FILE, 'rb') as f:
-                return pickle.load(f)
-    except Exception as e:
-        logger.error(f"Failed to load offset: {e}")
-    return 0
-
-# ============================================================
-# محدودکننده تردها
+# Thread Pool
 # ============================================================
 executor = ThreadPoolExecutor(max_workers=5)
 
@@ -264,7 +226,6 @@ def parse_number(text):
         if not text or text.strip() == '':
             return None
         text = str(text).strip()
-        # پشتیبانی از هر دو حالت -۵۰۰ و ۵۰۰-
         if text.endswith('-'):
             text = '-' + text[:-1]
         text = normalize_digits(text)
@@ -280,7 +241,6 @@ def parse_number(text):
 def escape_markdown(text):
     if not text:
         return ""
-    # فقط کاراکترهای ضروری برای مارک‌داون عادی
     escape_chars = ['_', '*', '[', ']', '(', ')', '~', '`']
     for char in escape_chars:
         text = text.replace(char, '\\' + char)
@@ -305,10 +265,9 @@ def split_text_safely(text, max_len=4000):
     return chunks
 
 # ============================================================
-# تنظیم فونت فارسی (یک‌بار در startup)
+# تنظیم فونت
 # ============================================================
 _font_initialized = False
-
 def setup_persian_font_once():
     global _font_initialized
     if _font_initialized:
@@ -316,20 +275,11 @@ def setup_persian_font_once():
     try:
         font_paths = [
             '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Regular.ttf',
-            '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Medium.ttf',
-            '/usr/share/fonts/opentype/vazirmatn/Vazirmatn-Regular.otf',
             '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
             '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-            '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',
-            '/usr/share/fonts/truetype/ubuntu/Ubuntu-Regular.ttf',
-            '/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf',
-            '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
-            '/usr/share/fonts/truetype/arphic/uming.ttc',
-            '/usr/share/fonts/truetype/ipafont/ipag.ttf',
         ]
         plt.rcParams['font.family'] = 'sans-serif'
         plt.rcParams['axes.unicode_minus'] = False
-
         for path in font_paths:
             if os.path.exists(path):
                 fm.fontManager.addfont(path)
@@ -338,7 +288,6 @@ def setup_persian_font_once():
                 logger.info(f"✅ Font loaded: {path}")
                 _font_initialized = True
                 return
-
         plt.rcParams['font.family'] = ['DejaVu Sans', 'Liberation Sans', 'sans-serif']
         logger.warning("⚠️ No Persian font found, using fallback fonts")
         _font_initialized = True
@@ -409,11 +358,9 @@ def is_last_day_of_shamsi_month(shamsi_date_str):
         try:
             next_day = jdatetime.date(year, month, day) + timedelta(days=1)
             return next_day.month != month
-        except Exception as e:
-            logger.error(f"is_last_day_of_shamsi_month: error calculating next day: {e}")
+        except Exception:
             return False
-    except Exception as e:
-        logger.error(f"is_last_day_of_shamsi_month: invalid date format: {shamsi_date_str}, error: {e}")
+    except Exception:
         return False
 
 def get_shamsi_month_range():
@@ -429,6 +376,155 @@ def get_shamsi_month_range():
         f"{first_day.year}/{first_day.month:02d}/{first_day.day:02d}",
         f"{last_day.year}/{last_day.month:02d}/{last_day.day:02d}"
     )
+
+# ============================================================
+# ایجاد جداول
+# ============================================================
+def create_all_tables_if_not_exists():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS branches (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL UNIQUE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    employee_number VARCHAR(20) NOT NULL UNIQUE,
+                    telegram_id BIGINT UNIQUE,
+                    full_name VARCHAR(255) NOT NULL,
+                    role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'deputy', 'super_admin')),
+                    title VARCHAR(255) NOT NULL,
+                    branch_id INTEGER REFERENCES branches(id) ON DELETE SET NULL,
+                    is_super_admin BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS collections (
+                    id SERIAL PRIMARY KEY,
+                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                    deputy_amount BIGINT NOT NULL DEFAULT 0,
+                    others_amount BIGINT NOT NULL DEFAULT 0,
+                    total_amount BIGINT GENERATED ALWAYS AS (deputy_amount + others_amount) STORED,
+                    shamsi_date VARCHAR(10) NOT NULL,
+                    recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT unique_branch_date UNIQUE (branch_id, shamsi_date)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS notes (
+                    id SERIAL PRIMARY KEY,
+                    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    note_text TEXT NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_activity_log (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    action VARCHAR(50) NOT NULL,
+                    details TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS holidays (
+                    id SERIAL PRIMARY KEY,
+                    shamsi_date VARCHAR(10) NOT NULL UNIQUE,
+                    description VARCHAR(255),
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS problems (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    problem_text TEXT NOT NULL,
+                    category VARCHAR(50) DEFAULT 'general',
+                    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'resolved', 'rejected')),
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS scores (
+                    id SERIAL PRIMARY KEY,
+                    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                    score INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT unique_collection_score UNIQUE (collection_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS feature_settings (
+                    key VARCHAR(50) PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS actual_stats (
+                    id SERIAL PRIMARY KEY,
+                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                    shamsi_date VARCHAR(10) NOT NULL,
+                    total_actual BIGINT NOT NULL DEFAULT 0,
+                    recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT unique_branch_actual_date UNIQUE (branch_id, shamsi_date)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS branch_targets (
+                    id SERIAL PRIMARY KEY,
+                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+                    target_amount BIGINT NOT NULL,
+                    target_date VARCHAR(10) NOT NULL,
+                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_target
+                ON branch_targets(branch_id)
+                WHERE is_active = TRUE
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_branch_date ON collections(branch_id, shamsi_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_shamsi ON collections(shamsi_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_employee ON users(employee_number);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_branch_targets_branch ON branch_targets(branch_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_branch_targets_active ON branch_targets(is_active);")
+            conn.commit()
+            logger.info("✅ All tables created/verified successfully.")
+    except Exception as e:
+        logger.error(f"❌ Error creating tables: {e}")
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+create_all_tables_if_not_exists()
 
 # ============================================================
 # توابع مدیریت تنظیمات
@@ -526,7 +622,6 @@ def set_feature_setting(key, value):
         if conn:
             return_db_connection(conn)
 
-# توابع وضعیت‌های خودکار
 def get_auto_reminder_status():
     return get_feature_setting('auto_reminder', 'active') == 'active'
 def set_auto_reminder_status(status):
@@ -866,165 +961,7 @@ def update_problem_status(problem_id, new_status):
             return_db_connection(conn)
 
 # ============================================================
-# توابع ایجاد جداول (بدون نظرسنجی)
-# ============================================================
-def create_all_tables_if_not_exists():
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS branches (
-                    id SERIAL PRIMARY KEY,
-                    name VARCHAR(255) NOT NULL UNIQUE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    employee_number VARCHAR(20) NOT NULL UNIQUE,
-                    telegram_id BIGINT UNIQUE,
-                    full_name VARCHAR(255) NOT NULL,
-                    role VARCHAR(20) NOT NULL CHECK (role IN ('admin', 'deputy', 'super_admin')),
-                    title VARCHAR(255) NOT NULL,
-                    branch_id INTEGER REFERENCES branches(id) ON DELETE SET NULL,
-                    is_super_admin BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS collections (
-                    id SERIAL PRIMARY KEY,
-                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
-                    deputy_amount BIGINT NOT NULL DEFAULT 0,
-                    others_amount BIGINT NOT NULL DEFAULT 0,
-                    total_amount BIGINT GENERATED ALWAYS AS (deputy_amount + others_amount) STORED,
-                    shamsi_date VARCHAR(10) NOT NULL,
-                    recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT unique_branch_date UNIQUE (branch_id, shamsi_date)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS notes (
-                    id SERIAL PRIMARY KEY,
-                    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    note_text TEXT NOT NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_activity_log (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    action VARCHAR(50) NOT NULL,
-                    details TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key VARCHAR(50) PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS holidays (
-                    id SERIAL PRIMARY KEY,
-                    shamsi_date VARCHAR(10) NOT NULL UNIQUE,
-                    description VARCHAR(255),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS problems (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    problem_text TEXT NOT NULL,
-                    category VARCHAR(50) DEFAULT 'general',
-                    status VARCHAR(20) DEFAULT 'pending' CHECK (status IN ('pending', 'resolved', 'rejected')),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS scores (
-                    id SERIAL PRIMARY KEY,
-                    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
-                    score INTEGER NOT NULL DEFAULT 0,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT unique_collection_score UNIQUE (collection_id)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS feature_settings (
-                    key VARCHAR(50) PRIMARY KEY,
-                    value TEXT,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS actual_stats (
-                    id SERIAL PRIMARY KEY,
-                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
-                    shamsi_date VARCHAR(10) NOT NULL,
-                    total_actual BIGINT NOT NULL DEFAULT 0,
-                    recorded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT unique_branch_actual_date UNIQUE (branch_id, shamsi_date)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS branch_targets (
-                    id SERIAL PRIMARY KEY,
-                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
-                    target_amount BIGINT NOT NULL,
-                    target_date VARCHAR(10) NOT NULL,
-                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE
-                )
-            """)
-            cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_target
-                ON branch_targets(branch_id)
-                WHERE is_active = TRUE
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_branch_date ON collections(branch_id, shamsi_date);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_shamsi ON collections(shamsi_date);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_users_employee ON users(employee_number);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_branch_targets_branch ON branch_targets(branch_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_branch_targets_active ON branch_targets(is_active);")
-            conn.commit()
-            logger.info("✅ All tables created/verified successfully.")
-    except Exception as e:
-        logger.error(f"❌ Error creating tables: {e}")
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-create_all_tables_if_not_exists()
-
-# ============================================================
-# توابع دیتابیس پایه با مدیریت صحیح connection pool
-# ============================================================
-def get_db_connection():
-    return db_pool.getconn()
-
-def return_db_connection(conn):
-    db_pool.putconn(conn)
-
-# ============================================================
-# توابع کش‌شده برای داده‌های دیتابیس
+# توابع دیتابیس پایه
 # ============================================================
 def get_all_branches():
     cached = cache_branches.get('branches')
@@ -1048,490 +985,6 @@ def get_all_branches():
 def invalidate_branches_cache():
     cache_branches.invalidate('branches')
 
-# ============================================================
-# توابع آمار واقعی
-# ============================================================
-def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        total_actual_rial = total_actual * 1_000_000
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO actual_stats (branch_id, shamsi_date, total_actual, recorded_by, created_at)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (branch_id, shamsi_date) DO UPDATE SET
-                    total_actual = EXCLUDED.total_actual,
-                    recorded_by = EXCLUDED.recorded_by,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (branch_id, shamsi_date, total_actual_rial, user_id, get_iran_time()))
-            conn.commit()
-            return True, "ثبت شد"
-    except Exception as e:
-        logger.error(f"save_actual_stats error: {e}")
-        if conn:
-            conn.rollback()
-        return False, f"خطا: {e}"
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_actual_stats(branch_id, shamsi_date):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT total_actual
-                FROM actual_stats
-                WHERE branch_id = %s AND shamsi_date = %s
-            """, (branch_id, shamsi_date))
-            result = cur.fetchone()
-            if result:
-                return result[0]
-            return None
-    except Exception as e:
-        logger.error(f"get_actual_stats error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_actual_stats_for_date(shamsi_date):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT b.id, b.name, a.total_actual
-                FROM actual_stats a
-                JOIN branches b ON a.branch_id = b.id
-                WHERE a.shamsi_date = %s
-                ORDER BY b.name
-            """, (shamsi_date,))
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_actual_stats_for_date error: {e}")
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def compare_collection_with_actual(branch_id, shamsi_date):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT total_amount
-                FROM collections
-                WHERE branch_id = %s AND shamsi_date = %s
-            """, (branch_id, shamsi_date))
-            collection = cur.fetchone()
-            cur.execute("""
-                SELECT total_actual
-                FROM actual_stats
-                WHERE branch_id = %s AND shamsi_date = %s
-            """, (branch_id, shamsi_date))
-            actual = cur.fetchone()
-            if not actual:
-                return None
-            claimed = collection[0] if collection else 0
-            actual_raw = actual[0]
-
-            # برای حالتی که actual > 0 باشد هم اطلاعات را برگردان
-            return {
-                'claimed': claimed,
-                'actual': actual_raw,
-                'abs_actual': abs(actual_raw),
-                'diff_abs': abs(abs(claimed) - abs(actual_raw)),
-                'is_claimed_more': abs(claimed) > abs(actual_raw) if actual_raw != 0 else None
-            }
-    except Exception as e:
-        logger.error(f"compare_collection_with_actual error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# ============================================================
-# توابع گزارش‌های تطبیقی و پیش‌بینی
-# ============================================================
-def get_adaptive_comparison():
-    cached = cache_adaptive.get('adaptive')
-    if cached is not None:
-        return cached
-    shamsi_today = get_shamsi_date()
-    shamsi_yesterday = get_shamsi_date(-1)
-    shamsi_week_ago = get_shamsi_date(-7)
-    shamsi_month_ago = get_shamsi_date(-30)
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_today,))
-            today_total = cur.fetchone()[0] or 0
-            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_yesterday,))
-            yesterday_total = cur.fetchone()[0] or 0
-            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_week_ago,))
-            week_ago_total = cur.fetchone()[0] or 0
-            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_month_ago,))
-            month_ago_total = cur.fetchone()[0] or 0
-            def calc_change(current, previous):
-                if previous == 0:
-                    return 0 if current == 0 else 100
-                return ((current - previous) / previous) * 100
-            result = {
-                'today': today_total,
-                'yesterday': yesterday_total,
-                'week_ago': week_ago_total,
-                'month_ago': month_ago_total,
-                'change_yesterday': calc_change(today_total, yesterday_total),
-                'change_week': calc_change(today_total, week_ago_total),
-                'change_month': calc_change(today_total, month_ago_total)
-            }
-            cache_adaptive.set('adaptive', result)
-            return result
-    except Exception as e:
-        logger.error(f"get_adaptive_comparison error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_forecast(branch_id=None, days=7):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            if branch_id:
-                cur.execute("""
-                    SELECT shamsi_date, total_amount
-                    FROM collections
-                    WHERE branch_id = %s
-                    ORDER BY shamsi_date DESC
-                    LIMIT 45
-                """, (branch_id,))
-            else:
-                cur.execute("""
-                    SELECT shamsi_date, SUM(total_amount) as total
-                    FROM collections
-                    GROUP BY shamsi_date
-                    ORDER BY shamsi_date DESC
-                    LIMIT 45
-                """)
-            data = cur.fetchall()
-            if len(data) < 3:
-                return None, {'error': 'حداقل ۳ روز داده نیاز است', 'available_days': len(data)}
-            dates = []
-            amounts = []
-            for row in reversed(data):
-                shamsi_str = row[0]
-                parts = shamsi_str.split('/')
-                if len(parts) == 3:
-                    try:
-                        year, month, day = map(int, parts)
-                        greg = jdatetime.date(year, month, day).togregorian()
-                        dates.append(greg.toordinal())
-                        amounts.append(float(row[1] or 0))
-                    except Exception:
-                        continue
-            if len(dates) < 3:
-                return None, {'error': f'تعداد داده‌های معتبر: {len(dates)} (حداقل ۳ روز نیاز است)'}
-            x = np.array(dates)
-            y = np.array(amounts)
-            n = len(x)
-            weights = np.exp(np.linspace(0, 1, n))
-            weights = weights / weights.sum() * n
-            x_mean = np.average(x, weights=weights)
-            y_mean = np.average(y, weights=weights)
-            cov = np.average((x - x_mean) * (y - y_mean), weights=weights)
-            var = np.average((x - x_mean) ** 2, weights=weights)
-            if var == 0:
-                return None, {'error': 'داده‌ها تغییرات کافی ندارند'}
-            slope = cov / var
-            intercept = y_mean - slope * x_mean
-            y_pred_all = slope * x + intercept
-            mse = np.mean((y - y_pred_all) ** 2)
-            rmse = np.sqrt(mse)
-            ss_tot = np.sum((y - y_mean) ** 2)
-            ss_res = np.sum((y - y_pred_all) ** 2)
-            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
-            last_date = dates[-1]
-            forecast = []
-            for i in range(1, days + 1):
-                future_date = last_date + i
-                predicted = slope * future_date + intercept
-                lower = predicted - 1.96 * rmse
-                upper = predicted + 1.96 * rmse
-                future_greg = datetime.fromordinal(future_date)
-                future_shamsi = jdatetime.datetime.fromgregorian(datetime=future_greg)
-                shamsi_str = f"{future_shamsi.year}/{future_shamsi.month:02d}/{future_shamsi.day:02d}"
-                forecast.append({
-                    'date': shamsi_str,
-                    'predicted': max(0, predicted),
-                    'lower': max(0, lower),
-                    'upper': max(0, upper)
-                })
-            trend_analysis = {
-                'slope': slope,
-                'r2': r2,
-                'rmse': rmse,
-                'trend': 'صعودی' if slope > 0 else 'نزولی' if slope < 0 else 'ثابت',
-                'strength': 'قوی' if r2 > 0.7 else 'متوسط' if r2 > 0.4 else 'ضعیف',
-                'avg_amount': np.mean(y),
-                'last_amount': y[-1] if len(y) > 0 else 0,
-                'data_count': len(dates)
-            }
-            return forecast, trend_analysis
-    except Exception as e:
-        logger.error(f"get_forecast error: {e}")
-        return None, {'error': str(e)}
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_forecast_for_all_branches(days=7):
-    cached = cache_forecast_all.get('forecast_all')
-    if cached is not None:
-        return cached
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM branches ORDER BY name")
-            branches = cur.fetchall()
-            results = {}
-            for branch_id, branch_name in branches:
-                forecast, trend = get_forecast(branch_id, days)
-                if forecast and trend:
-                    results[branch_name] = {
-                        'forecast': forecast,
-                        'trend': trend
-                    }
-            cache_forecast_all.set('forecast_all', results)
-            return results
-    except Exception as e:
-        logger.error(f"get_forecast_for_all_branches error: {e}")
-        return {}
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# ============================================================
-# توابع نمودار (با مدیریت صحیح plt.close)
-# ============================================================
-def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
-    try:
-        plt.figure(figsize=figsize)
-        try:
-            title_fa = reshape_persian(title)
-            x_label_fa = reshape_persian(x_label)
-            y_label_fa = reshape_persian(y_label)
-
-            labels = [reshape_persian(str(lbl)) for lbl in data['labels']]
-            values = [float(v) if v is not None else 0 for v in data['values']]
-
-            plt.xticks(rotation=45, ha='right', fontsize=10)
-
-            if chart_type == 'bar':
-                plt.bar(labels, values, color='skyblue', edgecolor='navy')
-                max_val = max(values) if values else 1
-                for i, v in enumerate(values):
-                    if v > 0:
-                        plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
-                                ha='center', va='bottom', fontsize=8)
-            elif chart_type == 'line':
-                plt.plot(labels, values, marker='o', linestyle='-', color='blue', linewidth=2, markersize=8)
-                max_val = max(values) if values else 1
-                for i, v in enumerate(values):
-                    if v > 0:
-                        plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
-                                ha='center', va='bottom', fontsize=8)
-            elif chart_type == 'pie':
-                non_zero = [(l, v) for l, v in zip(labels, values) if v > 0]
-                if non_zero:
-                    labels, values = zip(*non_zero)
-                    plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
-                else:
-                    plt.pie([1], labels=['داده‌ای وجود ندارد'], colors=['lightgray'])
-            elif chart_type == 'horizontal':
-                plt.barh(labels, values, color='skyblue', edgecolor='navy')
-                max_val = max(values) if values else 1
-                for i, v in enumerate(values):
-                    if v > 0:
-                        plt.text(v + 0.02*max_val, i, f"{int(v)//1_000_000:,.0f}",
-                                va='center', fontsize=8)
-            elif chart_type == 'stacked':
-                if 'values2' in data:
-                    values2 = [float(v) if v is not None else 0 for v in data['values2']]
-                    plt.bar(labels, values, label='معاون', color='blue', alpha=0.7)
-                    plt.bar(labels, values2, label='همکاران', color='orange', alpha=0.7, bottom=values)
-                    plt.legend()
-                else:
-                    plt.bar(labels, values, color='skyblue')
-
-            plt.title(title_fa, fontsize=14, fontweight='bold')
-            plt.xlabel(x_label_fa)
-            plt.ylabel(y_label_fa)
-
-            plt.tight_layout()
-            img_bytes = io.BytesIO()
-            plt.savefig(img_bytes, format='png', dpi=120, bbox_inches='tight')
-            img_bytes.seek(0)
-            return img_bytes.getvalue()
-        finally:
-            plt.close()
-    except Exception as e:
-        logger.error(f"generate_chart error: {e}\n{traceback.format_exc()}")
-        plt.close()
-        return None
-
-def generate_branch_chart(branch_id, days=10):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT shamsi_date, total_amount
-                FROM collections
-                WHERE branch_id = %s
-                ORDER BY shamsi_date DESC
-                LIMIT %s
-            """, (branch_id, days))
-            data = cur.fetchall()
-            if not data:
-                return None
-            labels = [get_shamsi_date_formatted(row[0]) for row in reversed(data)]
-            values = [row[1] for row in reversed(data)]
-            return {
-                'labels': labels,
-                'values': values
-            }
-    except Exception as e:
-        logger.error(f"generate_branch_chart error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def generate_province_chart(days=10):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT shamsi_date, SUM(total_amount) as total
-                FROM collections
-                GROUP BY shamsi_date
-                ORDER BY shamsi_date DESC
-                LIMIT %s
-            """, (days,))
-            data = cur.fetchall()
-            if not data:
-                return None
-            labels = [get_shamsi_date_formatted(row[0]) for row in reversed(data)]
-            values = [row[1] for row in reversed(data)]
-            return {
-                'labels': labels,
-                'values': values
-            }
-    except Exception as e:
-        logger.error(f"generate_province_chart error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_analytical_chart_data(chart_type, days=10):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            if chart_type == 'branch_comparison':
-                cur.execute("""
-                    SELECT b.name, SUM(c.total_amount) as total
-                    FROM collections c
-                    JOIN branches b ON c.branch_id = b.id
-                    WHERE c.shamsi_date >= %s
-                    GROUP BY b.name
-                    ORDER BY total DESC
-                    LIMIT 10
-                """, (get_shamsi_date(-days),))
-                data = cur.fetchall()
-                return {
-                    'labels': [row[0] for row in data],
-                    'values': [row[1] for row in data]
-                }
-            elif chart_type == 'deputy_others_ratio':
-                cur.execute("""
-                    SELECT
-                        SUM(deputy_amount) as deputy_total,
-                        SUM(others_amount) as others_total
-                    FROM collections
-                    WHERE shamsi_date >= %s
-                """, (get_shamsi_date(-days),))
-                row = cur.fetchone()
-                return {
-                    'labels': ['معاونین', 'همکاران'],
-                    'values': [row[0] or 0, row[1] or 0]
-                }
-            elif chart_type == 'daily_trend':
-                cur.execute("""
-                    SELECT shamsi_date, SUM(total_amount) as total
-                    FROM collections
-                    WHERE shamsi_date >= %s
-                    GROUP BY shamsi_date
-                    ORDER BY shamsi_date DESC
-                    LIMIT %s
-                """, (get_shamsi_date(-days), days))
-                data = cur.fetchall()
-                return {
-                    'labels': [get_shamsi_date_formatted(row[0]) for row in reversed(data)],
-                    'values': [row[1] for row in reversed(data)]
-                }
-            elif chart_type == 'match_analysis':
-                cur.execute("""
-                    SELECT
-                        b.name,
-                        COALESCE(AVG(
-                            CASE
-                                WHEN a.total_actual IS NULL THEN NULL
-                                WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
-                                WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
-                                WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
-                                    (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0)
-                                WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
-                                    (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0)
-                                ELSE NULL
-                            END
-                        ), 0) as accuracy
-                    FROM branches b
-                    LEFT JOIN collections c ON b.id = c.branch_id
-                    LEFT JOIN actual_stats a ON b.id = a.branch_id AND c.shamsi_date = a.shamsi_date
-                    WHERE c.shamsi_date >= %s
-                    AND a.total_actual IS NOT NULL
-                    GROUP BY b.name
-                    HAVING COUNT(a.total_actual) > 0
-                    ORDER BY accuracy DESC
-                """, (get_shamsi_date(-days),))
-                data = cur.fetchall()
-                return {
-                    'labels': [row[0] for row in data],
-                    'values': [row[1] for row in data]
-                }
-            else:
-                return None
-    except Exception as e:
-        logger.error(f"get_analytical_chart_data error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-# ============================================================
-# توابع دیتابیس پایه
-# ============================================================
 def find_user_by_employee_number(emp_num):
     emp_num = normalize_digits(emp_num)
     conn = None
@@ -1693,9 +1146,6 @@ def get_all_notes_with_collection(limit=50):
         if conn:
             return_db_connection(conn)
 
-# ============================================================
-# توابع مدیریت وصولی‌ها
-# ============================================================
 def check_existing_collection(branch_id, shamsi_date):
     shamsi_date = normalize_digits(shamsi_date)
     conn = None
@@ -2795,7 +2245,7 @@ def get_deputy_late_analysis(days=30):
             return_db_connection(conn)
 
 # ============================================================
-# توابع مدیریت اهداف وصولی (اصلاح شده با created_at)
+# توابع مدیریت اهداف
 # ============================================================
 def set_branch_target(branch_id, target_amount, target_date, created_by):
     target_date = normalize_digits(target_date)
@@ -2889,14 +2339,12 @@ def get_target_progress(branch_id, target_date, target_amount, created_at=None):
         start_date = f"{start_date_obj.year}/{start_date_obj.month:02d}/{start_date_obj.day:02d}"
     else:
         start_date = shamsi_today
-
     collected = get_branch_collection_since_date(branch_id, start_date)
     progress_percent = (collected / target_amount * 100) if target_amount > 0 else 0
     try:
         target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
         today_obj = jdatetime.date(*map(int, shamsi_today.split('/')))
         days_left = (target_date_obj - today_obj).days
-        # اگر منفی باشد، مقدار منفی را نگه می‌داریم تا نشان دهیم هدف منقضی شده
     except Exception:
         days_left = 0
     remaining = target_amount - collected
@@ -2978,7 +2426,651 @@ def get_targets_progress_report():
     return report
 
 # ============================================================
-# ارسال پیام و عکس (با کش شدن وضعیت سوپرادمین)
+# توابع آمار واقعی
+# ============================================================
+def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        total_actual_rial = total_actual * 1_000_000
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO actual_stats (branch_id, shamsi_date, total_actual, recorded_by, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (branch_id, shamsi_date) DO UPDATE SET
+                    total_actual = EXCLUDED.total_actual,
+                    recorded_by = EXCLUDED.recorded_by,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (branch_id, shamsi_date, total_actual_rial, user_id, get_iran_time()))
+            conn.commit()
+            return True, "ثبت شد"
+    except Exception as e:
+        logger.error(f"save_actual_stats error: {e}")
+        if conn:
+            conn.rollback()
+        return False, f"خطا: {e}"
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_actual_stats(branch_id, shamsi_date):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT total_actual
+                FROM actual_stats
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            result = cur.fetchone()
+            if result:
+                return result[0]
+            return None
+    except Exception as e:
+        logger.error(f"get_actual_stats error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_actual_stats_for_date(shamsi_date):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT b.id, b.name, a.total_actual
+                FROM actual_stats a
+                JOIN branches b ON a.branch_id = b.id
+                WHERE a.shamsi_date = %s
+                ORDER BY b.name
+            """, (shamsi_date,))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_actual_stats_for_date error: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def compare_collection_with_actual(branch_id, shamsi_date):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT total_amount
+                FROM collections
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            collection = cur.fetchone()
+            cur.execute("""
+                SELECT total_actual
+                FROM actual_stats
+                WHERE branch_id = %s AND shamsi_date = %s
+            """, (branch_id, shamsi_date))
+            actual = cur.fetchone()
+            if not actual:
+                return None
+            claimed = collection[0] if collection else 0
+            actual_raw = actual[0]
+            return {
+                'claimed': claimed,
+                'actual': actual_raw,
+                'abs_actual': abs(actual_raw),
+                'diff_abs': abs(abs(claimed) - abs(actual_raw)),
+                'is_claimed_more': abs(claimed) > abs(actual_raw) if actual_raw != 0 else None
+            }
+    except Exception as e:
+        logger.error(f"compare_collection_with_actual error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
+# توابع گزارش‌های تطبیقی و پیش‌بینی
+# ============================================================
+def get_adaptive_comparison():
+    cached = cache_adaptive.get('adaptive')
+    if cached is not None:
+        return cached
+    shamsi_today = get_shamsi_date()
+    shamsi_yesterday = get_shamsi_date(-1)
+    shamsi_week_ago = get_shamsi_date(-7)
+    shamsi_month_ago = get_shamsi_date(-30)
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_today,))
+            today_total = cur.fetchone()[0] or 0
+            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_yesterday,))
+            yesterday_total = cur.fetchone()[0] or 0
+            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_week_ago,))
+            week_ago_total = cur.fetchone()[0] or 0
+            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date = %s", (shamsi_month_ago,))
+            month_ago_total = cur.fetchone()[0] or 0
+            def calc_change(current, previous):
+                if previous == 0:
+                    return 0 if current == 0 else 100
+                return ((current - previous) / previous) * 100
+            result = {
+                'today': today_total,
+                'yesterday': yesterday_total,
+                'week_ago': week_ago_total,
+                'month_ago': month_ago_total,
+                'change_yesterday': calc_change(today_total, yesterday_total),
+                'change_week': calc_change(today_total, week_ago_total),
+                'change_month': calc_change(today_total, month_ago_total)
+            }
+            cache_adaptive.set('adaptive', result)
+            return result
+    except Exception as e:
+        logger.error(f"get_adaptive_comparison error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_forecast(branch_id=None, days=7):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if branch_id:
+                cur.execute("""
+                    SELECT shamsi_date, total_amount
+                    FROM collections
+                    WHERE branch_id = %s
+                    ORDER BY shamsi_date DESC
+                    LIMIT 45
+                """, (branch_id,))
+            else:
+                cur.execute("""
+                    SELECT shamsi_date, SUM(total_amount) as total
+                    FROM collections
+                    GROUP BY shamsi_date
+                    ORDER BY shamsi_date DESC
+                    LIMIT 45
+                """)
+            data = cur.fetchall()
+            if len(data) < 3:
+                return None, {'error': 'حداقل ۳ روز داده نیاز است', 'available_days': len(data)}
+            dates = []
+            amounts = []
+            for row in reversed(data):
+                shamsi_str = row[0]
+                parts = shamsi_str.split('/')
+                if len(parts) == 3:
+                    try:
+                        year, month, day = map(int, parts)
+                        greg = jdatetime.date(year, month, day).togregorian()
+                        dates.append(greg.toordinal())
+                        amounts.append(float(row[1] or 0))
+                    except Exception:
+                        continue
+            if len(dates) < 3:
+                return None, {'error': f'تعداد داده‌های معتبر: {len(dates)} (حداقل ۳ روز نیاز است)'}
+            x = np.array(dates)
+            y = np.array(amounts)
+            n = len(x)
+            weights = np.exp(np.linspace(0, 1, n))
+            weights = weights / weights.sum() * n
+            x_mean = np.average(x, weights=weights)
+            y_mean = np.average(y, weights=weights)
+            cov = np.average((x - x_mean) * (y - y_mean), weights=weights)
+            var = np.average((x - x_mean) ** 2, weights=weights)
+            if var == 0:
+                return None, {'error': 'داده‌ها تغییرات کافی ندارند'}
+            slope = cov / var
+            intercept = y_mean - slope * x_mean
+            y_pred_all = slope * x + intercept
+            mse = np.mean((y - y_pred_all) ** 2)
+            rmse = np.sqrt(mse)
+            ss_tot = np.sum((y - y_mean) ** 2)
+            ss_res = np.sum((y - y_pred_all) ** 2)
+            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+            last_date = dates[-1]
+            forecast = []
+            for i in range(1, days + 1):
+                future_date = last_date + i
+                predicted = slope * future_date + intercept
+                lower = predicted - 1.96 * rmse
+                upper = predicted + 1.96 * rmse
+                future_greg = datetime.fromordinal(future_date)
+                future_shamsi = jdatetime.datetime.fromgregorian(datetime=future_greg)
+                shamsi_str = f"{future_shamsi.year}/{future_shamsi.month:02d}/{future_shamsi.day:02d}"
+                forecast.append({
+                    'date': shamsi_str,
+                    'predicted': max(0, predicted),
+                    'lower': max(0, lower),
+                    'upper': max(0, upper)
+                })
+            trend_analysis = {
+                'slope': slope,
+                'r2': r2,
+                'rmse': rmse,
+                'trend': 'صعودی' if slope > 0 else 'نزولی' if slope < 0 else 'ثابت',
+                'strength': 'قوی' if r2 > 0.7 else 'متوسط' if r2 > 0.4 else 'ضعیف',
+                'avg_amount': np.mean(y),
+                'last_amount': y[-1] if len(y) > 0 else 0,
+                'data_count': len(dates)
+            }
+            return forecast, trend_analysis
+    except Exception as e:
+        logger.error(f"get_forecast error: {e}")
+        return None, {'error': str(e)}
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_forecast_for_all_branches(days=7):
+    cached = cache_forecast_all.get('forecast_all')
+    if cached is not None:
+        return cached
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM branches ORDER BY name")
+            branches = cur.fetchall()
+            results = {}
+            for branch_id, branch_name in branches:
+                forecast, trend = get_forecast(branch_id, days)
+                if forecast and trend:
+                    results[branch_name] = {
+                        'forecast': forecast,
+                        'trend': trend
+                    }
+            cache_forecast_all.set('forecast_all', results)
+            return results
+    except Exception as e:
+        logger.error(f"get_forecast_for_all_branches error: {e}")
+        return {}
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
+# توابع نمودار
+# ============================================================
+def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
+    try:
+        plt.figure(figsize=figsize)
+        try:
+            title_fa = reshape_persian(title)
+            x_label_fa = reshape_persian(x_label)
+            y_label_fa = reshape_persian(y_label)
+            labels = [reshape_persian(str(lbl)) for lbl in data['labels']]
+            values = [float(v) if v is not None else 0 for v in data['values']]
+            plt.xticks(rotation=45, ha='right', fontsize=10)
+            if chart_type == 'bar':
+                plt.bar(labels, values, color='skyblue', edgecolor='navy')
+                max_val = max(values) if values else 1
+                for i, v in enumerate(values):
+                    if v > 0:
+                        plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
+                                ha='center', va='bottom', fontsize=8)
+            elif chart_type == 'line':
+                plt.plot(labels, values, marker='o', linestyle='-', color='blue', linewidth=2, markersize=8)
+                max_val = max(values) if values else 1
+                for i, v in enumerate(values):
+                    if v > 0:
+                        plt.text(i, v + 0.02*max_val, f"{int(v)//1_000_000:,.0f}",
+                                ha='center', va='bottom', fontsize=8)
+            elif chart_type == 'pie':
+                non_zero = [(l, v) for l, v in zip(labels, values) if v > 0]
+                if non_zero:
+                    labels, values = zip(*non_zero)
+                    plt.pie(values, labels=labels, autopct='%1.1f%%', startangle=90)
+                else:
+                    plt.pie([1], labels=['داده‌ای وجود ندارد'], colors=['lightgray'])
+            elif chart_type == 'horizontal':
+                plt.barh(labels, values, color='skyblue', edgecolor='navy')
+                max_val = max(values) if values else 1
+                for i, v in enumerate(values):
+                    if v > 0:
+                        plt.text(v + 0.02*max_val, i, f"{int(v)//1_000_000:,.0f}",
+                                va='center', fontsize=8)
+            elif chart_type == 'stacked':
+                if 'values2' in data:
+                    values2 = [float(v) if v is not None else 0 for v in data['values2']]
+                    plt.bar(labels, values, label='معاون', color='blue', alpha=0.7)
+                    plt.bar(labels, values2, label='همکاران', color='orange', alpha=0.7, bottom=values)
+                    plt.legend()
+                else:
+                    plt.bar(labels, values, color='skyblue')
+            plt.title(title_fa, fontsize=14, fontweight='bold')
+            plt.xlabel(x_label_fa)
+            plt.ylabel(y_label_fa)
+            plt.tight_layout()
+            img_bytes = io.BytesIO()
+            plt.savefig(img_bytes, format='png', dpi=120, bbox_inches='tight')
+            img_bytes.seek(0)
+            return img_bytes.getvalue()
+        finally:
+            plt.close()
+    except Exception as e:
+        logger.error(f"generate_chart error: {e}\n{traceback.format_exc()}")
+        plt.close()
+        return None
+
+def generate_branch_chart(branch_id, days=10):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT shamsi_date, total_amount
+                FROM collections
+                WHERE branch_id = %s
+                ORDER BY shamsi_date DESC
+                LIMIT %s
+            """, (branch_id, days))
+            data = cur.fetchall()
+            if not data:
+                return None
+            labels = [get_shamsi_date_formatted(row[0]) for row in reversed(data)]
+            values = [row[1] for row in reversed(data)]
+            return {
+                'labels': labels,
+                'values': values
+            }
+    except Exception as e:
+        logger.error(f"generate_branch_chart error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def generate_province_chart(days=10):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT shamsi_date, SUM(total_amount) as total
+                FROM collections
+                GROUP BY shamsi_date
+                ORDER BY shamsi_date DESC
+                LIMIT %s
+            """, (days,))
+            data = cur.fetchall()
+            if not data:
+                return None
+            labels = [get_shamsi_date_formatted(row[0]) for row in reversed(data)]
+            values = [row[1] for row in reversed(data)]
+            return {
+                'labels': labels,
+                'values': values
+            }
+    except Exception as e:
+        logger.error(f"generate_province_chart error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_analytical_chart_data(chart_type, days=10):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if chart_type == 'branch_comparison':
+                cur.execute("""
+                    SELECT b.name, SUM(c.total_amount) as total
+                    FROM collections c
+                    JOIN branches b ON c.branch_id = b.id
+                    WHERE c.shamsi_date >= %s
+                    GROUP BY b.name
+                    ORDER BY total DESC
+                    LIMIT 10
+                """, (get_shamsi_date(-days),))
+                data = cur.fetchall()
+                return {
+                    'labels': [row[0] for row in data],
+                    'values': [row[1] for row in data]
+                }
+            elif chart_type == 'deputy_others_ratio':
+                cur.execute("""
+                    SELECT
+                        SUM(deputy_amount) as deputy_total,
+                        SUM(others_amount) as others_total
+                    FROM collections
+                    WHERE shamsi_date >= %s
+                """, (get_shamsi_date(-days),))
+                row = cur.fetchone()
+                return {
+                    'labels': ['معاونین', 'همکاران'],
+                    'values': [row[0] or 0, row[1] or 0]
+                }
+            elif chart_type == 'daily_trend':
+                cur.execute("""
+                    SELECT shamsi_date, SUM(total_amount) as total
+                    FROM collections
+                    WHERE shamsi_date >= %s
+                    GROUP BY shamsi_date
+                    ORDER BY shamsi_date DESC
+                    LIMIT %s
+                """, (get_shamsi_date(-days), days))
+                data = cur.fetchall()
+                return {
+                    'labels': [get_shamsi_date_formatted(row[0]) for row in reversed(data)],
+                    'values': [row[1] for row in reversed(data)]
+                }
+            elif chart_type == 'match_analysis':
+                cur.execute("""
+                    SELECT
+                        b.name,
+                        COALESCE(AVG(
+                            CASE
+                                WHEN a.total_actual IS NULL THEN NULL
+                                WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                                WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                                WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
+                                    (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0)
+                                WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                                    (LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0)
+                                ELSE NULL
+                            END
+                        ), 0) as accuracy
+                    FROM branches b
+                    LEFT JOIN collections c ON b.id = c.branch_id
+                    LEFT JOIN actual_stats a ON b.id = a.branch_id AND c.shamsi_date = a.shamsi_date
+                    WHERE c.shamsi_date >= %s
+                    AND a.total_actual IS NOT NULL
+                    GROUP BY b.name
+                    HAVING COUNT(a.total_actual) > 0
+                    ORDER BY accuracy DESC
+                """, (get_shamsi_date(-days),))
+                data = cur.fetchall()
+                return {
+                    'labels': [row[0] for row in data],
+                    'values': [row[1] for row in data]
+                }
+            else:
+                return None
+    except Exception as e:
+        logger.error(f"get_analytical_chart_data error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
+# توابع مدیریت معاونین
+# ============================================================
+def get_all_deputies_with_details():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT u.id, u.employee_number, u.full_name, u.title, b.id as branch_id, b.name as branch_name
+                FROM users u
+                LEFT JOIN branches b ON u.branch_id = b.id
+                WHERE u.role = 'deputy'
+                ORDER BY b.name, u.full_name
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_all_deputies_with_details error: {e}")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def add_deputy(employee_number, full_name, title, branch_id, is_super_admin=False):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (employee_number, full_name, role, title, branch_id, is_super_admin, created_at)
+                VALUES (%s, %s, 'deputy', %s, %s, %s, %s)
+                ON CONFLICT (employee_number) DO NOTHING
+                RETURNING id
+            """, (employee_number, full_name, title, branch_id, is_super_admin, get_iran_time()))
+            result = cur.fetchone()
+            conn.commit()
+            if result:
+                return result[0]
+            return None
+    except Exception as e:
+        logger.error(f"add_deputy error: {e}")
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def update_deputy(user_id, employee_number=None, full_name=None, title=None, branch_id=None):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            updates = []
+            params = []
+            if employee_number is not None:
+                updates.append("employee_number = %s")
+                params.append(employee_number)
+            if full_name is not None:
+                updates.append("full_name = %s")
+                params.append(full_name)
+            if title is not None:
+                updates.append("title = %s")
+                params.append(title)
+            if branch_id is not None:
+                updates.append("branch_id = %s")
+                params.append(branch_id)
+            if not updates:
+                return False
+            updates.append("updated_at = %s")
+            params.append(get_iran_time())
+            params.append(user_id)
+            query = f"UPDATE users SET {', '.join(updates)} WHERE id = %s AND role = 'deputy'"
+            cur.execute(query, params)
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception as e:
+        logger.error(f"update_deputy error: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def delete_deputy(user_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM collections WHERE recorded_by = %s", (user_id,))
+            if cur.fetchone()[0] > 0:
+                return False, "این معاون دارای سابقه وصول است و قابل حذف نمی‌باشد"
+            cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+            result = cur.fetchone()
+            if not result or result[0] != 'deputy':
+                return False, "کاربر معاون نیست"
+            cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+            conn.commit()
+            return True, "حذف شد"
+    except Exception as e:
+        logger.error(f"delete_deputy error: {e}")
+        if conn:
+            conn.rollback()
+        return False, str(e)
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_deputy_by_employee_number(emp_num):
+    emp_num = normalize_digits(emp_num)
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, employee_number, full_name, title, branch_id
+                FROM users
+                WHERE employee_number = %s AND role = 'deputy'
+            """, (emp_num,))
+            return cur.fetchone()
+    except Exception as e:
+        logger.error(f"get_deputy_by_employee_number error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_deputy_match_report(user_id, days=30):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT branch_id FROM users WHERE id = %s", (user_id,))
+            branch = cur.fetchone()
+            if not branch:
+                return None
+            branch_id = branch[0]
+            shamsi_start = get_shamsi_date(-days)
+            cur.execute("""
+                SELECT
+                    c.shamsi_date,
+                    c.total_amount as collected,
+                    a.total_actual as actual,
+                    CASE
+                        WHEN a.total_actual IS NULL THEN NULL
+                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
+                        WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
+                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
+                            ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0), 2)
+                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
+                            ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0), 2)
+                        ELSE 0
+                    END as match_percent,
+                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
+                FROM collections c
+                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
+                WHERE c.branch_id = %s
+                AND c.shamsi_date >= %s
+                AND a.total_actual IS NOT NULL
+                ORDER BY c.shamsi_date DESC
+            """, (branch_id, shamsi_start))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_deputy_match_report error: {e}")
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
+# ارسال پیام و عکس
 # ============================================================
 def is_super_admin_user(chat_id):
     user = find_user_by_telegram_id(chat_id)
@@ -2987,18 +3079,14 @@ def is_super_admin_user(chat_id):
     return False
 
 def send_message(chat_id, text, reply_markup=None, remove_keyboard=False, parse_mode="Markdown", escape_user_text=False):
-    # وضعیت ربات: فقط سوپرادمین می‌تواند در حالت غیرفعال پیام بفرستد
     bot_status = get_bot_status()
     if not bot_status:
-        # بررسی سریع سوپرادمین (با کش)
         user = find_user_by_telegram_id(chat_id)
         if not user or not user[7]:
             send_maintenance_message(chat_id)
             return None
-
     if escape_user_text:
         text = escape_markdown(text)
-
     if len(text) > 4000:
         chunks = split_text_safely(text, 4000)
         for chunk in chunks:
@@ -3081,7 +3169,7 @@ def send_maintenance_message(chat_id):
         pass
 
 # ============================================================
-# کیبوردها (بدون دکمه‌های نظرسنجی)
+# کیبوردها
 # ============================================================
 def get_deputy_keyboard():
     return {
@@ -3394,7 +3482,7 @@ def send_monthly_report_to_all():
             send_message(chat_id, msg)
 
 # ============================================================
-# توابع کمکی برای Threading با محدودیت ترد
+# توابع کمکی برای Threading
 # ============================================================
 def generate_and_send_branch_chart(chat_id, branch_id, branch_name, role, is_super_admin):
     try:
@@ -3522,177 +3610,138 @@ def generate_and_send_forecast(chat_id, role, is_super_admin):
         send_message(chat_id, "❌ خطا در تولید پیش‌بینی.", get_cancel_keyboard())
 
 # ============================================================
-# توابع مدیریت معاونین
+# offset management
 # ============================================================
-def get_all_deputies_with_details():
-    conn = None
+OFFSET_FILE = "offset.dat"
+def save_offset(offset):
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT u.id, u.employee_number, u.full_name, u.title, b.id as branch_id, b.name as branch_name
-                FROM users u
-                LEFT JOIN branches b ON u.branch_id = b.id
-                WHERE u.role = 'deputy'
-                ORDER BY b.name, u.full_name
-            """)
-            return cur.fetchall()
+        with open(OFFSET_FILE, 'wb') as f:
+            pickle.dump(offset, f)
     except Exception as e:
-        logger.error(f"get_all_deputies_with_details error: {e}")
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def add_deputy(employee_number, full_name, title, branch_id, is_super_admin=False):
-    conn = None
+        logger.error(f"Failed to save offset: {e}")
+def load_offset():
     try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users (employee_number, full_name, role, title, branch_id, is_super_admin, created_at)
-                VALUES (%s, %s, 'deputy', %s, %s, %s, %s)
-                ON CONFLICT (employee_number) DO NOTHING
-                RETURNING id
-            """, (employee_number, full_name, title, branch_id, is_super_admin, get_iran_time()))
-            result = cur.fetchone()
-            conn.commit()
-            if result:
-                return result[0]
-            return None
+        if os.path.exists(OFFSET_FILE):
+            with open(OFFSET_FILE, 'rb') as f:
+                return pickle.load(f)
     except Exception as e:
-        logger.error(f"add_deputy error: {e}")
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def update_deputy(user_id, employee_number=None, full_name=None, title=None, branch_id=None):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            updates = []
-            params = []
-            if employee_number is not None:
-                updates.append("employee_number = %s")
-                params.append(employee_number)
-            if full_name is not None:
-                updates.append("full_name = %s")
-                params.append(full_name)
-            if title is not None:
-                updates.append("title = %s")
-                params.append(title)
-            if branch_id is not None:
-                updates.append("branch_id = %s")
-                params.append(branch_id)
-            if not updates:
-                return False
-            updates.append("updated_at = %s")
-            params.append(get_iran_time())
-            params.append(user_id)
-            query = f"UPDATE users SET {', '.join(updates)} WHERE id = %s AND role = 'deputy'"
-            cur.execute(query, params)
-            conn.commit()
-            return cur.rowcount > 0
-    except Exception as e:
-        logger.error(f"update_deputy error: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def delete_deputy(user_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM collections WHERE recorded_by = %s", (user_id,))
-            if cur.fetchone()[0] > 0:
-                return False, "این معاون دارای سابقه وصول است و قابل حذف نمی‌باشد"
-            cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
-            result = cur.fetchone()
-            if not result or result[0] != 'deputy':
-                return False, "کاربر معاون نیست"
-            cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
-            conn.commit()
-            return True, "حذف شد"
-    except Exception as e:
-        logger.error(f"delete_deputy error: {e}")
-        if conn:
-            conn.rollback()
-        return False, str(e)
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_deputy_by_employee_number(emp_num):
-    emp_num = normalize_digits(emp_num)
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT id, employee_number, full_name, title, branch_id
-                FROM users
-                WHERE employee_number = %s AND role = 'deputy'
-            """, (emp_num,))
-            return cur.fetchone()
-    except Exception as e:
-        logger.error(f"get_deputy_by_employee_number error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_deputy_match_report(user_id, days=30):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT branch_id FROM users WHERE id = %s", (user_id,))
-            branch = cur.fetchone()
-            if not branch:
-                return None
-            branch_id = branch[0]
-            shamsi_start = get_shamsi_date(-days)
-            cur.execute("""
-                SELECT
-                    c.shamsi_date,
-                    c.total_amount as collected,
-                    a.total_actual as actual,
-                    CASE
-                        WHEN a.total_actual IS NULL THEN NULL
-                        WHEN a.total_actual = 0 AND c.total_amount = 0 THEN 100
-                        WHEN a.total_actual = 0 AND c.total_amount > 0 THEN 0
-                        WHEN a.total_actual < 0 AND c.total_amount >= 0 THEN
-                            ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0), 2)
-                        WHEN a.total_actual > 0 AND c.total_amount >= 0 THEN
-                            ROUND((LEAST(ABS(a.total_actual), ABS(c.total_amount)) * 100.0) / NULLIF(GREATEST(ABS(a.total_actual), ABS(c.total_amount)), 0), 2)
-                        ELSE 0
-                    END as match_percent,
-                    (ABS(a.total_actual) - ABS(c.total_amount)) as diff
-                FROM collections c
-                LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
-                WHERE c.branch_id = %s
-                AND c.shamsi_date >= %s
-                AND a.total_actual IS NOT NULL
-                ORDER BY c.shamsi_date DESC
-            """, (branch_id, shamsi_start))
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_deputy_match_report error: {e}")
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
+        logger.error(f"Failed to load offset: {e}")
+    return 0
 
 # ============================================================
-# پردازش پیام‌ها (بدون بخش نظرسنجی - کامل حذف شده)
+# Scheduler
+# ============================================================
+def start_scheduler():
+    scheduler = BackgroundScheduler(timezone='Asia/Tehran')
+    scheduler.add_job(
+        check_and_send_reminders,
+        CronTrigger(hour=15, minute=0),
+        id='reminder_job',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        send_daily_report_to_admins,
+        CronTrigger(hour=17, minute=30),
+        id='daily_report_job',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        check_and_send_drop_alerts,
+        CronTrigger(hour=18, minute=30),
+        id='drop_alert_job',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        check_and_auto_score,
+        CronTrigger(hour=20, minute=0),
+        id='scoring_job',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        send_weekly_report_to_all,
+        CronTrigger(day_of_week='thu', hour=17, minute=0),
+        id='weekly_report_job',
+        replace_existing=True
+    )
+    scheduler.add_job(
+        send_monthly_report_to_all,
+        CronTrigger(hour=17, minute=0),
+        id='monthly_report_job',
+        replace_existing=True
+    )
+    scheduler.start()
+    logger.info("✅ Scheduler started")
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    global requests_session, processed_set
+    offset = load_offset()
+    logger.info(f"🤖 Bot started successfully with offset: {offset}")
+    threading.Thread(target=run_flask, daemon=True).start()
+    logger.info(f"🌐 Flask server started on port {PORT}")
+    start_scheduler()
+    atexit.register(lambda: save_offset(offset))
+    while True:
+        try:
+            url = f"{BASE_URL}/getUpdates"
+            params = {"offset": offset, "timeout": 30}
+            res = requests_session.get(url, params=params, timeout=45)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("ok") and data.get("result"):
+                    for update in data["result"]:
+                        update_id = update["update_id"]
+                        if update_id in processed_set:
+                            continue
+                        processed_set.add(update_id)
+                        processed_updates.append(update_id)
+                        if len(processed_updates) > 2000:
+                            old = processed_updates.popleft()
+                            processed_set.discard(old)
+                        if "message" in update:
+                            handle_message(update["message"])
+                        offset = update_id + 1
+                        save_offset(offset)
+                else:
+                    if data.get("error_code") == 409:
+                        logger.warning("⚠️ Conflict (409) – another instance is running. Resetting offset...")
+                        try:
+                            res2 = requests_session.get(f"{BASE_URL}/getUpdates", timeout=10)
+                            if res2.status_code == 200:
+                                data2 = res2.json()
+                                if data2.get("ok") and data2.get("result"):
+                                    last_update = data2["result"][-1]
+                                    offset = last_update["update_id"] + 1
+                                    logger.info(f"✅ Offset reset to {offset}")
+                                    save_offset(offset)
+                                else:
+                                    offset = 0
+                            else:
+                                offset = 0
+                        except Exception:
+                            offset = 0
+                        time.sleep(3)
+                    else:
+                        logger.warning(f"⚠️ API response not ok: {data}")
+                        time.sleep(2)
+            else:
+                logger.error(f"❌ HTTP error: {res.status_code} - {res.text}")
+                time.sleep(5)
+        except requests.exceptions.Timeout:
+            logger.warning("⏳ Timeout in long polling (normal). Reconnecting...")
+            time.sleep(2)
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"❌ Connection error: {e} – recreating session...")
+            requests_session = create_session()
+            time.sleep(5)
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in main loop: {e}")
+            time.sleep(5)
+
+# ============================================================
+# تابع handle_message (بخش اصلی پردازش پیام)
 # ============================================================
 def handle_message(message):
     try:
@@ -3724,7 +3773,7 @@ def handle_message(message):
             user_state = user_states.get(chat_id, {"state": "LOGGED_OUT"})
         current_state = user_state.get("state", "LOGGED_OUT")
 
-        # ===== State Handlers =====
+        # ===== State: LOGGED_OUT / WAITING_FOR_EMP_NUM =====
         if current_state == "LOGGED_OUT" or current_state == "WAITING_FOR_EMP_NUM":
             if current_state != "WAITING_FOR_EMP_NUM":
                 with user_states_lock:
@@ -3790,6 +3839,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید.")
             return
 
+        # ===== State: WAITING_FOR_SUPER_ADMIN_PASSWORD =====
         if current_state == "WAITING_FOR_SUPER_ADMIN_PASSWORD":
             if text == SUPER_ADMIN_PASSWORD:
                 temp_data = user_state.get("temp_user_data")
@@ -3848,7 +3898,7 @@ def handle_message(message):
         user_db_id = user_data["db_id"]
         is_super_admin = user_data.get("is_super_admin", False)
 
-        # ===== سایر State ها =====
+        # ===== State: WAITING_FOR_DEPUTY_AMOUNT =====
         if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -3871,6 +3921,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت (میلیون ریال) وارد کنید.\nمثال: ۴۷۰۰ برای ۴.۷ میلیارد ریال")
             return
 
+        # ===== State: WAITING_FOR_OTHERS_AMOUNT =====
         if current_state == "WAITING_FOR_OTHERS_AMOUNT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -3900,6 +3951,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت (میلیون ریال) وارد کنید.")
             return
 
+        # ===== State: WAITING_FOR_NOTE =====
         if current_state == "WAITING_FOR_NOTE":
             if text == "🔙 انصراف":
                 data = user_state.get("collection_data", {})
@@ -3951,6 +4003,7 @@ def handle_message(message):
                 send_message(chat_id, msg, keyboard)
                 return
 
+        # ===== State: WAITING_FOR_EDIT_CONFIRMATION =====
         if current_state == "WAITING_FOR_EDIT_CONFIRMATION":
             if text == "📝 بله، ویرایش شود":
                 with user_states_lock:
@@ -3966,6 +4019,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
             return
 
+        # ===== State: WAITING_FOR_BRANCH_DATE (معاون) =====
         if role == 'deputy' and current_state == "WAITING_FOR_BRANCH_DATE":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4002,6 +4056,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
+        # ===== State: WAITING_FOR_ADMIN_DATE (ادمین/سوپرادمین) =====
         if (role == 'admin' or is_super_admin) and current_state == "WAITING_FOR_ADMIN_DATE":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4037,6 +4092,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
+        # ===== State: WAITING_FOR_PROBLEM =====
         if current_state == "WAITING_FOR_PROBLEM":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4056,6 +4112,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
+        # ===== State: WAITING_FOR_NOTE_FOR_COLLECTION (معاون) =====
         if current_state == "WAITING_FOR_NOTE_FOR_COLLECTION" and role == 'deputy':
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4095,6 +4152,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
+        # ===== State: WAITING_FOR_MESSAGE_RECIPIENT (سوپرادمین) =====
         if current_state == "WAITING_FOR_MESSAGE_RECIPIENT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4141,6 +4199,7 @@ def handle_message(message):
             send_message(chat_id, f"📨 مخاطبین انتخاب شدند:\n{recipient_names}\n\n✏️ حالا متن پیام خود را بنویسید:", get_cancel_keyboard())
             return
 
+        # ===== State: WAITING_FOR_MESSAGE_TEXT (سوپرادمین) =====
         if current_state == "WAITING_FOR_MESSAGE_TEXT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -6096,120 +6155,6 @@ def handle_message(message):
             send_message(message['chat']['id'], "❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         except Exception:
             pass
-
-# ============================================================
-# راه‌اندازی زمان‌بندی کارها
-# ============================================================
-def start_scheduler():
-    scheduler = BackgroundScheduler(timezone='Asia/Tehran')
-    scheduler.add_job(
-        check_and_send_reminders,
-        CronTrigger(hour=15, minute=0),
-        id='reminder_job',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_daily_report_to_admins,
-        CronTrigger(hour=17, minute=30),
-        id='daily_report_job',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        check_and_send_drop_alerts,
-        CronTrigger(hour=18, minute=30),
-        id='drop_alert_job',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        check_and_auto_score,
-        CronTrigger(hour=20, minute=0),
-        id='scoring_job',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_weekly_report_to_all,
-        CronTrigger(day_of_week='thu', hour=17, minute=0),
-        id='weekly_report_job',
-        replace_existing=True
-    )
-    scheduler.add_job(
-        send_monthly_report_to_all,
-        CronTrigger(hour=17, minute=0),
-        id='monthly_report_job',
-        replace_existing=True
-    )
-    scheduler.start()
-    logger.info("✅ Scheduler started")
-
-# ============================================================
-# Main Polling Loop با ذخیره offset
-# ============================================================
-def main():
-    global requests_session, processed_set
-    offset = load_offset()
-    logger.info(f"🤖 Bot started successfully with offset: {offset}")
-    threading.Thread(target=run_flask, daemon=True).start()
-    logger.info(f"🌐 Flask server started on port {PORT}")
-    start_scheduler()
-    
-    atexit.register(lambda: save_offset(offset))
-    
-    while True:
-        try:
-            url = f"{BASE_URL}/getUpdates"
-            params = {"offset": offset, "timeout": 30}
-            res = requests_session.get(url, params=params, timeout=45)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("ok") and data.get("result"):
-                    for update in data["result"]:
-                        update_id = update["update_id"]
-                        if update_id in processed_set:
-                            continue
-                        processed_set.add(update_id)
-                        processed_updates.append(update_id)
-                        if len(processed_updates) > 2000:
-                            old = processed_updates.popleft()
-                            processed_set.discard(old)
-                        if "message" in update:
-                            handle_message(update["message"])
-                        offset = update_id + 1
-                        save_offset(offset)
-                else:
-                    if data.get("error_code") == 409:
-                        logger.warning("⚠️ Conflict (409) – another instance is running. Resetting offset...")
-                        try:
-                            res2 = requests_session.get(f"{BASE_URL}/getUpdates", timeout=10)
-                            if res2.status_code == 200:
-                                data2 = res2.json()
-                                if data2.get("ok") and data2.get("result"):
-                                    last_update = data2["result"][-1]
-                                    offset = last_update["update_id"] + 1
-                                    logger.info(f"✅ Offset reset to {offset}")
-                                    save_offset(offset)
-                                else:
-                                    offset = 0
-                            else:
-                                offset = 0
-                        except Exception:
-                            offset = 0
-                        time.sleep(3)
-                    else:
-                        logger.warning(f"⚠️ API response not ok: {data}")
-                        time.sleep(2)
-            else:
-                logger.error(f"❌ HTTP error: {res.status_code} - {res.text}")
-                time.sleep(5)
-        except requests.exceptions.Timeout:
-            logger.warning("⏳ Timeout in long polling (normal). Reconnecting...")
-            time.sleep(2)
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"❌ Connection error: {e} – recreating session...")
-            requests_session = create_session()
-            time.sleep(5)
-        except Exception as e:
-            logger.error(f"❌ Unexpected error in main loop: {e}")
-            time.sleep(5)
 
 if __name__ == "__main__":
     main()
