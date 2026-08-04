@@ -4,7 +4,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import requests
 from requests.adapters import HTTPAdapter
-from requests.packages.urllib3.util.retry import Retry
+from urllib3.util.retry import Retry  # اصلاح import
 import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
@@ -88,7 +88,7 @@ def create_session():
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS"]
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]  # اضافه کردن POST
     )
     adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
     session.mount("http://", adapter)
@@ -97,7 +97,7 @@ def create_session():
 requests_session = create_session()
 
 # ============================================================
-# Connection Pool با مدیریت ایمن
+# Connection Pool با مدیریت ایمن (رفع نشت کانکشن)
 # ============================================================
 class SafeConnectionPool:
     def __init__(self, minconn=5, maxconn=30, dsn=None):
@@ -125,12 +125,23 @@ class SafeConnectionPool:
                     return self._pool.getconn()
                 except Exception as e:
                     logger.error(f"Pool getconn error: {e}, falling back to direct connect")
-                    return psycopg2.connect(self.dsn)
-            return psycopg2.connect(self.dsn)
+                    conn = psycopg2.connect(self.dsn)
+                    conn.is_direct = True  # علامت‌گذاری
+                    return conn
+            conn = psycopg2.connect(self.dsn)
+            conn.is_direct = True
+            return conn
     def putconn(self, conn):
         if conn is None:
             return
         with self._lock:
+            # اگر کانکشن مستقیم است، فقط ببند
+            if getattr(conn, 'is_direct', False):
+                try:
+                    conn.close()
+                except:
+                    pass
+                return
             if self._pool is not None:
                 try:
                     self._pool.putconn(conn)
@@ -194,12 +205,13 @@ cache_targets = TTLCache(ttl_seconds=60)
 cache_admins = TTLCache(ttl_seconds=300)
 
 # ============================================================
-# State Management و متغیرهای سراسری
+# State Management و متغیرهای سراسری (با قفل برای processed_set)
 # ============================================================
 user_states_lock = threading.RLock()
 user_states = {}
 processed_updates = deque(maxlen=2000)
 processed_set = set()
+processed_set_lock = threading.Lock()  # اضافه شد
 
 # ============================================================
 # Thread Pool
@@ -265,7 +277,7 @@ def split_text_safely(text, max_len=4000):
     return chunks
 
 # ============================================================
-# تنظیم فونت
+# تنظیم فونت (بهبود fallback)
 # ============================================================
 _font_initialized = False
 def setup_persian_font_once():
@@ -277,6 +289,9 @@ def setup_persian_font_once():
             '/usr/share/fonts/truetype/vazirmatn/Vazirmatn-Regular.ttf',
             '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
             '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+            '/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf',
+            '/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf',
+            '/usr/share/fonts/truetype/ttf-dejavu/DejaVuSans.ttf',
         ]
         plt.rcParams['font.family'] = 'sans-serif'
         plt.rcParams['axes.unicode_minus'] = False
@@ -288,6 +303,7 @@ def setup_persian_font_once():
                 logger.info(f"✅ Font loaded: {path}")
                 _font_initialized = True
                 return
+        # fallback: استفاده از 'DejaVu Sans' که معمولاً موجود است
         plt.rcParams['font.family'] = ['DejaVu Sans', 'Liberation Sans', 'sans-serif']
         logger.warning("⚠️ No Persian font found, using fallback fonts")
         _font_initialized = True
@@ -327,7 +343,7 @@ def get_shamsi_date_formatted(shamsi_str):
     if len(parts) != 3:
         return shamsi_str
     year, month, day = parts
-    month = month.zfill(2)
+    month = month.zfill(2)   # اصلاح: دو رقمی کردن ماه
     day = day.zfill(2)
     months = {
         '01':'فروردین','02':'اردیبهشت','03':'خرداد',
@@ -520,6 +536,8 @@ def create_all_tables_if_not_exists():
             logger.info("✅ All tables created/verified successfully.")
     except Exception as e:
         logger.error(f"❌ Error creating tables: {e}")
+        if conn:
+            conn.rollback()
     finally:
         if conn:
             return_db_connection(conn)
@@ -541,6 +559,8 @@ def get_bot_status_db():
             return True
     except Exception as e:
         logger.error(f"get_bot_status_db: {e}")
+        if conn:
+            conn.rollback()
         return True
     finally:
         if conn:
@@ -595,6 +615,8 @@ def get_feature_setting(key, default='active'):
             return value
     except Exception as e:
         logger.error(f"get_feature_setting error: {e}")
+        if conn:
+            conn.rollback()
         return default
     finally:
         if conn:
@@ -680,6 +702,8 @@ def is_holiday(shamsi_date=None):
             return count > 0
     except Exception as e:
         logger.error(f"is_holiday error: {e}")
+        if conn:
+            conn.rollback()
         return False
     finally:
         if conn:
@@ -746,6 +770,8 @@ def get_all_holidays(limit=30):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_holidays error: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -816,6 +842,8 @@ def get_consecutive_days(branch_id, shamsi_date):
             return count
     except Exception as e:
         logger.error(f"get_consecutive_days error: {e}")
+        if conn:
+            conn.rollback()
         return 0
     finally:
         if conn:
@@ -842,6 +870,24 @@ def save_score(collection_id, score):
         if conn:
             return_db_connection(conn)
 
+def delete_score(collection_id):
+    """حذف رکورد امتیاز برای بازمحاسبه بعد از ویرایش"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM scores WHERE collection_id = %s", (collection_id,))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"delete_score error: {e}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            return_db_connection(conn)
+
 def get_branch_total_score(branch_id, days=30):
     conn = None
     try:
@@ -858,6 +904,8 @@ def get_branch_total_score(branch_id, days=30):
             return result or 0
     except Exception as e:
         logger.error(f"get_branch_total_score: {e}")
+        if conn:
+            conn.rollback()
         return 0
     finally:
         if conn:
@@ -879,6 +927,8 @@ def get_all_branch_scores(days=30):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_branch_scores: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -934,6 +984,8 @@ def get_all_problems(status=None, limit=50):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_problems: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -977,6 +1029,8 @@ def get_all_branches():
             return result
     except Exception as e:
         logger.error(f"get_all_branches: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1000,6 +1054,8 @@ def find_user_by_employee_number(emp_num):
             return cur.fetchone()
     except Exception as e:
         logger.error(f"find_user_by_employee_number: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1034,6 +1090,8 @@ def find_user_by_telegram_id(chat_id):
             return cur.fetchone()
     except Exception as e:
         logger.error(f"find_user_by_telegram_id: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1077,6 +1135,8 @@ def get_user_activity_log(limit=100):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_user_activity_log: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1118,6 +1178,8 @@ def get_notes_for_collection(collection_id):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_notes_for_collection: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1141,6 +1203,8 @@ def get_all_notes_with_collection(limit=50):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_notes_with_collection: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1160,11 +1224,16 @@ def check_existing_collection(branch_id, shamsi_date):
             return cur.fetchone()
     except Exception as e:
         logger.error(f"check_existing_collection: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# ذخیره/بروزرسانی وصول با مدیریت امتیاز (رفع باگ شماره ۲)
+# ============================================================
 def save_or_update_collection_with_note(branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id, note_text=None, update_existing=False):
     conn = None
     created_at_iran = get_iran_time()
@@ -1184,6 +1253,8 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
                 result = cur.fetchone()
                 if result:
                     collection_id = result[0]
+                    # حذف امتیاز قدیمی برای بازمحاسبه
+                    delete_score(collection_id)
                 else:
                     return False, None
             else:
@@ -1199,12 +1270,14 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
                 """, (branch_id, deputy_amount, others_amount, shamsi_date, user_id, created_at_iran))
                 result = cur.fetchone()
                 collection_id = result[0] if result else None
+                # اگر در حال ویرایش نباشد، امتیاز بعداً توسط job شب محاسبه می‌شود
             if note_text and collection_id:
                 cur.execute("""
                     INSERT INTO notes (collection_id, user_id, note_text, created_at)
                     VALUES (%s, %s, %s, %s)
                 """, (collection_id, user_id, note_text, created_at_iran))
             conn.commit()
+            # پاکسازی کش‌ها
             cache_today_report.invalidate_all()
             cache_top_branches.invalidate('top5')
             cache_10day_report.invalidate('10day')
@@ -1294,7 +1367,7 @@ def get_today_province_report(shamsi_date):
                         SELECT SUM(c2.total_amount)
                         FROM collections c2
                         WHERE c2.branch_id = b.id
-                        AND c2.shamsi_date >= TO_CHAR(bt.created_at AT TIME ZONE 'Asia/Tehran', 'YYYY/MM/DD')
+                        AND c2.shamsi_date >= bt.target_date  -- اصلاح: استفاده از target_date به جای created_at
                     ), 0) as collected_since_target
                 FROM branches b
                 LEFT JOIN collections c ON c.branch_id = b.id AND c.shamsi_date = %s
@@ -1306,6 +1379,8 @@ def get_today_province_report(shamsi_date):
             return result
     except Exception as e:
         logger.error(f"get_today_province_report: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1331,6 +1406,8 @@ def get_province_10_day_report():
             return result
     except Exception as e:
         logger.error(f"get_province_10_day_report: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1357,6 +1434,8 @@ def get_top_5_branches():
             return result
     except Exception as e:
         logger.error(f"get_top_5_branches: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1376,6 +1455,8 @@ def get_today_statistics():
             return cur.fetchone()
     except Exception as e:
         logger.error(f"get_today_statistics: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1398,6 +1479,8 @@ def get_detailed_report(shamsi_date):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_detailed_report: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1423,6 +1506,32 @@ def get_branch_performance(branch_id, days=10):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_branch_performance error: {e}")
+        if conn:
+            conn.rollback()
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# اضافه کردن تابع get_branch_10_day_report (رفع باگ شماره ۶)
+def get_branch_10_day_report(branch_id):
+    """گزارش ۱۰ روز اخیر یک شعبه"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT shamsi_date, deputy_amount, others_amount, total_amount
+                FROM collections
+                WHERE branch_id = %s
+                ORDER BY shamsi_date DESC
+                LIMIT 10
+            """, (branch_id,))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_branch_10_day_report error: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1446,6 +1555,8 @@ def get_daily_comparison():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_daily_comparison: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1467,6 +1578,8 @@ def get_deputy_vs_others_ratio():
             return cur.fetchone()
     except Exception as e:
         logger.error(f"get_deputy_vs_others_ratio: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1489,6 +1602,8 @@ def get_report_by_date(shamsi_date):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_report_by_date: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1508,6 +1623,8 @@ def get_branch_report_by_date(branch_id, shamsi_date):
             return cur.fetchone()
     except Exception as e:
         logger.error(f"get_branch_report_by_date: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1527,6 +1644,8 @@ def get_branch_full_history(branch_id):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_branch_full_history: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1556,6 +1675,8 @@ def get_best_worst_days(limit=5):
             return best, worst
     except Exception as e:
         logger.error(f"get_best_worst_days: {e}")
+        if conn:
+            conn.rollback()
         return [], []
     finally:
         if conn:
@@ -1574,6 +1695,8 @@ def get_all_users():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_users: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1654,11 +1777,16 @@ def get_all_collections(limit=100):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_collections: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# توابع ویرایش/حذف/ریست با پاکسازی کش (رفع باگ شماره ۵)
+# ============================================================
 def delete_collection(collection_id):
     conn = None
     try:
@@ -1666,6 +1794,14 @@ def delete_collection(collection_id):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM collections WHERE id = %s", (collection_id,))
             conn.commit()
+            # پاکسازی کش‌ها
+            cache_today_report.invalidate_all()
+            cache_top_branches.invalidate('top5')
+            cache_10day_report.invalidate('10day')
+            cache_adaptive.invalidate('adaptive')
+            cache_forecast_all.invalidate('forecast_all')
+            invalidate_branches_cache()
+            cache_targets.invalidate_all()
             return True
     except Exception as e:
         logger.error(f"delete_collection: {e}")
@@ -1687,6 +1823,16 @@ def update_collection(collection_id, deputy_amount, others_amount):
                 WHERE id = %s
             """, (deputy_amount, others_amount, get_iran_time(), collection_id))
             conn.commit()
+            # پاکسازی کش‌ها
+            cache_today_report.invalidate_all()
+            cache_top_branches.invalidate('top5')
+            cache_10day_report.invalidate('10day')
+            cache_adaptive.invalidate('adaptive')
+            cache_forecast_all.invalidate('forecast_all')
+            invalidate_branches_cache()
+            cache_targets.invalidate_all()
+            # حذف امتیاز قدیمی برای بازمحاسبه
+            delete_score(collection_id)
             return True
     except Exception as e:
         logger.error(f"update_collection: {e}")
@@ -1704,6 +1850,14 @@ def reset_all_collections():
         with conn.cursor() as cur:
             cur.execute("DELETE FROM collections")
             conn.commit()
+            # پاکسازی کش‌ها
+            cache_today_report.invalidate_all()
+            cache_top_branches.invalidate('top5')
+            cache_10day_report.invalidate('10day')
+            cache_adaptive.invalidate('adaptive')
+            cache_forecast_all.invalidate('forecast_all')
+            invalidate_branches_cache()
+            cache_targets.invalidate_all()
             return True
     except Exception as e:
         logger.error(f"reset_all_collections: {e}")
@@ -1729,6 +1883,8 @@ def get_all_deputies():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_deputies: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1751,6 +1907,8 @@ def get_branch_weekly_avg(branch_id, days=7):
             return cur.fetchone()[0] or 0
     except Exception as e:
         logger.error(f"get_branch_weekly_avg: {e}")
+        if conn:
+            conn.rollback()
         return 0
     finally:
         if conn:
@@ -1770,6 +1928,8 @@ def get_branch_monthly_avg(branch_id, days=30):
             return cur.fetchone()[0] or 0
     except Exception as e:
         logger.error(f"get_branch_monthly_avg: {e}")
+        if conn:
+            conn.rollback()
         return 0
     finally:
         if conn:
@@ -1812,6 +1972,8 @@ def get_today_performance_analysis():
             }
     except Exception as e:
         logger.error(f"get_today_performance_analysis: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1856,6 +2018,8 @@ def get_drop_alert_branches():
             return results
     except Exception as e:
         logger.error(f"get_drop_alert_branches: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1876,6 +2040,8 @@ def get_branch_trend(branch_id, days=3):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_branch_trend: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1914,6 +2080,8 @@ def get_deputy_performance_report(user_id, days=30):
             return None
     except Exception as e:
         logger.error(f"get_deputy_performance_report: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -1937,6 +2105,8 @@ def get_unreported_branches():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_unreported_branches: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1961,6 +2131,8 @@ def get_all_admins():
             return result
     except Exception as e:
         logger.error(f"get_all_admins: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -1982,6 +2154,8 @@ def get_branch_monthly_avg_for_name(branch_name):
             return result or 0
     except Exception as e:
         logger.error(f"get_branch_monthly_avg_for_name: {e}")
+        if conn:
+            conn.rollback()
         return 0
     finally:
         if conn:
@@ -2038,6 +2212,8 @@ def get_others_performance_summary():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_others_performance_summary error: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -2081,6 +2257,8 @@ def get_deputy_accuracy_ranking(days=30):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_deputy_accuracy_ranking: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -2114,6 +2292,8 @@ def get_branch_accuracy_trend(branch_id, days=30):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_branch_accuracy_trend: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -2173,6 +2353,8 @@ def get_best_worst_accuracy_branches(shamsi_date, limit=5):
             return best, worst
     except Exception as e:
         logger.error(f"get_best_worst_accuracy_branches: {e}")
+        if conn:
+            conn.rollback()
         return [], []
     finally:
         if conn:
@@ -2184,9 +2366,7 @@ def get_branch_performance_vs_avg(branch_id, days=30):
         conn = get_db_connection()
         with conn.cursor() as cur:
             shamsi_start = get_shamsi_date(-days)
-            cur.execute("""
-                SELECT AVG(total_amount) FROM collections WHERE shamsi_date >= %s
-            """, (shamsi_start,))
+            cur.execute("SELECT AVG(total_amount) FROM collections WHERE shamsi_date >= %s", (shamsi_start,))
             avg_province = cur.fetchone()[0] or 0
             cur.execute("""
                 SELECT
@@ -2210,6 +2390,8 @@ def get_branch_performance_vs_avg(branch_id, days=30):
             }
     except Exception as e:
         logger.error(f"get_branch_performance_vs_avg: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2239,6 +2421,8 @@ def get_deputy_late_analysis(days=30):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_deputy_late_analysis: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -2309,6 +2493,8 @@ def get_active_target(branch_id):
             return None
     except Exception as e:
         logger.error(f"get_active_target error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2327,6 +2513,8 @@ def get_branch_collection_since_date(branch_id, start_date):
             return cur.fetchone()[0]
     except Exception as e:
         logger.error(f"get_branch_collection_since_date error: {e}")
+        if conn:
+            conn.rollback()
         return 0
     finally:
         if conn:
@@ -2339,7 +2527,8 @@ def get_target_progress(branch_id, target_date, target_amount, created_at=None):
         start_date = f"{start_date_obj.year}/{start_date_obj.month:02d}/{start_date_obj.day:02d}"
     else:
         start_date = shamsi_today
-    collected = get_branch_collection_since_date(branch_id, start_date)
+    # برای محاسبه پیشرفت از تاریخ هدف استفاده می‌کنیم (نه تاریخ ایجاد)
+    collected = get_branch_collection_since_date(branch_id, target_date)
     progress_percent = (collected / target_amount * 100) if target_amount > 0 else 0
     try:
         target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
@@ -2375,6 +2564,8 @@ def get_all_active_targets():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_active_targets error: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -2469,6 +2660,8 @@ def get_actual_stats(branch_id, shamsi_date):
             return None
     except Exception as e:
         logger.error(f"get_actual_stats error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2489,6 +2682,8 @@ def get_actual_stats_for_date(shamsi_date):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_actual_stats_for_date error: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -2524,6 +2719,8 @@ def compare_collection_with_actual(branch_id, shamsi_date):
             }
     except Exception as e:
         logger.error(f"compare_collection_with_actual error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2554,7 +2751,10 @@ def get_adaptive_comparison():
             month_ago_total = cur.fetchone()[0] or 0
             def calc_change(current, previous):
                 if previous == 0:
-                    return 0 if current == 0 else 100
+                    if current == 0:
+                        return 0
+                    else:
+                        return 100  # یا می‌توان از عبارت «رشد نامحدود» استفاده کرد
                 return ((current - previous) / previous) * 100
             result = {
                 'today': today_total,
@@ -2569,6 +2769,8 @@ def get_adaptive_comparison():
             return result
     except Exception as e:
         logger.error(f"get_adaptive_comparison error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2661,6 +2863,8 @@ def get_forecast(branch_id=None, days=7):
             return forecast, trend_analysis
     except Exception as e:
         logger.error(f"get_forecast error: {e}")
+        if conn:
+            conn.rollback()
         return None, {'error': str(e)}
     finally:
         if conn:
@@ -2688,6 +2892,8 @@ def get_forecast_for_all_branches(days=7):
             return results
     except Exception as e:
         logger.error(f"get_forecast_for_all_branches error: {e}")
+        if conn:
+            conn.rollback()
         return {}
     finally:
         if conn:
@@ -2780,6 +2986,8 @@ def generate_branch_chart(branch_id, days=10):
             }
     except Exception as e:
         logger.error(f"generate_branch_chart error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2808,6 +3016,8 @@ def generate_province_chart(days=10):
             }
     except Exception as e:
         logger.error(f"generate_province_chart error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2894,6 +3104,8 @@ def get_analytical_chart_data(chart_type, days=10):
                 return None
     except Exception as e:
         logger.error(f"get_analytical_chart_data error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -2917,6 +3129,8 @@ def get_all_deputies_with_details():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_all_deputies_with_details error: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -3022,6 +3236,8 @@ def get_deputy_by_employee_number(emp_num):
             return cur.fetchone()
     except Exception as e:
         logger.error(f"get_deputy_by_employee_number error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
@@ -3064,13 +3280,15 @@ def get_deputy_match_report(user_id, days=30):
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_deputy_match_report error: {e}")
+        if conn:
+            conn.rollback()
         return None
     finally:
         if conn:
             return_db_connection(conn)
 
 # ============================================================
-# ارسال پیام و عکس
+# ارسال پیام و عکس (رفع double-escaping)
 # ============================================================
 def is_super_admin_user(chat_id):
     user = find_user_by_telegram_id(chat_id)
@@ -3090,7 +3308,8 @@ def send_message(chat_id, text, reply_markup=None, remove_keyboard=False, parse_
     if len(text) > 4000:
         chunks = split_text_safely(text, 4000)
         for chunk in chunks:
-            send_message_chunk(chat_id, chunk, reply_markup, remove_keyboard, parse_mode, escape_user_text)
+            # برای chunks، escape قبلاً انجام شده است، پس دوباره escape نکنیم
+            send_message_chunk(chat_id, chunk, reply_markup, remove_keyboard, parse_mode, False)
         return None
     url = f"{BASE_URL}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
@@ -3116,6 +3335,7 @@ def send_message(chat_id, text, reply_markup=None, remove_keyboard=False, parse_
         return None
 
 def send_message_chunk(chat_id, text, reply_markup=None, remove_keyboard=False, parse_mode="Markdown", escape_user_text=False):
+    # اگر escape_user_text=True باشد، escape را انجام می‌دهیم، در غیر این صورت متن را به همان صورت می‌فرستیم
     if escape_user_text:
         text = escape_markdown(text)
     url = f"{BASE_URL}/sendMessage"
@@ -3341,6 +3561,8 @@ def check_and_auto_score():
                 save_score(col_id, score)
     except Exception as e:
         logger.error(f"check_and_auto_score error: {e}")
+        if conn:
+            conn.rollback()
     finally:
         if conn:
             return_db_connection(conn)
@@ -3370,6 +3592,8 @@ def generate_weekly_report():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"generate_weekly_report: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -3400,6 +3624,8 @@ def generate_monthly_report():
             return cur.fetchall()
     except Exception as e:
         logger.error(f"generate_monthly_report: {e}")
+        if conn:
+            conn.rollback()
         return []
     finally:
         if conn:
@@ -3693,19 +3919,20 @@ def main():
                 if data.get("ok") and data.get("result"):
                     for update in data["result"]:
                         update_id = update["update_id"]
-                        if update_id in processed_set:
-                            continue
-                        processed_set.add(update_id)
-                        processed_updates.append(update_id)
-                        if len(processed_updates) > 2000:
-                            old = processed_updates.popleft()
-                            processed_set.discard(old)
+                        with processed_set_lock:
+                            if update_id in processed_set:
+                                continue
+                            processed_set.add(update_id)
+                            processed_updates.append(update_id)
+                            if len(processed_updates) > 2000:
+                                old = processed_updates.popleft()
+                                processed_set.discard(old)
                         if "message" in update:
                             handle_message(update["message"])
                         offset = update_id + 1
-                        save_offset(offset)
+                        save_offset(offset)  # می‌توان بعداً بهینه‌سازی کرد
                 else:
-                    if data.get("error_code") == 409:
+                    if res.status_code == 409:  # اصلاح: بررسی status code
                         logger.warning("⚠️ Conflict (409) – another instance is running. Resetting offset...")
                         try:
                             res2 = requests_session.get(f"{BASE_URL}/getUpdates", timeout=10)
@@ -3979,7 +4206,7 @@ def handle_message(message):
                 return
             else:
                 data = user_state.get("collection_data", {})
-                note_text = escape_markdown(text) if text else ""
+                note_text = text  # ذخیره متن خام
                 success, collection_id = save_or_update_collection_with_note(
                     branch_id=branch_id,
                     deputy_amount_millions=data.get("deputy_amount", 0),
@@ -3993,7 +4220,7 @@ def handle_message(message):
                     user_states[chat_id]["state"] = "LOGGED_IN"
                 if success:
                     total = data.get("deputy_amount", 0) + data.get("others_amount", 0)
-                    msg = f"✅ ثبت شد.\n💰 جمع کل: {total:,.0f} میلیون ریال\n📝 یادداشت: {note_text}"
+                    msg = f"✅ ثبت شد.\n💰 جمع کل: {total:,.0f} میلیون ریال\n📝 یادداشت: {escape_markdown(text)}"
                     log_user_activity(user_db_id, "collection_add_with_note", f"ثبت وصول با یادداشت برای شعبه {branch_name}")
                 else:
                     msg = "❌ خطا در ثبت اطلاعات."
@@ -4740,12 +4967,13 @@ def handle_message(message):
                 return
 
             if text.startswith("/edit_deputy"):
-                parts = text.split()
-                if len(parts) >= 3:
+                # اصلاح: استفاده از split با حداکثر 3 قسمت
+                parts = text.split(' ', 3)
+                if len(parts) >= 4:  # ['/edit_deputy', user_id, field, value]
                     try:
                         user_id = int(parts[1])
                         field = parts[2]
-                        value = ' '.join(parts[3:]) if len(parts) > 3 else ''
+                        value = parts[3].strip() if len(parts) > 3 else ''
                         if field == 'employee_number':
                             value = normalize_digits(value)
                             existing = get_deputy_by_employee_number(value)
@@ -5767,13 +5995,18 @@ def handle_message(message):
                         diff_abs = item['diff_abs']
                         is_claimed_more = item['is_claimed_more']
 
+                        # فرمول یکدست دقت (مشابه ویوها)
                         if actual < 0:
-                            if claimed == 0 or abs_actual == 0:
+                            if claimed == 0 and abs_actual == 0:
+                                accuracy = 100.0
+                            elif claimed == 0 and abs_actual > 0:
                                 accuracy = 0.0
                             else:
                                 accuracy = (1 - (diff_abs / max(claimed, abs_actual))) * 100
                         else:
-                            if claimed == 0 or actual == 0:
+                            if claimed == 0 and actual == 0:
+                                accuracy = 100.0
+                            elif claimed == 0 or actual == 0:
                                 accuracy = 0.0
                             else:
                                 accuracy = (min(claimed, actual) / max(claimed, actual)) * 100
@@ -5944,9 +6177,14 @@ def handle_message(message):
                             send_message(chat_id, "❌ خطا در حذف تعطیل.", get_super_admin_keyboard())
                     else:
                         send_message(chat_id, "❌ شماره نامعتبر.", get_cancel_keyboard())
+                        # state را ریست می‌کنیم
+                        with user_states_lock:
+                            user_states[chat_id]["state"] = "LOGGED_IN"
                         return
                 except Exception:
                     send_message(chat_id, "❌ لطفاً یک عدد معتبر وارد کنید.", get_cancel_keyboard())
+                    with user_states_lock:
+                        user_states[chat_id]["state"] = "LOGGED_IN"
                     return
                 with user_states_lock:
                     user_states[chat_id]["state"] = "LOGGED_IN"
