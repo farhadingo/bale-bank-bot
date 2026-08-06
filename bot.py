@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۸.۹ کامل (رفع باگ‌ها، پشتیبان‌گیری، بازیابی، نمایش فارسی در نمودارها)
+# bot.py - نسخه ۸.۹.۱ (رفع ImportError RejectedExecutionException)
 # ============================================================
 import os
 import time
@@ -12,7 +12,7 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 import threading
-from concurrent.futures import ThreadPoolExecutor, RejectedExecutionException
+from concurrent.futures import ThreadPoolExecutor  # حذف RejectedExecutionException
 from flask import Flask, jsonify
 import jdatetime
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -111,7 +111,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.9'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.9.1'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -1420,8 +1420,8 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
                         send_instant_notification_async,
                         branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id
                     )
-                except RejectedExecutionException:
-                    logger.warning("Executor rejected task, notification not sent")
+                except Exception as e:
+                    logger.warning(f"Failed to submit notification task: {e}")
             return True, collection_id
     except Exception as e:
         logger.error(f"save_or_update_collection_with_note: {e}")
@@ -3304,7 +3304,6 @@ def update_deputy(user_id, employee_number=None, full_name=None, title=None, bra
         with conn.cursor() as cur:
             updates = []
             params = []
-            # استفاده از whitelist برای امنیت
             if employee_number is not None:
                 updates.append("employee_number = %s")
                 params.append(employee_number)
@@ -4070,7 +4069,7 @@ def generate_and_send_forecast(chat_id, role, is_super_admin):
 # ============================================================
 OFFSET_FILE = "offset.dat"
 _last_offset_save = time_module.time()
-_OFFSET_SAVE_INTERVAL = 10  # هر ۱۰ ثانیه
+_OFFSET_SAVE_INTERVAL = 10
 _offset_pending = False
 _offset_lock = threading.Lock()
 
@@ -4980,7 +4979,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۸.۹ (رفع باگ‌ها، پشتیبان‌گیری)\n"
+                "📅 نسخه: ۸.۹.۱ (رفع ImportError)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_keyboard(role, is_super_admin)
