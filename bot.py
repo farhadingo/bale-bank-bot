@@ -1,3 +1,6 @@
+# ============================================================
+# bot.py - نسخه ۸.۹ کامل (رفع باگ‌ها، پشتیبان‌گیری، بازیابی، نمایش فارسی در نمودارها)
+# ============================================================
 import os
 import time
 import logging
@@ -1325,7 +1328,6 @@ def check_existing_collection(branch_id, shamsi_date):
             """, (branch_id, shamsi_date))
             result = cur.fetchone()
             if result:
-                # تبدیل به دیکشنری برای خوانایی
                 return {
                     'id': result[0],
                     'deputy_amount': result[1],
@@ -1345,12 +1347,9 @@ def check_existing_collection(branch_id, shamsi_date):
 def can_edit_collection(collection_created_at):
     """بررسی اینکه آیا معاون می‌تواند این وصول را ویرایش کند (تا ۱۲ شب همان روز)"""
     now = get_iran_time()
-    # زمان ایجاد به ایران
     created = collection_created_at.astimezone(IRAN_TZ)
-    # اگر روز متفاوت است، اجازه ویرایش ندهید
     if created.date() != now.date():
         return False
-    # اگر ساعت از ۱۲ شب گذشته باشد، اجازه ندهید
     if now.hour > EDIT_DEADLINE_HOUR or (now.hour == EDIT_DEADLINE_HOUR and now.minute > EDIT_DEADLINE_MINUTE):
         return False
     return True
@@ -3043,7 +3042,6 @@ def get_forecast_for_all_branches(days=7):
 def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
     try:
         plt.figure(figsize=figsize)
-        # تبدیل متن‌ها به فارسی خوانا
         title_fa = reshape_persian(title)
         x_label_fa = reshape_persian(x_label)
         y_label_fa = reshape_persian(y_label)
@@ -3324,7 +3322,6 @@ def update_deputy(user_id, employee_number=None, full_name=None, title=None, bra
             updates.append("updated_at = %s")
             params.append(get_iran_time())
             params.append(user_id)
-            # ستون‌ها قبلاً با whitelist تایید شده‌اند
             query = f"UPDATE users SET {', '.join(updates)} WHERE id = %s AND role = 'deputy'"
             cur.execute(query, params)
             conn.commit()
@@ -4081,7 +4078,6 @@ def save_offset(offset):
     global _offset_pending
     with _offset_lock:
         _offset_pending = True
-        # ذخیره واقعی در تابع جداگانه با تأخیر
     if time_module.time() - _last_offset_save > _OFFSET_SAVE_INTERVAL:
         _flush_offset(offset)
 
@@ -4181,7 +4177,6 @@ def main():
                         if "message" in update:
                             handle_message(update["message"])
                         offset = update_id + 1
-                        # ذخیره offset در فواصل زمانی
                         if time_module.time() - last_offset_save_time > _OFFSET_SAVE_INTERVAL:
                             _flush_offset(offset)
                             last_offset_save_time = time_module.time()
@@ -4320,7 +4315,6 @@ def handle_message(message):
 
         # ===== State: WAITING_FOR_SUPER_ADMIN_PASSWORD =====
         if current_state == "WAITING_FOR_SUPER_ADMIN_PASSWORD":
-            # بررسی هش شده
             if hashlib.sha256(text.encode()).hexdigest() == PASSWORD_HASH:
                 temp_data = user_state.get("temp_user_data")
                 if temp_data:
@@ -5683,7 +5677,6 @@ def handle_message(message):
                 try:
                     backup_data = generate_backup_file()
                     if backup_data:
-                        # ارسال فایل به عنوان عکس (با پسوند .bin)
                         files = {'photo': ('backup.bin', backup_data, 'application/octet-stream')}
                         url = f"{BASE_URL}/sendPhoto"
                         data = {'chat_id': chat_id, 'caption': '📦 فایل پشتیبان از تمام داده‌ها'}
@@ -5709,18 +5702,14 @@ def handle_message(message):
                     user_states.update(chat_id, {"state": "LOGGED_IN"})
                     send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
                     return
-                # بازیابی از فایل ارسالی (فقط عکس/سند پشتیبانی می‌شود)
                 if message.get('document') or message.get('photo'):
-                    # دریافت فایل از Bale API
                     file_id = None
                     if message.get('document'):
                         file_id = message['document']['file_id']
                     elif message.get('photo'):
-                        # آخرین عکس با بالاترین کیفیت
                         file_id = message['photo'][-1]['file_id']
                     if file_id:
                         try:
-                            # دریافت لینک فایل
                             file_url_res = requests_session.get(f"{BASE_URL}/getFile", params={"file_id": file_id})
                             if file_url_res.status_code == 200 and file_url_res.json().get('ok'):
                                 file_path = file_url_res.json().get('result', {}).get('file_path')
@@ -6450,9 +6439,8 @@ def handle_message(message):
                     return
                 existing = check_existing_collection(branch_id, shamsi_today)
                 if existing:
-                    # بررسی محدودیت ویرایش تا ۱۲ شب
                     if can_edit_collection(existing['created_at']):
-                        with user_states.update(chat_id, {"state": "WAITING_FOR_EDIT_CONFIRMATION"})
+                        user_states.update(chat_id, {"state": "WAITING_FOR_EDIT_CONFIRMATION"})
                         confirm_keyboard = {
                             "keyboard": [[{"text": "📝 بله، ویرایش شود"}, {"text": "❌ خیر، لغو شود"}]],
                             "resize_keyboard": True
