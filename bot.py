@@ -84,7 +84,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.7'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.8'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -782,9 +782,11 @@ def calculate_score(collection_time, deputy_amount, others_amount, branch_id, sh
     total_amount = deputy_amount + others_amount
     score = 0
     hour = collection_time.astimezone(IRAN_TZ).hour
+    minute = collection_time.astimezone(IRAN_TZ).minute
+    # زمان‌بندی امتیاز (اختیاری) – بدون تغییر در منطق تاخیر
     if hour < 12:
         score += 3
-    elif hour < 15:
+    elif hour < 15:  # همچنان بر اساس ساعت ۱۵ برای امتیازدهی (اختیاری)
         score += 2
     else:
         score += 1
@@ -1776,6 +1778,9 @@ def get_all_collections(limit=100):
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# توابع ویرایش/حذف/ریست
+# ============================================================
 def delete_collection(collection_id):
     conn = None
     try:
@@ -2032,6 +2037,9 @@ def get_branch_trend(branch_id, days=3):
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# تابع جدید: گزارش عملکرد معاونان با درنظرگرفتن مهلت ۱۶:۳۰
+# ============================================================
 def get_deputy_performance_report(user_id, days=30):
     conn = None
     try:
@@ -2041,7 +2049,10 @@ def get_deputy_performance_report(user_id, days=30):
             cur.execute("""
                 SELECT
                     COUNT(*) as total_days,
-                    SUM(CASE WHEN created_at::time < '16:15:00' THEN 1 ELSE 0 END) as on_time_days,
+                    SUM(CASE WHEN (EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Tehran') < 16)
+                              OR (EXTRACT(HOUR FROM created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                  AND EXTRACT(MINUTE FROM created_at AT TIME ZONE 'Asia/Tehran') < 30)
+                              THEN 1 ELSE 0 END) as on_time_days,
                     AVG(total_amount) as avg_amount,
                     MAX(total_amount) as best_day
                 FROM collections
@@ -2382,6 +2393,9 @@ def get_branch_performance_vs_avg(branch_id, days=30):
         if conn:
             return_db_connection(conn)
 
+# ============================================================
+# به‌روزرسانی تابع تحلیل تاخیر با مهلت ۱۶:۳۰
+# ============================================================
 def get_deputy_late_analysis(days=30):
     conn = None
     try:
@@ -2393,8 +2407,14 @@ def get_deputy_late_analysis(days=30):
                     u.full_name,
                     b.name as branch_name,
                     COUNT(c.id) as total_days,
-                    SUM(CASE WHEN created_at::time >= '16:15:00' THEN 1 ELSE 0 END) as late_days,
-                    ROUND(100.0 * SUM(CASE WHEN created_at::time >= '16:15:00' THEN 1 ELSE 0 END) / NULLIF(COUNT(c.id), 0), 1) as late_percent
+                    SUM(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') > 16)
+                              OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                  AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') >= 30)
+                              THEN 1 ELSE 0 END) as late_days,
+                    ROUND(100.0 * SUM(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') > 16)
+                                          OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                              AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') >= 30)
+                                          THEN 1 ELSE 0 END) / NULLIF(COUNT(c.id), 0), 1) as late_percent
                 FROM users u
                 JOIN branches b ON u.branch_id = b.id
                 LEFT JOIN collections c ON u.id = c.recorded_by AND c.shamsi_date >= %s
@@ -3272,6 +3292,70 @@ def get_deputy_match_report(user_id, days=30):
             return_db_connection(conn)
 
 # ============================================================
+# توابع جدید برای گزارش‌های سوپرادمین (بازه زمانی و روند هفتگی)
+# ============================================================
+def get_range_report(start_date, end_date):
+    """خلاصه عملکرد هر شعبه در بازه زمانی مشخص"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    b.id,
+                    b.name,
+                    COALESCE(SUM(c.total_amount), 0) as total,
+                    COALESCE(AVG(c.total_amount), 0) as avg,
+                    COUNT(c.id) as report_days,
+                    COALESCE(SUM(c.deputy_amount), 0) as deputy_total,
+                    COALESCE(SUM(c.others_amount), 0) as others_total
+                FROM branches b
+                LEFT JOIN collections c ON b.id = c.branch_id
+                    AND c.shamsi_date >= %s AND c.shamsi_date <= %s
+                GROUP BY b.id, b.name
+                ORDER BY total DESC
+            """, (start_date, end_date))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_range_report error: {e}")
+        if conn:
+            conn.rollback()
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_weekly_trend():
+    """روند هفتگی هر شعبه در ۴ هفته اخیر"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    b.id,
+                    b.name,
+                    COALESCE(SUM(CASE WHEN EXTRACT(WEEK FROM c.created_at AT TIME ZONE 'Asia/Tehran') = EXTRACT(WEEK FROM CURRENT_DATE AT TIME ZONE 'Asia/Tehran') THEN c.total_amount ELSE 0 END), 0) as this_week,
+                    COALESCE(SUM(CASE WHEN EXTRACT(WEEK FROM c.created_at AT TIME ZONE 'Asia/Tehran') = EXTRACT(WEEK FROM CURRENT_DATE AT TIME ZONE 'Asia/Tehran') - 1 THEN c.total_amount ELSE 0 END), 0) as last_week,
+                    COALESCE(SUM(CASE WHEN EXTRACT(WEEK FROM c.created_at AT TIME ZONE 'Asia/Tehran') = EXTRACT(WEEK FROM CURRENT_DATE AT TIME ZONE 'Asia/Tehran') - 2 THEN c.total_amount ELSE 0 END), 0) as two_weeks_ago,
+                    COALESCE(SUM(CASE WHEN EXTRACT(WEEK FROM c.created_at AT TIME ZONE 'Asia/Tehran') = EXTRACT(WEEK FROM CURRENT_DATE AT TIME ZONE 'Asia/Tehran') - 3 THEN c.total_amount ELSE 0 END), 0) as three_weeks_ago
+                FROM branches b
+                LEFT JOIN collections c ON b.id = c.branch_id
+                WHERE c.shamsi_date >= %s
+                GROUP BY b.id, b.name
+                ORDER BY this_week DESC
+            """, (get_shamsi_date(-28),))
+            return cur.fetchall()
+    except Exception as e:
+        logger.error(f"get_weekly_trend error: {e}")
+        if conn:
+            conn.rollback()
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
 # ارسال پیام و عکس
 # ============================================================
 def is_super_admin_user(chat_id):
@@ -3430,9 +3514,7 @@ def get_super_admin_keyboard():
             [{"text": "⏰ تحلیل تاخیر معاونان"}],
             [{"text": "🎯 مدیریت اهداف وصولی"}, {"text": "📊 گزارش پیشرفت اهداف"}],
             [{"text": "🏆 رتبه‌بندی تحقق هدف"}],
-            # گزارش‌های جدید برای سوپرادمین
-            [{"text": "📊 مقایسه هفتگی"}, {"text": "📊 جزئیات ماهانه"}],
-            [{"text": "📊 شعب کم‌فعال"}],
+            [{"text": "📊 گزارش بازه زمانی"}, {"text": "📊 تحلیل روند هفتگی"}]
         ],
         "resize_keyboard": True
     }
@@ -3441,10 +3523,10 @@ def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
 
 # ============================================================
-# توابع ارسال خودکار
+# توابع ارسال خودکار (با تغییر زمان یادآوری به ۱۶:۰۰)
 # ============================================================
 def send_reminder_to_deputy(chat_id, branch_name):
-    msg = f"⏰ یادآوری: شما تا ساعت ۱۶:۱۵ امروز گزارش وصول شعبه {branch_name} را ثبت نکرده‌اید. لطفاً هرچه سریعتر اقدام فرمایید."
+    msg = f"⏰ یادآوری: شما تا ساعت ۱۶:۳۰ امروز گزارش وصول شعبه {branch_name} را ثبت نکرده‌اید. لطفاً هرچه سریعتر اقدام فرمایید."
     send_message(chat_id, msg)
 
 def send_reminder_to_admin(chat_id, unreported_list):
@@ -3566,9 +3648,15 @@ def generate_weekly_report():
                     COUNT(c.id) as report_count,
                     COALESCE(SUM(c.total_amount), 0) as total_amount,
                     COALESCE(AVG(c.total_amount), 0) as avg_amount,
-                    COALESCE(COUNT(CASE WHEN created_at::time < '12:00:00' THEN 1 END), 0) as early_count,
-                    COALESCE(COUNT(CASE WHEN created_at::time >= '12:00:00' AND created_at::time < '16:15:00' THEN 1 END), 0) as on_time_count,
-                    COALESCE(COUNT(CASE WHEN created_at::time >= '16:15:00' THEN 1 END), 0) as late_count
+                    COALESCE(COUNT(CASE WHEN EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') < 12 THEN 1 END), 0) as early_count,
+                    COALESCE(COUNT(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') < 16)
+                                          OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                              AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') < 30)
+                                          THEN 1 END), 0) as on_time_count,
+                    COALESCE(COUNT(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') > 16)
+                                          OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                              AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') >= 30)
+                                          THEN 1 END), 0) as late_count
                 FROM branches b
                 LEFT JOIN collections c ON b.id = c.branch_id AND c.shamsi_date >= %s AND c.shamsi_date <= %s
                 GROUP BY b.id, b.name
@@ -3598,9 +3686,15 @@ def generate_monthly_report():
                     COUNT(c.id) as report_count,
                     COALESCE(SUM(c.total_amount), 0) as total_amount,
                     COALESCE(AVG(c.total_amount), 0) as avg_amount,
-                    COALESCE(COUNT(CASE WHEN created_at::time < '12:00:00' THEN 1 END), 0) as early_count,
-                    COALESCE(COUNT(CASE WHEN created_at::time >= '12:00:00' AND created_at::time < '16:15:00' THEN 1 END), 0) as on_time_count,
-                    COALESCE(COUNT(CASE WHEN created_at::time >= '16:15:00' THEN 1 END), 0) as late_count
+                    COALESCE(COUNT(CASE WHEN EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') < 12 THEN 1 END), 0) as early_count,
+                    COALESCE(COUNT(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') < 16)
+                                          OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                              AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') < 30)
+                                          THEN 1 END), 0) as on_time_count,
+                    COALESCE(COUNT(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') > 16)
+                                          OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
+                                              AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') >= 30)
+                                          THEN 1 END), 0) as late_count
                 FROM branches b
                 LEFT JOIN collections c ON b.id = c.branch_id AND c.shamsi_date >= %s AND c.shamsi_date <= %s
                 GROUP BY b.id, b.name
@@ -3645,7 +3739,7 @@ def send_weekly_report_to_all():
         msg += f"   📊 تعداد گزارش: {count}\n"
         msg += f"   💰 کل وصول: {total//1_000_000:,.0f} میلیون ریال\n"
         msg += f"   📈 میانگین: {avg//1_000_000:,.0f} میلیون ریال\n"
-        msg += f"   ⏰ ثبت به‌موقع: {early} (قبل ۱۲) / {on_time} (۱۲-۱۶:۱۵) / دیر: {late}\n\n"
+        msg += f"   ⏰ ثبت به‌موقع: {early} (قبل ۱۲) / {on_time} (۱۲-۱۶:۳۰) / دیر: {late}\n\n"
     msg += f"━━━━━━━━━━━━━━━━━━\n"
     msg += f"💰 جمع کل وصول استان: {total_all//1_000_000:,.0f} میلیون ریال"
     for user in users:
@@ -3684,97 +3778,13 @@ def send_monthly_report_to_all():
         msg += f"   📊 تعداد گزارش: {count}\n"
         msg += f"   💰 کل وصول: {total//1_000_000:,.0f} میلیون ریال\n"
         msg += f"   📈 میانگین: {avg//1_000_000:,.0f} میلیون ریال\n"
-        msg += f"   ⏰ ثبت به‌موقع: {early} (قبل ۱۲) / {on_time} (۱۲-۱۶:۱۵) / دیر: {late}\n\n"
+        msg += f"   ⏰ ثبت به‌موقع: {early} (قبل ۱۲) / {on_time} (۱۲-۱۶:۳۰) / دیر: {late}\n\n"
     msg += f"━━━━━━━━━━━━━━━━━━\n"
     msg += f"💰 جمع کل وصول استان: {total_all//1_000_000:,.0f} میلیون ریال"
     for user in users:
         chat_id = user[0]
         if chat_id:
             send_message(chat_id, msg)
-
-# ============================================================
-# گزارش‌های جدید برای سوپرادمین
-# ============================================================
-def get_weekly_comparison_report():
-    """مقایسه وصول هفته جاری با هفته قبل"""
-    shamsi_today = get_shamsi_date()
-    shamsi_week_ago = get_shamsi_date(-7)
-    shamsi_two_weeks_ago = get_shamsi_date(-14)
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date >= %s AND shamsi_date <= %s", (shamsi_two_weeks_ago, shamsi_week_ago - timedelta(days=1)))
-            last_week_total = cur.fetchone()[0] or 0
-            cur.execute("SELECT SUM(total_amount) FROM collections WHERE shamsi_date >= %s AND shamsi_date <= %s", (shamsi_week_ago, shamsi_today))
-            this_week_total = cur.fetchone()[0] or 0
-            change = ((this_week_total - last_week_total) / last_week_total * 100) if last_week_total > 0 else 0
-            return {
-                'last_week': last_week_total,
-                'this_week': this_week_total,
-                'change': change
-            }
-    except Exception as e:
-        logger.error(f"get_weekly_comparison_report error: {e}")
-        if conn:
-            conn.rollback()
-        return None
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_monthly_detailed_report():
-    """گزارش جزئیات ماهانه: میانگین روزانه، کل، تعداد روزهای ثبت"""
-    shamsi_month_start, shamsi_month_end = get_shamsi_month_range()
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    b.name,
-                    COUNT(c.id) as days,
-                    COALESCE(SUM(c.total_amount), 0) as total,
-                    COALESCE(AVG(c.total_amount), 0) as avg_daily
-                FROM branches b
-                LEFT JOIN collections c ON b.id = c.branch_id AND c.shamsi_date >= %s AND c.shamsi_date <= %s
-                GROUP BY b.id, b.name
-                ORDER BY total DESC
-            """, (shamsi_month_start, shamsi_month_end))
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_monthly_detailed_report error: {e}")
-        if conn:
-            conn.rollback()
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
-
-def get_inactive_branches_report(days=30):
-    """شعبه‌هایی که در روزهای اخیر فعالیت کمی داشته‌اند"""
-    shamsi_start = get_shamsi_date(-days)
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT b.name, COUNT(c.id) as report_count
-                FROM branches b
-                LEFT JOIN collections c ON b.id = c.branch_id AND c.shamsi_date >= %s
-                GROUP BY b.id, b.name
-                HAVING COUNT(c.id) <= 2
-                ORDER BY report_count ASC
-            """, (shamsi_start,))
-            return cur.fetchall()
-    except Exception as e:
-        logger.error(f"get_inactive_branches_report error: {e}")
-        if conn:
-            conn.rollback()
-        return []
-    finally:
-        if conn:
-            return_db_connection(conn)
 
 # ============================================================
 # توابع کمکی برای Threading
@@ -3924,13 +3934,13 @@ def load_offset():
     return 0
 
 # ============================================================
-# Scheduler
+# Scheduler (با تغییر زمان یادآوری به ۱۶:۰۰)
 # ============================================================
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone='Asia/Tehran')
     scheduler.add_job(
         check_and_send_reminders,
-        CronTrigger(hour=16, minute=0),  # تغییر ساعت یادآوری به ۱۶:۰۰
+        CronTrigger(hour=16, minute=0),
         id='reminder_job',
         replace_existing=True
     )
@@ -4037,7 +4047,7 @@ def main():
             time.sleep(5)
 
 # ============================================================
-# تابع handle_message (بخش اصلی پردازش پیام)
+# تابع handle_message (با اضافه شدن گزارش‌های جدید)
 # ============================================================
 def handle_message(message):
     try:
@@ -4069,7 +4079,7 @@ def handle_message(message):
             user_state = user_states.get(chat_id, {"state": "LOGGED_OUT"})
         current_state = user_state.get("state", "LOGGED_OUT")
 
-        # ===== State: LOGGED_OUT / WAITING_FOR_EMP_NUM =====
+        # ===== LOGGED_OUT / WAITING_FOR_EMP_NUM =====
         if current_state == "LOGGED_OUT" or current_state == "WAITING_FOR_EMP_NUM":
             if current_state != "WAITING_FOR_EMP_NUM":
                 with user_states_lock:
@@ -4135,7 +4145,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ شماره کارمندی در سیستم یافت نشد.\nلطفاً شماره کارمندی صحیح خود را بفرستید.")
             return
 
-        # ===== State: WAITING_FOR_SUPER_ADMIN_PASSWORD =====
+        # ===== WAITING_FOR_SUPER_ADMIN_PASSWORD =====
         if current_state == "WAITING_FOR_SUPER_ADMIN_PASSWORD":
             if text == SUPER_ADMIN_PASSWORD:
                 temp_data = user_state.get("temp_user_data")
@@ -4194,7 +4204,7 @@ def handle_message(message):
         user_db_id = user_data["db_id"]
         is_super_admin = user_data.get("is_super_admin", False)
 
-        # ===== State: WAITING_FOR_DEPUTY_AMOUNT =====
+        # ===== WAITING_FOR_DEPUTY_AMOUNT =====
         if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4217,7 +4227,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت (میلیون ریال) وارد کنید.\nمثال: ۴۷۰۰ برای ۴.۷ میلیارد ریال")
             return
 
-        # ===== State: WAITING_FOR_OTHERS_AMOUNT =====
+        # ===== WAITING_FOR_OTHERS_AMOUNT =====
         if current_state == "WAITING_FOR_OTHERS_AMOUNT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4247,7 +4257,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ خطا: لطفاً مبلغ را به صورت عدد مثبت (میلیون ریال) وارد کنید.")
             return
 
-        # ===== State: WAITING_FOR_NOTE =====
+        # ===== WAITING_FOR_NOTE =====
         if current_state == "WAITING_FOR_NOTE":
             if text == "🔙 انصراف":
                 data = user_state.get("collection_data", {})
@@ -4299,7 +4309,7 @@ def handle_message(message):
                 send_message(chat_id, msg, keyboard)
                 return
 
-        # ===== State: WAITING_FOR_EDIT_CONFIRMATION =====
+        # ===== WAITING_FOR_EDIT_CONFIRMATION =====
         if current_state == "WAITING_FOR_EDIT_CONFIRMATION":
             if text == "📝 بله، ویرایش شود":
                 with user_states_lock:
@@ -4315,7 +4325,7 @@ def handle_message(message):
                 send_message(chat_id, "❌ عملیات لغو شد.\n\nبه منوی اصلی بازگشتید.", keyboard)
             return
 
-        # ===== State: WAITING_FOR_BRANCH_DATE (معاون) =====
+        # ===== WAITING_FOR_BRANCH_DATE (معاون) =====
         if role == 'deputy' and current_state == "WAITING_FOR_BRANCH_DATE":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4352,7 +4362,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== State: WAITING_FOR_ADMIN_DATE (ادمین/سوپرادمین) =====
+        # ===== WAITING_FOR_ADMIN_DATE (ادمین/سوپرادمین) =====
         if (role == 'admin' or is_super_admin) and current_state == "WAITING_FOR_ADMIN_DATE":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4388,7 +4398,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== State: WAITING_FOR_PROBLEM =====
+        # ===== WAITING_FOR_PROBLEM =====
         if current_state == "WAITING_FOR_PROBLEM":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4408,7 +4418,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== State: WAITING_FOR_NOTE_FOR_COLLECTION (معاون) =====
+        # ===== WAITING_FOR_NOTE_FOR_COLLECTION (معاون) =====
         if current_state == "WAITING_FOR_NOTE_FOR_COLLECTION" and role == 'deputy':
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4448,7 +4458,7 @@ def handle_message(message):
                 user_states[chat_id]["state"] = "LOGGED_IN"
             return
 
-        # ===== State: WAITING_FOR_MESSAGE_RECIPIENT (سوپرادمین) =====
+        # ===== WAITING_FOR_MESSAGE_RECIPIENT (سوپرادمین) =====
         if current_state == "WAITING_FOR_MESSAGE_RECIPIENT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4495,7 +4505,7 @@ def handle_message(message):
             send_message(chat_id, f"📨 مخاطبین انتخاب شدند:\n{recipient_names}\n\n✏️ حالا متن پیام خود را بنویسید:", get_cancel_keyboard())
             return
 
-        # ===== State: WAITING_FOR_MESSAGE_TEXT (سوپرادمین) =====
+        # ===== WAITING_FOR_MESSAGE_TEXT (سوپرادمین) =====
         if current_state == "WAITING_FOR_MESSAGE_TEXT":
             if text == "🔙 انصراف":
                 with user_states_lock:
@@ -4758,168 +4768,32 @@ def handle_message(message):
                 return
 
             # ===== گزارش‌های جدید سوپرادمین =====
-            if text == "📊 مقایسه هفتگی":
-                report = get_weekly_comparison_report()
-                if report:
-                    last = report['last_week']
-                    this = report['this_week']
-                    change = report['change']
-                    msg = f"📊 **مقایسه وصول هفتگی**\n━━━━━━━━━━━━━━━━━━\n\n"
-                    msg += f"📅 هفته گذشته: {last//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"📅 هفته جاری: {this//1_000_000:,.0f} میلیون ریال\n"
-                    msg += f"📊 تغییر: {change:+.1f}%"
-                    if change > 0:
-                        msg += " 📈"
-                    elif change < 0:
-                        msg += " 📉"
-                    else:
-                        msg += " ➡️"
-                    send_message(chat_id, msg, get_super_admin_keyboard())
-                else:
-                    send_message(chat_id, "📊 داده‌های کافی برای مقایسه هفتگی وجود ندارد.", get_super_admin_keyboard())
+            if text == "📊 گزارش بازه زمانی":
+                with user_states_lock:
+                    user_states[chat_id]["state"] = "WAITING_FOR_REPORT_START_DATE"
+                send_message(chat_id, "📅 لطفاً **تاریخ شروع** را به فرمت YYYY/MM/DD وارد کنید:", get_cancel_keyboard())
                 return
 
-            if text == "📊 جزئیات ماهانه":
-                report = get_monthly_detailed_report()
-                if report:
-                    msg = f"📊 **گزارش جزئیات ماهانه**\n"
-                    msg += f"📅 بازه: {get_shamsi_date_formatted(get_shamsi_month_range()[0])} تا {get_shamsi_date_formatted(get_shamsi_month_range()[1])}\n"
-                    msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-                    total_all = 0
-                    for row in report:
-                        name, days, total, avg = row
-                        total_all += total
-                        msg += f"🏢 {name}\n"
-                        msg += f"   📅 تعداد روزهای ثبت: {days}\n"
-                        msg += f"   💰 کل وصول: {total//1_000_000:,.0f} میلیون ریال\n"
-                        msg += f"   📈 میانگین روزانه: {avg//1_000_000:,.0f} میلیون ریال\n\n"
-                    msg += f"━━━━━━━━━━━━━━━━━━\n"
-                    msg += f"💰 جمع کل استان: {total_all//1_000_000:,.0f} میلیون ریال"
-                    send_message(chat_id, msg, get_super_admin_keyboard())
-                else:
-                    send_message(chat_id, "📭 داده‌ای برای ماه جاری یافت نشد.", get_super_admin_keyboard())
+            if text == "📊 تحلیل روند هفتگی":
+                trend_data = get_weekly_trend()
+                if not trend_data:
+                    send_message(chat_id, "📭 داده‌های کافی برای تحلیل روند هفتگی وجود ندارد.", get_super_admin_keyboard())
+                    return
+                msg = "📊 **تحلیل روند هفتگی شعب (۴ هفته اخیر)**\n━━━━━━━━━━━━━━━━━━\n\n"
+                for idx, row in enumerate(trend_data, 1):
+                    branch_id, name, this_w, last_w, two_w, three_w = row
+                    growth = ((this_w - last_w) / last_w * 100) if last_w > 0 else 0
+                    arrow = "📈" if growth > 5 else "📉" if growth < -5 else "➡️"
+                    msg += f"{idx}. 🏢 {name}\n"
+                    msg += f"   هفته جاری: {this_w//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   هفته قبل: {last_w//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   دو هفته قبل: {two_w//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   سه هفته قبل: {three_w//1_000_000:,.0f} میلیون ریال\n"
+                    msg += f"   رشد هفته‌به‌هفته: {growth:+.1f}% {arrow}\n\n"
+                send_message(chat_id, msg, get_super_admin_keyboard())
                 return
 
-            if text == "📊 شعب کم‌فعال":
-                inactive = get_inactive_branches_report(30)
-                if inactive:
-                    msg = "📊 **شعب کم‌فعال (۳۰ روز اخیر)**\n━━━━━━━━━━━━━━━━━━\n\n"
-                    for name, count in inactive:
-                        msg += f"🏢 {name}: {count} روز ثبت\n"
-                    send_message(chat_id, msg, get_super_admin_keyboard())
-                else:
-                    send_message(chat_id, "✅ همه شعب فعال هستند (حداقل ۳ روز ثبت داشته‌اند).", get_super_admin_keyboard())
-                return
-
-        # ===== دکمه‌های عمومی =====
-        if text == "🔙 خروج":
-            log_user_activity(user_db_id, "logout", "خروج از سیستم")
-            with user_states_lock:
-                user_states[chat_id] = {"state": "LOGGED_OUT"}
-            send_message(chat_id, "👋 شما از سیستم خارج شدید.\n\nبرای ورود مجدد، شماره کارمندی خود را ارسال کنید.", remove_keyboard=True)
-            return
-
-        if text == "❓ راهنما":
-            help_text = (
-                "📌 **راهنمای ربات وصول مطالبات**\n\n"
-                "🔹 **معاونین شعب:**\n"
-                "   • ثبت وصولی روزانه (با قابلیت ویرایش و یادداشت)\n"
-                "   • مشاهده گزارش ۱۰ روز اخیر شعبه\n"
-                "   • مقایسه عملکرد روزانه شعبه\n"
-                "   • مشاهده ثبت امروز\n"
-                "   • گزارش یک تاریخ خاص برای شعبه خود\n"
-                "   • مشاهده تاریخچه کامل شعبه\n"
-                "   • ثبت و مشاهده یادداشت‌ها\n"
-                "   • ثبت مشکل\n"
-                "   • درباره توسعه‌دهنده\n\n"
-                "🔹 **کاربران ارشد (ادمین):**\n"
-                "   • گزارش امروز (همه شعب)\n"
-                "   • گزارش ۱۰ روز اخیر استان\n"
-                "   • رتبه‌بندی شعب برتر\n"
-                "   • آمار مفصل امروز\n"
-                "   • مقایسه روزانه ۷ روز اخیر\n"
-                "   • تحلیل مدیریتی (تحلیل هوشمند داده‌ها)\n"
-                "   • گزارش تاریخ خاص برای کل استان\n"
-                "   • نمایش بهترین/بدترین روزهای استان\n"
-                "   • گزارش روند هر شعبه\n"
-                "   • گزارش عملکرد معاونان\n"
-                "   • گزارش عملکرد همکاران (مجموع کل دوره)\n"
-                "   • گزارش تطبیقی (مقایسه با دوره قبل)\n"
-                "   • پیش‌بینی عملکرد (تحلیل روند هوشمند)\n"
-                "   • نمودارهای تصویری (استان و شعبه)\n"
-                "   • نمودارهای تحلیلی متنوع\n"
-                "   • مقایسه انطباق با آمار واقعی (گزارش متنی دقیق)\n"
-                "   • مشاهده یادداشت‌ها\n"
-                "   • ثبت مشکل\n"
-                "   • درباره توسعه‌دهنده\n\n"
-                "🔹 **سوپرادمین:**\n"
-                "   • مدیریت کاربران و گزارش‌ها\n"
-                "   • مدیریت معاونین (افزودن، ویرایش، حذف)\n"
-                "   • فعال/غیرفعال کردن ربات\n"
-                "   • کنترل اعمال خودکار\n"
-                "   • ریست کردن گزارش‌ها\n"
-                "   • ارسال پیام به معاونین\n"
-                "   • مدیریت تعطیلات\n"
-                "   • مشاهده لاگ کامل فعالیت‌ها\n"
-                "   • مدیریت مشکلات ثبت شده\n"
-                "   • ارسال گزارش هفتگی و ماهانه\n"
-                "   • فعال/غیرفعال کردن قابلیت‌ها\n"
-                "   • ثبت آمار واقعی وصول (هر شعبه یک عدد)\n"
-                "   • مشاهده نمودارهای تحلیلی و انطباق\n"
-                "   • **مدیریت اهداف وصولی:**\n"
-                "      - تعیین هدف برای هر شعبه (مبلغ و تاریخ)\n"
-                "      - مشاهده اهداف فعال\n"
-                "      - گزارش پیشرفت اهداف\n"
-                "      - رتبه‌بندی تحقق هدف\n"
-                "   • **گزارش‌های پیشرفته:**\n"
-                "      - رتبه‌بندی معاونان بر اساس دقت خوداظهاری\n"
-                "      - روند دقت یک شعبه در بازه زمانی\n"
-                "      - بهترین/بدترین دقت در یک روز مشخص\n"
-                "      - مقایسه عملکرد شعبه با میانگین استان\n"
-                "      - تحلیل تاخیر در ثبت وصول معاونان\n"
-                "   • **گزارش‌های جدید:**\n"
-                "      - مقایسه هفتگی (هفته جاری vs قبلی)\n"
-                "      - جزئیات ماهانه (به تفکیک شعبه)\n"
-                "      - شعب کم‌فعال\n\n"
-                "💰 **واحد پول:** تمام مبالغ به **میلیون ریال** است.\n"
-                "🔸 در هر مرحله می‌توانید با دکمه «انصراف» به منو برگردید.\n"
-                "🔸 برای خروج کامل، گزینه «خروج» را انتخاب کنید."
-            )
-            keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
-            if is_super_admin:
-                keyboard = get_super_admin_keyboard()
-            send_message(chat_id, help_text, keyboard)
-            return
-
-        # ===== بقیه منوها =====
-        if text == "ℹ️ درباره توسعه‌دهنده":
-            about_msg = (
-                "🤖 **ربات وصول مطالبات استان زنجان**\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                "این ربات توسط **سید فرهاد سید حسینی**\n"
-                "کارشناس حقوقی مدیریت شعب استان زنجان\n\n"
-                "با حمایت‌های **آقای هادی بیگدلی**\n"
-                "معاونت محترم وقت اعتباری منطقه\n\n"
-                "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۸.۷ (رفع باگ‌ها و بهینه‌سازی)\n"
-                "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
-            )
-            keyboard = get_admin_keyboard() if role == 'admin' else get_deputy_keyboard()
-            if is_super_admin:
-                keyboard = get_super_admin_keyboard()
-            send_message(chat_id, about_msg, keyboard)
-            return
-
-        if text == "📝 ثبت مشکل":
-            with user_states_lock:
-                user_states[chat_id]["state"] = "WAITING_FOR_PROBLEM"
-            send_message(chat_id, "📝 لطفاً مشکل یا پیشنهاد خود را به صورت کامل بنویسید:\n\n(مثال: در ثبت وصول امروز خطایی رخ داد...)", get_cancel_keyboard())
-            return
-
-        # ============================================================
-        # بخش سوپرادمین
-        # ============================================================
-        if is_super_admin:
+            # ===== ادامه منوی سوپرادمین (بقیه گزینه‌ها) =====
             if text == "🔧 کنترل خودکار":
                 reminder_status = "فعال ✅" if get_auto_reminder_status() else "غیرفعال ❌"
                 report_status = "فعال ✅" if get_auto_report_status() else "غیرفعال ❌"
@@ -5444,7 +5318,7 @@ def handle_message(message):
                 send_message(chat_id, "📅 لطفاً **تاریخ** مورد نظر برای ثبت آمار واقعی را به فرمت YYYY/MM/DD وارد کنید:\n\n(مثلاً 1403/01/15)", get_cancel_keyboard())
                 return
 
-            # ===== گزارش‌های جدید سوپرادمین =====
+            # ===== گزارش‌های جدید سوپرادمین (ادامه) =====
             if text == "🏅 رتبه‌بندی دقت معاونان":
                 ranking = get_deputy_accuracy_ranking(30)
                 if not ranking:
@@ -5794,7 +5668,7 @@ def handle_message(message):
                 return
 
             # ============================================================
-            # گزارش امروز (اصلاح‌شده با نمایش هدف و N+1 رفع شده)
+            # گزارش امروز (با نمایش هدف)
             # ============================================================
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
@@ -6121,7 +5995,6 @@ def handle_message(message):
                         diff_abs = item['diff_abs']
                         is_claimed_more = item['is_claimed_more']
 
-                        # فرمول یکدست دقت (مشابه ویوها)
                         if actual < 0:
                             if claimed == 0 and abs_actual == 0:
                                 accuracy = 100.0
@@ -6324,6 +6197,77 @@ def handle_message(message):
                         send_message(chat_id, "❌ خطا در ریست گزارش‌ها.", get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "❌ عملیات ریست لغو شد.", get_super_admin_keyboard())
+                with user_states_lock:
+                    user_states[chat_id]["state"] = "LOGGED_IN"
+                return
+
+            # ===== گزارش بازه زمانی (State) =====
+            if current_state == "WAITING_FOR_REPORT_START_DATE" and is_super_admin:
+                if text == "🔙 انصراف":
+                    with user_states_lock:
+                        user_states[chat_id]["state"] = "LOGGED_IN"
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                start_date = normalize_digits(text)
+                if validate_shamsi_date(start_date):
+                    with user_states_lock:
+                        user_states[chat_id]["report_start_date"] = start_date
+                        user_states[chat_id]["state"] = "WAITING_FOR_REPORT_END_DATE"
+                    send_message(chat_id, "📅 لطفاً **تاریخ پایان** را به فرمت YYYY/MM/DD وارد کنید:", get_cancel_keyboard())
+                else:
+                    send_message(chat_id, "❌ فرمت تاریخ شروع نامعتبر. لطفاً به صورت YYYY/MM/DD وارد کنید.", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_REPORT_END_DATE" and is_super_admin:
+                if text == "🔙 انصراف":
+                    with user_states_lock:
+                        user_states[chat_id]["state"] = "LOGGED_IN"
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                end_date = normalize_digits(text)
+                if validate_shamsi_date(end_date):
+                    start_date = user_state.get("report_start_date")
+                    if start_date:
+                        try:
+                            start_obj = jdatetime.date(*map(int, start_date.split('/')))
+                            end_obj = jdatetime.date(*map(int, end_date.split('/')))
+                            if start_obj > end_obj:
+                                send_message(chat_id, "❌ تاریخ شروع نباید از تاریخ پایان بزرگتر باشد.", get_cancel_keyboard())
+                                return
+                        except Exception:
+                            send_message(chat_id, "❌ خطا در بررسی تاریخ.", get_cancel_keyboard())
+                            return
+                        report = get_range_report(start_date, end_date)
+                        if not report:
+                            send_message(chat_id, f"📭 هیچ داده‌ای برای بازه {get_shamsi_date_formatted(start_date)} تا {get_shamsi_date_formatted(end_date)} یافت نشد.", get_super_admin_keyboard())
+                            with user_states_lock:
+                                user_states[chat_id]["state"] = "LOGGED_IN"
+                            return
+                        msg = f"📊 **گزارش عملکرد شعب در بازه زمانی**\n"
+                        msg += f"📅 از {get_shamsi_date_formatted(start_date)} تا {get_shamsi_date_formatted(end_date)}\n"
+                        msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                        total_all = 0
+                        for idx, row in enumerate(report, 1):
+                            branch_name = row[1]
+                            total = int(safe_format(row[2]))
+                            avg = int(safe_format(row[3]))
+                            days = row[4]
+                            deputy = int(safe_format(row[5]))
+                            others = int(safe_format(row[6]))
+                            msg += f"{idx}. 🏢 {branch_name}\n"
+                            msg += f"   💰 کل وصول: {total//1_000_000:,.0f} میلیون ریال\n"
+                            msg += f"   📈 میانگین روزانه: {avg//1_000_000:,.0f} میلیون ریال\n"
+                            msg += f"   📊 تعداد روزهای ثبت: {days}\n"
+                            msg += f"   👤 سهم معاون: {deputy//1_000_000:,.0f} میلیون ریال\n"
+                            msg += f"   👥 سهم همکاران: {others//1_000_000:,.0f} میلیون ریال\n\n"
+                            total_all += total
+                        msg += f"━━━━━━━━━━━━━━━━━━\n"
+                        msg += f"💰 جمع کل استان: {total_all//1_000_000:,.0f} میلیون ریال"
+                        send_message(chat_id, msg, get_super_admin_keyboard())
+                    else:
+                        send_message(chat_id, "❌ تاریخ شروع یافت نشد. لطفاً دوباره شروع کنید.", get_super_admin_keyboard())
+                else:
+                    send_message(chat_id, "❌ فرمت تاریخ پایان نامعتبر. لطفاً به صورت YYYY/MM/DD وارد کنید.", get_cancel_keyboard())
                 with user_states_lock:
                     user_states[chat_id]["state"] = "LOGGED_IN"
                 return
