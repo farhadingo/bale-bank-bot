@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۸.۹.۱ (رفع ImportError RejectedExecutionException)
+# bot.py - نسخه ۸.۹.۲ (رفع خطای export_all_data برای جداول بدون id)
 # ============================================================
 import os
 import time
@@ -12,7 +12,7 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime, timedelta, timezone
 import threading
-from concurrent.futures import ThreadPoolExecutor  # حذف RejectedExecutionException
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify
 import jdatetime
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -111,7 +111,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.9.1'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.9.2'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -3439,7 +3439,11 @@ def export_all_data_to_json():
                 'actual_stats', 'branch_targets'
             ]
             for table in tables:
-                cur.execute(f"SELECT * FROM {table} ORDER BY id")
+                # استفاده از ORDER BY مناسب برای هر جدول
+                if table in ['settings', 'feature_settings']:
+                    cur.execute(f"SELECT * FROM {table} ORDER BY key")
+                else:
+                    cur.execute(f"SELECT * FROM {table} ORDER BY id")
                 rows = cur.fetchall()
                 colnames = [desc[0] for desc in cur.description]
                 data[table] = [dict(zip(colnames, row)) for row in rows]
@@ -4979,7 +4983,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۸.۹.۱ (رفع ImportError)\n"
+                "📅 نسخه: ۸.۹.۲ (رفع خطای export)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_keyboard(role, is_super_admin)
