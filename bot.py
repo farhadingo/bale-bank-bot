@@ -3178,7 +3178,8 @@ def start_scheduler():
 # Main
 # ============================================================
 def main():
-    global offset
+    global requests_session, processed_set
+    offset = load_offset()
     logger.info(f"🤖 Bot started successfully with offset: {offset}")
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"🌐 Flask server started on port {PORT}")
@@ -3243,7 +3244,7 @@ def main():
             time.sleep(5)
 
 # ============================================================
-# تابع handle_message
+# تابع handle_message (با تمام Stateها)
 # ============================================================
 def handle_message(message):
     try:
@@ -3492,7 +3493,6 @@ def handle_message(message):
         # ===== WAITING_FOR_EDIT_CONFIRMATION (با شرط امروز بودن) =====
         if current_state == "WAITING_FOR_EDIT_CONFIRMATION":
             if text == "📝 بله، ویرایش شود":
-                # بررسی آیا امروز است (تا ساعت ۱۲ شب همان روز)
                 shamsi_today = get_shamsi_date()
                 existing = check_existing_collection(branch_id, shamsi_today)
                 if existing and existing['created_at'].astimezone(IRAN_TZ).date() == get_iran_time().date():
@@ -3708,10 +3708,10 @@ def handle_message(message):
             return
 
         # ============================================================
-        # بخش سوپرادمین (با گزینه‌های کامل)
+        # بخش سوپرادمین (تمام گزینه‌ها)
         # ============================================================
         if is_super_admin:
-            # ===== مدیریت اهداف =====
+            # ----- مدیریت اهداف -----
             if text == "🎯 مدیریت اهداف وصولی":
                 keyboard = {
                     "keyboard": [
@@ -3929,13 +3929,85 @@ def handle_message(message):
                 send_message(chat_id, msg, get_super_admin_keyboard())
                 return
 
-            # ===== گزارش‌های جدید =====
+            # ----- گزارش‌های جدید -----
             if text == "📊 گزارش بازه زمانی":
                 user_states.set(chat_id, {
                     "state": "WAITING_FOR_REPORT_START_DATE",
                     "user_data": user_data
                 })
                 send_message(chat_id, "📅 لطفاً **تاریخ شروع** را به فرمت YYYY/MM/DD وارد کنید:", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_REPORT_START_DATE":
+                if text == "🔙 انصراف":
+                    user_states.set(chat_id, {"state": "LOGGED_IN", "user_data": user_data})
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                start_date = normalize_digits(text)
+                if validate_shamsi_date(start_date):
+                    user_state["report_start_date"] = start_date
+                    user_state["state"] = "WAITING_FOR_REPORT_END_DATE"
+                    user_states.set(chat_id, user_state)
+                    send_message(chat_id, "📅 لطفاً **تاریخ پایان** را به فرمت YYYY/MM/DD وارد کنید:", get_cancel_keyboard())
+                else:
+                    send_message(chat_id, "❌ فرمت تاریخ شروع نامعتبر. لطفاً به صورت YYYY/MM/DD وارد کنید.", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_REPORT_END_DATE":
+                if text == "🔙 انصراف":
+                    user_states.set(chat_id, {"state": "LOGGED_IN", "user_data": user_data})
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                end_date = normalize_digits(text)
+                if validate_shamsi_date(end_date):
+                    start_date = user_state.get("report_start_date")
+                    if start_date:
+                        try:
+                            start_obj = jdatetime.date(*map(int, start_date.split('/')))
+                            end_obj = jdatetime.date(*map(int, end_date.split('/')))
+                            if start_obj > end_obj:
+                                send_message(chat_id, "❌ تاریخ شروع نباید از تاریخ پایان بزرگتر باشد.", get_cancel_keyboard())
+                                return
+                        except Exception:
+                            send_message(chat_id, "❌ خطا در بررسی تاریخ.", get_cancel_keyboard())
+                            return
+                        with DBConnection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("""
+                                    SELECT * FROM range_report_view
+                                    WHERE shamsi_date >= %s AND shamsi_date <= %s
+                                """, (start_date, end_date))
+                                report = cur.fetchall()
+                        if not report:
+                            send_message(chat_id, f"📭 هیچ داده‌ای برای بازه {get_shamsi_date_formatted(start_date)} تا {get_shamsi_date_formatted(end_date)} یافت نشد.", get_super_admin_keyboard())
+                            user_states.set(chat_id, {"state": "LOGGED_IN", "user_data": user_data})
+                            return
+                        msg = f"📊 **گزارش عملکرد شعب در بازه زمانی**\n"
+                        msg += f"📅 از {get_shamsi_date_formatted(start_date)} تا {get_shamsi_date_formatted(end_date)}\n"
+                        msg += f"━━━━━━━━━━━━━━━━━━\n\n"
+                        total_all = 0
+                        for idx, row in enumerate(report, 1):
+                            branch_name = row[1]
+                            total = int(safe_format(row[2]))
+                            avg = int(safe_format(row[3]))
+                            days = row[4]
+                            deputy = int(safe_format(row[5]))
+                            others = int(safe_format(row[6]))
+                            msg += f"{idx}. 🏢 {branch_name}\n"
+                            msg += f"   💰 کل وصول: {total//MILLION:,.0f} میلیون ریال\n"
+                            msg += f"   📈 میانگین روزانه: {avg//MILLION:,.0f} میلیون ریال\n"
+                            msg += f"   📊 تعداد روزهای ثبت: {days}\n"
+                            msg += f"   👤 سهم معاون: {deputy//MILLION:,.0f} میلیون ریال\n"
+                            msg += f"   👥 سهم همکاران: {others//MILLION:,.0f} میلیون ریال\n\n"
+                            total_all += total
+                        msg += f"━━━━━━━━━━━━━━━━━━\n"
+                        msg += f"💰 جمع کل استان: {total_all//MILLION:,.0f} میلیون ریال"
+                        send_message(chat_id, msg, get_super_admin_keyboard())
+                    else:
+                        send_message(chat_id, "❌ تاریخ شروع یافت نشد. لطفاً دوباره شروع کنید.", get_super_admin_keyboard())
+                else:
+                    send_message(chat_id, "❌ فرمت تاریخ پایان نامعتبر. لطفاً به صورت YYYY/MM/DD وارد کنید.", get_cancel_keyboard())
+                user_states.set(chat_id, {"state": "LOGGED_IN", "user_data": user_data})
                 return
 
             if text == "📊 تحلیل روند هفتگی":
@@ -3960,7 +4032,7 @@ def handle_message(message):
                 send_message(chat_id, msg, get_super_admin_keyboard())
                 return
 
-            # ===== بکاپ و ریستور =====
+            # ----- بکاپ و ریستور -----
             if text == "💾 بکاپ گیری":
                 try:
                     backup_bytes = backup_database()
@@ -4022,7 +4094,7 @@ def handle_message(message):
                 user_states.set(chat_id, {"state": "LOGGED_IN", "user_data": user_data})
                 return
 
-            # ===== ادامه گزینه‌های سوپرادمین (سایر موارد) =====
+            # ----- کنترل خودکار -----
             if text == "🔧 کنترل خودکار":
                 reminder_status = "فعال ✅" if get_auto_reminder_status() else "غیرفعال ❌"
                 report_status = "فعال ✅" if get_auto_report_status() else "غیرفعال ❌"
@@ -4115,6 +4187,7 @@ def handle_message(message):
                 send_message(chat_id, f"✅ وضعیت ثبت آمار واقعی به {'فعال' if new_status else 'غیرفعال'} تغییر یافت.", get_super_admin_keyboard())
                 return
 
+            # ----- مدیریت مشکلات -----
             if text == "⚙️ مدیریت مشکلات":
                 problems = get_all_problems('pending', 20)
                 if problems:
@@ -4148,6 +4221,7 @@ def handle_message(message):
                     send_message(chat_id, "❌ فرمت: /resolve_problem [problem_id]", get_super_admin_keyboard())
                 return
 
+            # ----- مدیریت معاونین -----
             if text == "👥 مدیریت معاونین":
                 deputies = get_all_deputies_with_details()
                 if deputies:
@@ -4263,6 +4337,7 @@ def handle_message(message):
                     send_message(chat_id, "❌ فرمت: /delete_deputy [user_id]", get_super_admin_keyboard())
                 return
 
+            # ----- وضعیت ربات -----
             if text == "🔧 وضعیت ربات":
                 current_status = get_bot_status()
                 status_text = "فعال ✅" if current_status else "غیرفعال ❌"
@@ -4291,6 +4366,7 @@ def handle_message(message):
                     send_message(chat_id, "❌ خطا در غیرفعال‌سازی ربات.", get_super_admin_keyboard())
                 return
 
+            # ----- ریست گزارش‌ها -----
             if text == "🔄 ریست گزارش‌ها":
                 keyboard = {
                     "keyboard": [
@@ -4314,6 +4390,7 @@ def handle_message(message):
                 user_states.set(chat_id, {"state": "LOGGED_IN", "user_data": user_data})
                 return
 
+            # ----- مدیریت تعطیلات -----
             if text == "📅 مدیریت تعطیلات":
                 keyboard = {
                     "keyboard": [
@@ -4400,6 +4477,7 @@ def handle_message(message):
                     send_message(chat_id, "📭 هیچ روز تعطیلی ثبت نشده است.", get_super_admin_keyboard())
                 return
 
+            # ----- ارسال پیام به معاونین -----
             if text == "📨 ارسال پیام به معاونین":
                 deputies = get_all_deputies()
                 if not deputies:
@@ -4422,6 +4500,7 @@ def handle_message(message):
                 send_message(chat_id, msg, get_cancel_keyboard())
                 return
 
+            # ----- دستورات مدیریتی -----
             if text.startswith("/edit_role"):
                 parts = text.split()
                 if len(parts) == 3:
@@ -4505,6 +4584,7 @@ def handle_message(message):
                     send_message(chat_id, "❌ فرمت: /edit_collection [id] [deputy_amount_millions] [others_amount_millions]", get_super_admin_keyboard())
                 return
 
+            # ----- گزارش هفتگی/ماهانه -----
             if text == "📊 گزارش هفتگی":
                 send_message(chat_id, "🔄 در حال تولید گزارش هفتگی...", get_super_admin_keyboard())
                 send_weekly_report_to_all()
@@ -4517,6 +4597,7 @@ def handle_message(message):
                 send_message(chat_id, "✅ گزارش ماهانه به تمام کاربران ارسال شد.", get_super_admin_keyboard())
                 return
 
+            # ----- مدیریت کاربران و گزارش‌ها -----
             if text == "👥 مدیریت کاربران":
                 users = get_all_users()
                 if users:
@@ -4545,6 +4626,7 @@ def handle_message(message):
                     send_message(chat_id, "هیچ گزارشی یافت نشد.", get_super_admin_keyboard())
                 return
 
+            # ----- لاگ‌ها -----
             if text == "📋 مشاهده لاگ‌ها":
                 log_file = get_log_file_path()
                 if os.path.exists(log_file):
@@ -4577,6 +4659,7 @@ def handle_message(message):
                     send_message(chat_id, "هیچ فعالیتی ثبت نشده است.", get_super_admin_keyboard())
                 return
 
+            # ----- یادداشت‌ها -----
             if text == "📝 مشاهده یادداشت‌ها":
                 notes = get_all_notes_with_collection(30)
                 if notes:
@@ -4591,6 +4674,7 @@ def handle_message(message):
                     send_message(chat_id, "هیچ یادداشتی وجود ندارد.", get_super_admin_keyboard())
                 return
 
+            # ----- ثبت آمار واقعی -----
             if text == "📊 ثبت آمار واقعی":
                 if not get_actual_stats_status():
                     send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_super_admin_keyboard())
@@ -4667,7 +4751,7 @@ def handle_message(message):
                     send_message(chat_id, "❌ لطفاً یک عدد معتبر وارد کنید.")
                 return
 
-            # ===== گزارش‌های پیشرفته =====
+            # ----- گزارش‌های پیشرفته -----
             if text == "🏅 رتبه‌بندی دقت معاونان":
                 ranking = get_deputy_accuracy_ranking(30)
                 if not ranking:
@@ -5179,7 +5263,7 @@ def handle_message(message):
                     send_message(chat_id, "هیچ یادداشتی وجود ندارد.", keyboard)
                 return
 
-            # ===== گزارش امروز =====
+            # ----- گزارش امروز -----
             if text == "📊 گزارش امروز":
                 shamsi_today = get_shamsi_date()
                 if is_holiday(shamsi_today):
@@ -5514,7 +5598,7 @@ def handle_message(message):
                             send_message(chat_id, "شما هیچ یادداشتی ثبت نکرده‌اید.", get_deputy_keyboard())
                 return
 
-            # ===== دکمه‌های عمومی معاون =====
+            # ----- دکمه‌های عمومی معاون -----
             if text == "🔙 خروج":
                 log_user_activity(user_db_id, "logout", "خروج از سیستم")
                 user_states.set(chat_id, {"state": "LOGGED_OUT"})
