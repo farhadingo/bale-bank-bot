@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۸.۹.۲ (رفع خطای export_all_data برای جداول بدون id)
+# bot.py - نسخه ۹.۰.۰ (بکاپ/ریستور افزایشی امن و ابزارهای سوپرادمین)
 # ============================================================
 import os
 import time
@@ -36,6 +36,10 @@ import atexit
 import gzip
 import hashlib
 import binascii
+import hmac
+import uuid
+from psycopg2 import sql
+from psycopg2.extras import execute_values
 from zoneinfo import ZoneInfo  # Python 3.9+
 
 # ============================================================
@@ -48,6 +52,15 @@ EDIT_DEADLINE_HOUR = 0   # ۱۲ شب (ساعت ۰)
 EDIT_DEADLINE_MINUTE = 0
 SCORE_DEADLINE_HOUR = 16   # ۱۶:۳۰
 SCORE_DEADLINE_MINUTE = 30
+BACKUP_FORMAT_VERSION = 3
+BACKUP_SECRET = os.getenv("BACKUP_SECRET") or os.getenv("SUPER_ADMIN_PASSWORD", "")
+MAX_BACKUP_COMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_BYTES", 25 * 1024 * 1024))
+MAX_BACKUP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_UNCOMPRESSED_BYTES", 200 * 1024 * 1024))
+BACKUP_TABLES = (
+    'branches', 'users', 'collections', 'notes', 'user_activity_log',
+    'settings', 'holidays', 'problems', 'scores', 'feature_settings',
+    'actual_stats', 'branch_targets'
+)
 
 # ============================================================
 # تنظیمات لاگین
@@ -111,7 +124,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/8.9.2'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/9.0.0'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -134,6 +147,7 @@ class SafeConnectionPool:
         self.maxconn = maxconn
         self._pool = None
         self._lock = threading.RLock()
+        self._direct_connection_ids = set()
         self._create_pool()
 
     def _create_pool(self):
@@ -156,17 +170,18 @@ class SafeConnectionPool:
                 except Exception as e:
                     logger.error(f"Pool getconn error: {e}, falling back to direct connect")
                     conn = psycopg2.connect(self.dsn)
-                    conn.is_direct = True
+                    self._direct_connection_ids.add(id(conn))
                     return conn
             conn = psycopg2.connect(self.dsn)
-            conn.is_direct = True
+            self._direct_connection_ids.add(id(conn))
             return conn
 
     def putconn(self, conn):
         if conn is None:
             return
         with self._lock:
-            if getattr(conn, 'is_direct', False):
+            if id(conn) in self._direct_connection_ids:
+                self._direct_connection_ids.discard(id(conn))
                 try:
                     conn.close()
                 except:
@@ -3432,18 +3447,23 @@ def export_all_data_to_json():
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            tables = [
-                'branches', 'users', 'collections', 'notes',
-                'user_activity_log', 'settings', 'holidays',
-                'problems', 'scores', 'feature_settings',
-                'actual_stats', 'branch_targets'
-            ]
-            for table in tables:
-                # استفاده از ORDER BY مناسب برای هر جدول
-                if table in ['settings', 'feature_settings']:
-                    cur.execute(f"SELECT * FROM {table} ORDER BY key")
-                else:
-                    cur.execute(f"SELECT * FROM {table} ORDER BY id")
+            for table in BACKUP_TABLES:
+                # ترتیب بر اساس کلید اصلی؛ هیچ فرضی درباره وجود ستون id نمی‌شود.
+                cur.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid
+                                       AND a.attnum = ANY(i.indkey)
+                    WHERE i.indrelid = %s::regclass AND i.indisprimary
+                    ORDER BY array_position(i.indkey, a.attnum)
+                """, (table,))
+                primary_keys = [row[0] for row in cur.fetchall()]
+                query = sql.SQL("SELECT * FROM {}").format(sql.Identifier(table))
+                if primary_keys:
+                    query += sql.SQL(" ORDER BY {}").format(
+                        sql.SQL(', ').join(sql.Identifier(col) for col in primary_keys)
+                    )
+                cur.execute(query)
                 rows = cur.fetchall()
                 colnames = [desc[0] for desc in cur.description]
                 data[table] = [dict(zip(colnames, row)) for row in rows]
@@ -3455,32 +3475,69 @@ def export_all_data_to_json():
         if conn:
             return_db_connection(conn)
 
-def import_all_data_from_json(json_data, clear_existing=True):
+def import_all_data_from_json(json_data, clear_existing=False, dry_run=False):
+    """Restore missing rows only; existing rows are never deleted or overwritten."""
     conn = None
+    summary = {'inserted': {}, 'skipped': {}, 'missing_tables': []}
     try:
+        if clear_existing:
+            logger.warning("clear_existing was requested but is intentionally ignored for data safety")
         conn = get_db_connection()
         with conn.cursor() as cur:
-            if clear_existing:
-                cur.execute("SET session_replication_role = 'replica';")
-                for table in ['notes', 'scores', 'collections', 'actual_stats', 'branch_targets', 'user_activity_log', 'problems', 'users', 'holidays', 'feature_settings', 'settings', 'branches']:
-                    cur.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE;")
-                cur.execute("SET session_replication_role = 'origin';")
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            cur.execute("SET LOCAL statement_timeout = '120s'")
             for table, rows in json_data.items():
-                if not rows:
+                if table not in BACKUP_TABLES:
+                    logger.warning("Ignoring unexpected backup table: %s", table)
                     continue
-                columns = list(rows[0].keys())
-                placeholders = ','.join(['%s'] * len(columns))
-                col_str = ','.join(columns)
-                for row in rows:
-                    values = [row[col] for col in columns]
-                    for i, v in enumerate(values):
-                        if isinstance(v, datetime):
-                            values[i] = v.isoformat()
-                    cur.execute(
-                        f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})",
-                        values
-                    )
-            conn.commit()
+                if not rows:
+                    summary['inserted'][table] = 0
+                    summary['skipped'][table] = 0
+                    continue
+                cur.execute("SELECT to_regclass(%s)", (f'public.{table}',))
+                if cur.fetchone()[0] is None:
+                    summary['missing_tables'].append(table)
+                    continue
+                cur.execute("""
+                    SELECT column_name, is_generated, is_identity
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name=%s
+                    ORDER BY ordinal_position
+                """, (table,))
+                writable = {
+                    name for name, generated, identity in cur.fetchall()
+                    if generated == 'NEVER' and identity != 'ALWAYS'
+                }
+                columns = [name for name in rows[0].keys() if name in writable]
+                if not columns:
+                    summary['skipped'][table] = len(rows)
+                    continue
+                values = [tuple(row.get(column) for column in columns) for row in rows]
+                statement = sql.SQL(
+                    "INSERT INTO {} ({}) VALUES %s ON CONFLICT DO NOTHING"
+                ).format(
+                    sql.Identifier(table),
+                    sql.SQL(', ').join(sql.Identifier(column) for column in columns)
+                )
+                inserted = 0
+                for start in range(0, len(values), 200):
+                    execute_values(cur, statement.as_string(conn), values[start:start + 200], page_size=200)
+                    inserted += max(cur.rowcount, 0)
+                summary['inserted'][table] = inserted
+                summary['skipped'][table] = len(rows) - inserted
+
+                # همگام‌سازی امن sequence پس از درج شناسه‌های صریح.
+                if 'id' in columns:
+                    cur.execute("SELECT pg_get_serial_sequence(%s, 'id')", (table,))
+                    sequence_name = cur.fetchone()[0]
+                    if sequence_name:
+                        cur.execute(sql.SQL(
+                            "SELECT setval(%s, GREATEST(COALESCE(MAX(id), 1), 1), MAX(id) IS NOT NULL) FROM {}"
+                        ).format(sql.Identifier(table)), (sequence_name,))
+            if dry_run:
+                conn.rollback()
+            else:
+                conn.commit()
             # پاکسازی کش‌ها
             cache_today_report.invalidate_all()
             cache_top_branches.invalidate_all()
@@ -3489,12 +3546,12 @@ def import_all_data_from_json(json_data, clear_existing=True):
             cache_forecast_all.invalidate_all()
             cache_targets.invalidate_all()
             invalidate_branches_cache()
-            return True
+            return True, summary
     except Exception as e:
         logger.error(f"import_all_data error: {e}")
         if conn:
             conn.rollback()
-        return False
+        return False, {'error': str(e), **summary}
     finally:
         if conn:
             return_db_connection(conn)
@@ -3503,33 +3560,60 @@ def generate_backup_file():
     data = export_all_data_to_json()
     if data is None:
         return None
-    json_str = json.dumps(data, default=str, ensure_ascii=False, indent=2)
-    buffer = io.BytesIO()
-    with gzip.GzipFile(fileobj=buffer, mode='wb') as f:
-        f.write(json_str.encode('utf-8'))
-    buffer.seek(0)
-    return buffer.getvalue()
+    payload = {
+        'format': 'zanjan-collection-bot-backup',
+        'format_version': BACKUP_FORMAT_VERSION,
+        'backup_id': str(uuid.uuid4()),
+        'created_at': get_iran_time().isoformat(),
+        'tables': data,
+        'table_counts': {name: len(rows) for name, rows in data.items()}
+    }
+    canonical = json.dumps(payload, default=str, ensure_ascii=False,
+                           sort_keys=True, separators=(',', ':')).encode('utf-8')
+    envelope = {
+        'payload': payload,
+        'sha256': hashlib.sha256(canonical).hexdigest(),
+        'hmac_sha256': hmac.new(BACKUP_SECRET.encode('utf-8'), canonical, hashlib.sha256).hexdigest()
+    }
+    return gzip.compress(json.dumps(envelope, ensure_ascii=False, default=str).encode('utf-8'), 9)
 
-def restore_from_file(file_bytes):
+def restore_from_file(file_bytes, dry_run=True):
     try:
+        if not isinstance(file_bytes, (bytes, bytearray)) or len(file_bytes) > MAX_BACKUP_COMPRESSED_BYTES:
+            return False, "حجم فایل پشتیبان نامعتبر یا بیش از حد مجاز است.", None
         try:
-            with gzip.GzipFile(fileobj=io.BytesIO(file_bytes), mode='rb') as f:
-                json_str = f.read().decode('utf-8')
-        except:
-            json_str = file_bytes.decode('utf-8')
-        data = json.loads(json_str)
+            with gzip.GzipFile(fileobj=io.BytesIO(file_bytes), mode='rb') as stream:
+                raw = stream.read(MAX_BACKUP_UNCOMPRESSED_BYTES + 1)
+            if len(raw) > MAX_BACKUP_UNCOMPRESSED_BYTES:
+                return False, "حجم بازشده فایل بیش از حد مجاز است.", None
+        except (OSError, EOFError):
+            raw = bytes(file_bytes)  # سازگاری با بکاپ JSON قدیمی
+        document = json.loads(raw.decode('utf-8'))
+        if document.get('payload'):
+            payload = document['payload']
+            canonical = json.dumps(payload, default=str, ensure_ascii=False,
+                                   sort_keys=True, separators=(',', ':')).encode('utf-8')
+            if not hmac.compare_digest(document.get('sha256', ''), hashlib.sha256(canonical).hexdigest()):
+                return False, "فایل پشتیبان تغییر کرده یا خراب است (SHA-256 نامعتبر).", None
+            expected_hmac = hmac.new(BACKUP_SECRET.encode('utf-8'), canonical, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(document.get('hmac_sha256', ''), expected_hmac):
+                return False, "امضای فایل معتبر نیست؛ BACKUP_SECRET یکسان نیست.", None
+            data = payload.get('tables', {})
+        else:
+            data = document  # بکاپ‌های قدیمی نسخه ۸.۹
         required_tables = ['branches', 'users', 'collections']
         for tbl in required_tables:
             if tbl not in data:
-                return False, f"جدول {tbl} در فایل بکاپ وجود ندارد."
-        success = import_all_data_from_json(data, clear_existing=True)
+                return False, f"جدول {tbl} در فایل بکاپ وجود ندارد.", None
+        success, summary = import_all_data_from_json(data, clear_existing=False, dry_run=dry_run)
         if success:
-            return True, "بازیابی با موفقیت انجام شد."
+            action = "آزمون بازیابی موفق بود؛ هیچ داده‌ای تغییر نکرد." if dry_run else "بازیابی افزایشی با موفقیت انجام شد."
+            return True, action, summary
         else:
-            return False, "خطا در بازیابی داده‌ها."
+            return False, "خطا در بازیابی داده‌ها.", summary
     except Exception as e:
         logger.error(f"restore_from_file error: {e}")
-        return False, f"خطا: {str(e)}"
+        return False, f"خطا: {str(e)}", None
 
 # ============================================================
 # ارسال پیام و عکس
@@ -3690,6 +3774,7 @@ def get_super_admin_keyboard():
             [{"text": "⏰ تحلیل تاخیر معاونان"}],
             [{"text": "🎯 مدیریت اهداف وصولی"}, {"text": "📊 گزارش پیشرفت اهداف"}],
             [{"text": "🏆 رتبه‌بندی تحقق هدف"}],
+            [{"text": "🩺 سلامت دیتابیس"}, {"text": "📦 آمار حجم جداول"}],
             [{"text": "💾 پشتیبان‌گیری از داده‌ها"}, {"text": "📂 بازیابی داده‌ها"}]
         ],
         "resize_keyboard": True
@@ -4239,10 +4324,14 @@ def handle_message(message):
             with user_states._lock:
                 user_state = user_states.get(chat_id, {"state": "LOGGED_IN"})
             current_state = user_state.get("state", "LOGGED_IN") if isinstance(user_state, dict) else "LOGGED_IN"
+            # سند بکاپ معمولاً text ندارد؛ باید تا بخش پردازش ریستور ادامه پیدا کند.
+            if current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document'):
+                pass
             if current_state in ["WAITING_FOR_NOTE", "WAITING_FOR_NOTE_FOR_COLLECTION"]:
                 send_message(chat_id, "❌ لطفاً یک متن وارد کنید.")
                 return
-            return
+            elif not (current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document')):
+                return
 
         if not get_bot_status() and not is_super_admin_user(chat_id):
             send_maintenance_message(chat_id)
@@ -4318,7 +4407,13 @@ def handle_message(message):
 
         # ===== State: WAITING_FOR_SUPER_ADMIN_PASSWORD =====
         if current_state == "WAITING_FOR_SUPER_ADMIN_PASSWORD":
-            if hashlib.sha256(text.encode()).hexdigest() == PASSWORD_HASH:
+            blocked_until = user_state.get("password_blocked_until", 0)
+            if blocked_until > time.time():
+                remaining = int((blocked_until - time.time()) / 60) + 1
+                send_message(chat_id, f"🔒 به علت تلاش‌های ناموفق، ورود تا حدود {remaining} دقیقه مسدود است.")
+                return
+            supplied_hash = hashlib.sha256(text.encode()).hexdigest()
+            if hmac.compare_digest(supplied_hash, PASSWORD_HASH):
                 temp_data = user_state.get("temp_user_data")
                 if temp_data:
                     db_id = temp_data["db_id"]
@@ -4342,7 +4437,17 @@ def handle_message(message):
                     send_message(chat_id, "❌ خطا در احراز هویت. لطفاً دوباره شماره کارمندی را وارد کنید.")
                     user_states.set(chat_id, {"state": "LOGGED_OUT"})
             else:
-                send_message(chat_id, "❌ رمز عبور اشتباه است. لطفاً دوباره تلاش کنید.")
+                failed_attempts = int(user_state.get("password_failed_attempts", 0)) + 1
+                if failed_attempts >= 5:
+                    user_states.update(chat_id, {
+                        "password_failed_attempts": 0,
+                        "password_blocked_until": time.time() + 900
+                    })
+                    logger.warning("Super-admin login temporarily blocked for chat_id=%s", chat_id)
+                    send_message(chat_id, "🔒 پنج تلاش ناموفق ثبت شد؛ ورود برای ۱۵ دقیقه مسدود شد.")
+                else:
+                    user_states.update(chat_id, {"password_failed_attempts": failed_attempts})
+                    send_message(chat_id, f"❌ رمز عبور اشتباه است. {5 - failed_attempts} تلاش باقی مانده است.")
             return
 
         user_data = user_state.get("user_data", {})
@@ -5675,14 +5780,71 @@ def handle_message(message):
                 return
 
             # ===== پشتیبان‌گیری و بازیابی =====
+            if text == "🩺 سلامت دیتابیس":
+                conn = None
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT current_database(), current_user, version(), pg_database_size(current_database()), now()")
+                        db_name, db_user, db_version, db_size, db_now = cur.fetchone()
+                        cur.execute("""
+                            SELECT COUNT(*) FILTER (WHERE state = 'active'), COUNT(*)
+                            FROM pg_stat_activity WHERE datname = current_database()
+                        """)
+                        active_connections, total_connections = cur.fetchone()
+                    msg = (f"🩺 **سلامت دیتابیس**\n\n"
+                           f"✅ اتصال و اجرای کوئری موفق\n"
+                           f"🗄 نام: {db_name}\n👤 کاربر: {db_user}\n"
+                           f"💾 حجم: {db_size / 1024 / 1024:.2f} MB\n"
+                           f"🔌 اتصال فعال/کل: {active_connections}/{total_connections}\n"
+                           f"🕒 زمان سرور: {db_now}\n"
+                           f"🐘 نسخه: {db_version.split(',')[0]}")
+                    send_message(chat_id, msg, get_super_admin_keyboard())
+                    log_user_activity(user_db_id, "database_health", "بررسی سلامت دیتابیس")
+                except Exception as e:
+                    if conn:
+                        conn.rollback()
+                    logger.error(f"Database health error: {e}")
+                    send_message(chat_id, f"❌ خطا در بررسی سلامت دیتابیس: {e}", get_super_admin_keyboard())
+                finally:
+                    if conn:
+                        return_db_connection(conn)
+                return
+
+            if text == "📦 آمار حجم جداول":
+                conn = None
+                try:
+                    conn = get_db_connection()
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT relname, n_live_tup,
+                                   pg_total_relation_size(relid) AS total_bytes
+                            FROM pg_stat_user_tables
+                            ORDER BY total_bytes DESC, relname
+                        """)
+                        rows = cur.fetchall()
+                    msg = "📦 **آمار جداول**\n━━━━━━━━━━━━━━━━━━\n"
+                    for table_name, estimated_rows, total_bytes in rows:
+                        msg += f"• {table_name}: حدود {estimated_rows:,} ردیف | {total_bytes / 1024:.1f} KB\n"
+                    send_message(chat_id, msg, get_super_admin_keyboard())
+                except Exception as e:
+                    if conn:
+                        conn.rollback()
+                    send_message(chat_id, f"❌ خطا در دریافت آمار جداول: {e}", get_super_admin_keyboard())
+                finally:
+                    if conn:
+                        return_db_connection(conn)
+                return
+
             if text == "💾 پشتیبان‌گیری از داده‌ها":
                 send_message(chat_id, "⏳ در حال تولید فایل پشتیبان... لطفاً صبر کنید.", get_super_admin_keyboard())
                 try:
                     backup_data = generate_backup_file()
                     if backup_data:
-                        files = {'photo': ('backup.bin', backup_data, 'application/octet-stream')}
-                        url = f"{BASE_URL}/sendPhoto"
-                        data = {'chat_id': chat_id, 'caption': '📦 فایل پشتیبان از تمام داده‌ها'}
+                        backup_name = f"zanjan-backup-{get_iran_time().strftime('%Y%m%d-%H%M%S')}.json.gz"
+                        files = {'document': (backup_name, backup_data, 'application/gzip')}
+                        url = f"{BASE_URL}/sendDocument"
+                        data = {'chat_id': chat_id, 'caption': '📦 فایل پشتیبان امضاشده از تمام داده‌ها'}
                         res = requests_session.post(url, data=data, files=files, timeout=60)
                         if res.status_code == 200:
                             log_user_activity(user_db_id, "backup", "دریافت فایل پشتیبان")
@@ -5697,7 +5859,7 @@ def handle_message(message):
 
             if text == "📂 بازیابی داده‌ها":
                 user_states.update(chat_id, {"state": "WAITING_FOR_RESTORE_FILE"})
-                send_message(chat_id, "📂 لطفاً **فایل پشتیبان** (که قبلاً دریافت کرده‌اید) را به صورت یک **عکس** یا **سند** برای ربات ارسال کنید.\n\n⚠️ **هشدار:** این عمل تمام داده‌های فعلی را پاک کرده و با داده‌های فایل جایگزین می‌کند. این عمل غیرقابل بازگشت است.", get_cancel_keyboard())
+                send_message(chat_id, "📂 فایل پشتیبان را به صورت **سند** ارسال کنید.\n\nابتدا آزمون تراکنشی انجام می‌شود و هیچ داده‌ای تغییر نمی‌کند. پس از نمایش نتیجه، تأیید جداگانه لازم است. ریستور فقط ردیف‌های غایب را اضافه می‌کند و داده‌های موجود را حذف یا بازنویسی نمی‌کند.", get_cancel_keyboard())
                 return
 
             if current_state == "WAITING_FOR_RESTORE_FILE":
@@ -5705,12 +5867,10 @@ def handle_message(message):
                     user_states.update(chat_id, {"state": "LOGGED_IN"})
                     send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
                     return
-                if message.get('document') or message.get('photo'):
+                if message.get('document'):
                     file_id = None
                     if message.get('document'):
                         file_id = message['document']['file_id']
-                    elif message.get('photo'):
-                        file_id = message['photo'][-1]['file_id']
                     if file_id:
                         try:
                             file_url_res = requests_session.get(f"{BASE_URL}/getFile", params={"file_id": file_id})
@@ -5720,10 +5880,19 @@ def handle_message(message):
                                     file_data_res = requests_session.get(f"https://tapi.bale.ai/file/bot{BOT_TOKEN}/{file_path}")
                                     if file_data_res.status_code == 200:
                                         file_bytes = file_data_res.content
-                                        success, msg = restore_from_file(file_bytes)
+                                        success, msg, summary = restore_from_file(file_bytes, dry_run=True)
                                         if success:
-                                            send_message(chat_id, f"✅ {msg}", get_super_admin_keyboard())
-                                            log_user_activity(user_db_id, "restore", "بازیابی کامل داده‌ها از فایل")
+                                            inserted = sum(summary.get('inserted', {}).values())
+                                            skipped = sum(summary.get('skipped', {}).values())
+                                            user_states.update(chat_id, {
+                                                "state": "WAITING_FOR_RESTORE_CONFIRM",
+                                                "restore_file_bytes": file_bytes,
+                                                "restore_expires_at": time.time() + 300,
+                                                "user_data": user_data
+                                            })
+                                            keyboard = {"keyboard": [[{"text": "✅ تأیید بازیابی افزایشی"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                                            send_message(chat_id, f"✅ {msg}\n\nردیف‌های قابل افزودن: {inserted}\nردیف‌های موجود/ردشده: {skipped}\n\nبرای اجرای واقعی تا ۵ دقیقه آینده تأیید کنید.", keyboard)
+                                            return
                                         else:
                                             send_message(chat_id, f"❌ {msg}", get_cancel_keyboard())
                                     else:
@@ -5738,8 +5907,31 @@ def handle_message(message):
                     else:
                         send_message(chat_id, "❌ فایل معتبری یافت نشد.", get_cancel_keyboard())
                 else:
-                    send_message(chat_id, "❌ لطفاً یک فایل (عکس یا سند) حاوی فایل پشتیبان ارسال کنید.", get_cancel_keyboard())
+                    send_message(chat_id, "❌ لطفاً فایل پشتیبان را به صورت سند ارسال کنید.", get_cancel_keyboard())
                 user_states.update(chat_id, {"state": "LOGGED_IN"})
+                return
+
+            if current_state == "WAITING_FOR_RESTORE_CONFIRM":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "restore_file_bytes": None})
+                    send_message(chat_id, "❌ بازیابی لغو شد و هیچ تغییری اعمال نشد.", get_super_admin_keyboard())
+                    return
+                if text != "✅ تأیید بازیابی افزایشی":
+                    send_message(chat_id, "برای ادامه دکمه تأیید را بزنید یا انصراف دهید.", get_cancel_keyboard())
+                    return
+                if time.time() > user_state.get("restore_expires_at", 0):
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "restore_file_bytes": None})
+                    send_message(chat_id, "⌛ مهلت تأیید پایان یافت؛ فایل را دوباره ارسال کنید.", get_super_admin_keyboard())
+                    return
+                success, msg, summary = restore_from_file(user_state.get("restore_file_bytes", b""), dry_run=False)
+                user_states.update(chat_id, {"state": "LOGGED_IN", "restore_file_bytes": None})
+                if success:
+                    inserted = sum(summary.get('inserted', {}).values())
+                    skipped = sum(summary.get('skipped', {}).values())
+                    send_message(chat_id, f"✅ {msg}\nافزوده‌شده: {inserted}\nبدون تغییر/ردشده: {skipped}", get_super_admin_keyboard())
+                    log_user_activity(user_db_id, "restore_additive", f"بازیابی افزایشی؛ {inserted} ردیف افزوده شد")
+                else:
+                    send_message(chat_id, f"❌ {msg}", get_super_admin_keyboard())
                 return
 
         # ============================================================
