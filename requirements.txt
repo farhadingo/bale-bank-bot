@@ -9,5 +9,5 @@ arabic-reshaper
 python-bidi
 tzdata
 gunicorn
-plotly
-kaleido
+plotly==5.24.1
+kaleido==0.2.1
