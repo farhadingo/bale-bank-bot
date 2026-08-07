@@ -29,6 +29,7 @@ import arabic_reshaper
 from bidi.algorithm import get_display
 import os.path
 import traceback
+import html
 from collections import deque, OrderedDict
 import time as time_module
 import pickle
@@ -41,6 +42,13 @@ import uuid
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from zoneinfo import ZoneInfo  # Python 3.9+
+
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except Exception:
+    go = None
+    PLOTLY_AVAILABLE = False
 
 # ============================================================
 # تنظیمات ثابت
@@ -2831,8 +2839,29 @@ MANAGEMENT_REPORT_BUTTONS = {
     "💾 آمادگی پشتیبان‌گیری": "backup_readiness",
 }
 
+VISUAL_REPORT_BUTTONS = {
+    "🏆 نمودار ۱۰ شعبه برتر": "top_branches",
+    "📈 نمودار روند ۳۰ روزه": "province_trend",
+    "🤝 نمودار ترکیب مشارکت": "contribution",
+    "🎯 نمودار تحقق اهداف": "target_progress",
+    "✅ نمودار دقت شعب": "accuracy",
+    "⏰ نمودار ثبت دیرهنگام": "late_submissions",
+    "📆 نمودار روزهای هفته": "weekday",
+    "🔄 نمودار مقایسه دو دوره": "periods",
+    "🚨 نمودار هشدار شعب": "risk_map",
+}
+
 def get_management_reports_keyboard():
     labels = list(MANAGEMENT_REPORT_BUTTONS)
+    rows = [[{"text": labels[i]}, {"text": labels[i + 1]}]
+            for i in range(0, len(labels) - 1, 2)]
+    if len(labels) % 2:
+        rows.append([{"text": labels[-1]}])
+    rows.append([{"text": "🔙 بازگشت به پنل سوپرادمین"}])
+    return {"keyboard": rows, "resize_keyboard": True}
+
+def get_visual_reports_keyboard():
+    labels = list(VISUAL_REPORT_BUTTONS)
     rows = [[{"text": labels[i]}, {"text": labels[i + 1]}]
             for i in range(0, len(labels) - 1, 2)]
     if len(labels) % 2:
@@ -3370,8 +3399,71 @@ def get_forecast_for_all_branches(days=7):
 # ============================================================
 # توابع نمودار با پشتیبانی کامل فارسی
 # ============================================================
+def _rtl_plotly_text(value):
+    """Keep logical Persian order and let Chromium/Kaleido perform shaping."""
+    value = str(value or '').replace('\u200e', '').replace('\u200f', '')
+    return f"\u202B{value}\u202C" if re.search(r'[\u0600-\u06ff]', value) else value
+
+def _generate_chart_plotly(data, title, x_label, y_label, chart_type, figsize):
+    if not PLOTLY_AVAILABLE:
+        return None
+    labels_raw = [str(item) for item in data.get('labels', [])]
+    labels = [_rtl_plotly_text(item) for item in labels_raw]
+    values = [float(value or 0) for value in data.get('values', [])]
+    values2 = [float(value or 0) for value in data.get('values2', [])]
+    series1_name = _rtl_plotly_text(data.get('series1_name', 'معاون'))
+    series2_name = _rtl_plotly_text(data.get('series2_name', 'همکاران'))
+    scale = float(data.get('display_scale', 1_000_000) or 1)
+    suffix = str(data.get('display_suffix', ''))
+    formatted = [f"{value / scale:,.0f}{suffix}" for value in values]
+    font_family = "Vazirmatn, Noto Sans Arabic, DejaVu Sans, Arial"
+    fig = go.Figure()
+    if chart_type == 'horizontal':
+        fig.add_trace(go.Bar(x=values, y=labels, orientation='h', marker_color='#75C1E3',
+                             marker_line_color='#233A8B', marker_line_width=1,
+                             text=formatted, textposition='outside', cliponaxis=False))
+        fig.update_yaxes(autorange='reversed')
+    elif chart_type == 'line':
+        fig.add_trace(go.Scatter(x=labels, y=values, mode='lines+markers+text',
+                                 line=dict(color='#2455C3', width=3),
+                                 marker=dict(size=8), text=formatted, textposition='top center'))
+    elif chart_type == 'pie':
+        non_zero = [(label, value) for label, value in zip(labels, values) if value > 0]
+        if non_zero:
+            pie_labels, pie_values = zip(*non_zero)
+            fig.add_trace(go.Pie(labels=pie_labels, values=pie_values, textinfo='label+percent', sort=False))
+        else:
+            fig.add_trace(go.Pie(labels=[_rtl_plotly_text('داده‌ای وجود ندارد')], values=[1], sort=False))
+    elif chart_type == 'stacked' and values2:
+        fig.add_trace(go.Bar(x=labels, y=values, name=series1_name, marker_color='#2455C3'))
+        fig.add_trace(go.Bar(x=labels, y=values2, name=series2_name, marker_color='#F59E0B'))
+        fig.update_layout(barmode='stack')
+    else:
+        fig.add_trace(go.Bar(x=labels, y=values, marker_color='#75C1E3',
+                             marker_line_color='#233A8B', marker_line_width=1,
+                             text=formatted, textposition='outside', cliponaxis=False))
+    fig.update_layout(
+        title=dict(text=f"<span dir='rtl'>{html.escape(str(title))}</span>", x=.5, xanchor='center'),
+        xaxis_title=f"<span dir='rtl'>{html.escape(str(x_label))}</span>",
+        yaxis_title=f"<span dir='rtl'>{html.escape(str(y_label))}</span>",
+        font=dict(family=font_family, size=14, color='#111827'),
+        paper_bgcolor='white', plot_bgcolor='white',
+        margin=dict(l=120 if chart_type == 'horizontal' else 70, r=80, t=90, b=90),
+        showlegend=chart_type in ('pie', 'stacked'),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor='#E5E7EB', zeroline=False, tickangle=-35 if chart_type != 'horizontal' else 0)
+    fig.update_yaxes(showgrid=chart_type != 'horizontal', gridcolor='#E5E7EB', zeroline=False)
+    width, height = int(figsize[0] * 110), int(figsize[1] * 110)
+    return fig.to_image(format='png', width=width, height=height, scale=1.5, engine='kaleido')
+
 def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
     try:
+        try:
+            plotly_image = _generate_chart_plotly(data, title, x_label, y_label, chart_type, figsize)
+            if plotly_image:
+                return plotly_image
+        except Exception as plotly_error:
+            logger.warning("Plotly chart rendering failed; using Matplotlib fallback: %s", plotly_error)
         setup_persian_font_once()
         fig, ax = plt.subplots(figsize=figsize)
         font_prop = _persian_font_property or fm.FontProperties(family='DejaVu Sans')
@@ -3415,8 +3507,8 @@ def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10,
         elif chart_type == 'stacked':
             if 'values2' in data:
                 values2 = [float(v) if v is not None else 0 for v in data['values2']]
-                ax.bar(labels, values, label=reshape_persian('معاون'), color='blue', alpha=0.7)
-                ax.bar(labels, values2, label=reshape_persian('همکاران'), color='orange', alpha=0.7, bottom=values)
+                ax.bar(labels, values, label=reshape_persian(data.get('series1_name', 'معاون')), color='blue', alpha=0.7)
+                ax.bar(labels, values2, label=reshape_persian(data.get('series2_name', 'همکاران')), color='orange', alpha=0.7, bottom=values)
                 ax.legend(prop=font_prop)
             else:
                 ax.bar(labels, values, color='skyblue')
@@ -3441,6 +3533,97 @@ def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10,
     finally:
         if 'fig' in locals():
             plt.close(fig)
+
+def generate_visual_management_report(report_key):
+    """Create read-only management charts from existing data."""
+    conn = None
+    today = get_shamsi_date()
+    start_7 = get_shamsi_date(-7)
+    start_14 = get_shamsi_date(-14)
+    start_30 = get_shamsi_date(-30)
+    start_60 = get_shamsi_date(-60)
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if report_key == 'top_branches':
+                cur.execute("""SELECT b.name,COALESCE(SUM(c.total_amount),0) total
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    GROUP BY b.id,b.name ORDER BY total DESC LIMIT 10""", (start_30,))
+                rows = cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] for r in rows]},
+                                      '۱۰ شعبه برتر در ۳۰ روز اخیر', 'مبلغ وصول', 'شعبه', 'horizontal', (12,7))
+            if report_key == 'province_trend':
+                cur.execute("""SELECT shamsi_date,SUM(total_amount) FROM collections
+                    WHERE shamsi_date>=%s GROUP BY shamsi_date ORDER BY shamsi_date""", (start_30,))
+                rows=cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] for r in rows]},
+                                      'روند وصول استان در ۳۰ روز اخیر','تاریخ','مبلغ وصول','line',(13,7))
+            if report_key == 'contribution':
+                cur.execute("""SELECT b.name,COALESCE(SUM(c.deputy_amount),0),COALESCE(SUM(c.others_amount),0)
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    GROUP BY b.id,b.name ORDER BY SUM(c.total_amount) DESC NULLS LAST LIMIT 12""", (start_30,))
+                rows=cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] for r in rows], 'values2':[r[2] for r in rows],
+                                       'series1_name':'معاون','series2_name':'همکاران'},
+                                      'ترکیب وصول معاون و همکاران','شعبه','مبلغ وصول','stacked',(14,8))
+            if report_key == 'target_progress':
+                targets=get_all_active_targets() or []; labels=[]; values=[]
+                for _,branch_id,name,amount,target_date,created_at,_ in targets:
+                    progress=get_target_progress(branch_id,target_date,amount,created_at)
+                    labels.append(name); values.append(min(progress['progress_percent'],200))
+                return generate_chart({'labels':labels,'values':values,'display_scale':1,'display_suffix':'٪'},
+                                      'درصد تحقق اهداف فعال','درصد تحقق','شعبه','horizontal',(12,7))
+            if report_key == 'accuracy':
+                cur.execute("""SELECT b.name,AVG(CASE WHEN GREATEST(ABS(a.total_actual),ABS(c.total_amount))=0 THEN 100
+                    ELSE LEAST(ABS(a.total_actual),ABS(c.total_amount))*100.0/GREATEST(ABS(a.total_actual),ABS(c.total_amount)) END) accuracy
+                    FROM branches b JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    JOIN actual_stats a ON a.branch_id=c.branch_id AND a.shamsi_date=c.shamsi_date
+                    GROUP BY b.id,b.name ORDER BY accuracy DESC""", (start_30,))
+                rows=cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] for r in rows], 'display_scale':1,'display_suffix':'٪'},
+                                      'میانگین دقت شعب در برابر آمار واقعی','درصد دقت','شعبه','horizontal',(12,7))
+            if report_key == 'late_submissions':
+                cur.execute("""SELECT b.name,SUM(CASE WHEN (c.created_at AT TIME ZONE 'Asia/Tehran')::time>TIME '16:30' THEN 1 ELSE 0 END) late
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    GROUP BY b.id,b.name ORDER BY late DESC NULLS LAST""", (start_30,))
+                rows=cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] or 0 for r in rows], 'display_scale':1},
+                                      'تعداد ثبت‌های دیرهنگام در ۳۰ روز اخیر','تعداد ثبت دیرهنگام','شعبه','horizontal',(12,8))
+            if report_key == 'weekday':
+                cur.execute("""SELECT EXTRACT(ISODOW FROM created_at AT TIME ZONE 'Asia/Tehran')::int,AVG(total_amount)
+                    FROM collections WHERE shamsi_date>=%s GROUP BY 1 ORDER BY 1""", (start_60,))
+                names={6:'شنبه',7:'یکشنبه',1:'دوشنبه',2:'سه‌شنبه',3:'چهارشنبه',4:'پنجشنبه',5:'جمعه'}
+                rows=cur.fetchall()
+                return generate_chart({'labels':[names.get(r[0],str(r[0])) for r in rows], 'values':[r[1] for r in rows]},
+                                      'میانگین وصول بر اساس روز هفته','روز هفته','میانگین وصول','bar',(11,7))
+            if report_key == 'periods':
+                cur.execute("""SELECT b.name,
+                    COALESCE(SUM(c.total_amount) FILTER(WHERE c.shamsi_date>=%s),0) current_period,
+                    COALESCE(SUM(c.total_amount) FILTER(WHERE c.shamsi_date>=%s AND c.shamsi_date<%s),0) previous_period
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id GROUP BY b.id,b.name
+                    ORDER BY current_period DESC LIMIT 12""", (start_30,start_60,start_30))
+                rows=cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] for r in rows], 'values2':[r[2] for r in rows],
+                                       'series1_name':'۳۰ روز اخیر','series2_name':'۳۰ روز قبل'},
+                                      'مقایسه ۳۰ روز اخیر با ۳۰ روز قبل','شعبه','مبلغ وصول','stacked',(14,8))
+            if report_key == 'risk_map':
+                cur.execute("""SELECT b.name,
+                    (CASE WHEN NOT BOOL_OR(c.shamsi_date=%s) THEN 2 ELSE 0 END +
+                     CASE WHEN COALESCE(AVG(c.total_amount) FILTER(WHERE c.shamsi_date>=%s),0) <
+                                   COALESCE(AVG(c.total_amount) FILTER(WHERE c.shamsi_date>=%s AND c.shamsi_date<%s),0)*.7
+                          THEN 2 ELSE 0 END) risk
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id GROUP BY b.id,b.name ORDER BY risk DESC,b.name""",
+                    (today,start_7,start_14,start_7))
+                rows=cur.fetchall()
+                return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] for r in rows], 'display_scale':1},
+                                      'شاخص هشدار شعب','امتیاز هشدار','شعبه','horizontal',(12,8))
+        return None
+    except Exception:
+        if conn: conn.rollback()
+        logger.exception("Visual management report %s failed", report_key)
+        return None
+    finally:
+        if conn: return_db_connection(conn)
 
 def generate_branch_chart(branch_id, days=10):
     conn = None
@@ -4116,6 +4299,7 @@ def get_super_admin_keyboard():
             [{"text": "🎯 مدیریت اهداف وصولی"}, {"text": "📊 گزارش پیشرفت اهداف"}],
             [{"text": "🏆 رتبه‌بندی تحقق هدف"}],
             [{"text": "📊 مرکز گزارش‌های مدیریتی"}],
+            [{"text": "📈 مرکز گزارش‌های تصویری"}],
             [{"text": "🩺 سلامت دیتابیس"}, {"text": "📦 آمار حجم جداول"}],
             [{"text": "💾 پشتیبان‌گیری از داده‌ها"}, {"text": "📂 بازیابی داده‌ها"}]
         ],
@@ -5458,6 +5642,15 @@ def handle_message(message):
                 )
                 return
 
+            if text == "📈 مرکز گزارش‌های تصویری":
+                engine = "Plotly/Kaleido" if PLOTLY_AVAILABLE else "Matplotlib fallback"
+                send_message(
+                    chat_id,
+                    f"📈 **مرکز گزارش‌های تصویری**\n\nموتور فعال: {engine}\nگزارش موردنظر را انتخاب کنید.",
+                    get_visual_reports_keyboard()
+                )
+                return
+
             if text == "🔙 بازگشت به پنل سوپرادمین":
                 send_message(chat_id, "به پنل سوپرادمین بازگشتید.", get_super_admin_keyboard())
                 return
@@ -5468,6 +5661,17 @@ def handle_message(message):
                 report_text = generate_management_report(report_key)
                 send_message(chat_id, report_text, get_management_reports_keyboard())
                 log_user_activity(user_db_id, "management_report", report_key)
+                return
+
+            if text in VISUAL_REPORT_BUTTONS:
+                report_key = VISUAL_REPORT_BUTTONS[text]
+                send_message(chat_id, "⏳ در حال ساخت نمودار فارسی...", get_visual_reports_keyboard())
+                chart_bytes = generate_visual_management_report(report_key)
+                if chart_bytes:
+                    send_photo(chat_id, chart_bytes, text, get_visual_reports_keyboard())
+                    log_user_activity(user_db_id, "visual_management_report", report_key)
+                else:
+                    send_message(chat_id, "❌ داده کافی وجود ندارد یا تولید تصویر ناموفق بود.", get_visual_reports_keyboard())
                 return
 
             if text == "🔧 کنترل خودکار":
