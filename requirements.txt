@@ -9,3 +9,5 @@ arabic-reshaper
 python-bidi
 tzdata
 gunicorn
+plotly
+kaleido
