@@ -1,11 +1,11 @@
+Flask
 requests
-psycopg2
 psycopg2-binary
-flask
 jdatetime
-apscheduler
+APScheduler
 matplotlib
 numpy
-Pillow
-arabic_reshaper
+arabic-reshaper
 python-bidi
+tzdata
+gunicorn
