@@ -53,7 +53,7 @@ EDIT_DEADLINE_MINUTE = 59
 SCORE_DEADLINE_HOUR = 16   # ۱۶:۳۰
 SCORE_DEADLINE_MINUTE = 30
 BACKUP_FORMAT_VERSION = 3
-BACKUP_SECRET = os.getenv("BACKUP_SECRET", "").strip()
+BACKUP_SECRET = os.getenv("SUPER_ADMIN_PASSWORD", "")
 MAX_BACKUP_COMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_BYTES", 25 * 1024 * 1024))
 MAX_BACKUP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_UNCOMPRESSED_BYTES", 200 * 1024 * 1024))
 BACKUP_TABLES = (
@@ -93,9 +93,6 @@ if not BOT_TOKEN or not DB_URL:
     exit(1)
 if not SUPER_ADMIN_PASSWORD:
     logger.error("❌ SUPER_ADMIN_PASSWORD environment variable is required!")
-    exit(1)
-if len(BACKUP_SECRET) < 32:
-    logger.error("❌ BACKUP_SECRET must be set independently and contain at least 32 characters!")
     exit(1)
 
 # هش کردن رمز عبور برای ذخیره در حافظه (امنیت بیشتر)
@@ -2811,6 +2808,283 @@ def get_targets_progress_report():
     return report
 
 # ============================================================
+# مرکز گزارش‌های مدیریتی سوپرادمین (تماماً خواندنی)
+# ============================================================
+MANAGEMENT_REPORT_BUTTONS = {
+    "🌅 داشبورد مدیریتی": "executive_dashboard",
+    "🚨 شعب نیازمند اقدام": "action_required",
+    "🎯 پیشرفت و پیش‌بینی اهداف": "target_outlook",
+    "⚖️ مقایسه شعب مشابه": "peer_comparison",
+    "📈 روند صعودی و نزولی": "trend",
+    "🔎 نوسان‌های غیرعادی": "anomalies",
+    "✅ کیفیت ثبت اطلاعات": "data_quality",
+    "👤 عملکرد جامع معاونان": "deputy_performance",
+    "⏰ انضباط ثبت روزانه": "submission_discipline",
+    "🤝 سهم معاون و همکاران": "contribution_mix",
+    "🎯 دقت با آمار واقعی": "actual_accuracy",
+    "📆 عملکرد روزهای هفته": "weekday_performance",
+    "🔄 مقایسه دوره‌ای": "period_comparison",
+    "🔮 پیش‌بینی پایان ماه": "month_forecast",
+    "🏅 رتبه‌بندی چندمعیاره": "multi_ranking",
+    "🩺 سلامت سامانه جامع": "system_health",
+    "🧹 کنترل کیفیت داده": "integrity_audit",
+    "💾 آمادگی پشتیبان‌گیری": "backup_readiness",
+}
+
+def get_management_reports_keyboard():
+    labels = list(MANAGEMENT_REPORT_BUTTONS)
+    rows = [[{"text": labels[i]}, {"text": labels[i + 1]}]
+            for i in range(0, len(labels) - 1, 2)]
+    if len(labels) % 2:
+        rows.append([{"text": labels[-1]}])
+    rows.append([{"text": "🔙 بازگشت به پنل سوپرادمین"}])
+    return {"keyboard": rows, "resize_keyboard": True}
+
+def _fmt_money(value):
+    return f"{int(value or 0) // 1_000_000:,.0f} میلیون ریال"
+
+def _trend_arrow(percent):
+    if percent > 3:
+        return "📈"
+    if percent < -3:
+        return "📉"
+    return "➡️"
+
+def _previous_shamsi_month_prefix():
+    today = jdatetime.datetime.fromgregorian(datetime=get_iran_time())
+    if today.month == 1:
+        return f"{today.year - 1}/12"
+    return f"{today.year}/{today.month - 1:02d}"
+
+def _report_header(title, period="۳۰ روز اخیر"):
+    return f"{title}\n📅 {period} | تولید: {get_iran_time().strftime('%H:%M')}\n━━━━━━━━━━━━━━━━━━\n"
+
+def generate_management_report(report_key):
+    """Generate read-only provincial management reports from existing records."""
+    conn = None
+    today = get_shamsi_date()
+    start_7 = get_shamsi_date(-7)
+    start_14 = get_shamsi_date(-14)
+    start_30 = get_shamsi_date(-30)
+    start_60 = get_shamsi_date(-60)
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            if report_key == "executive_dashboard":
+                cur.execute("""SELECT COALESCE(SUM(total_amount),0),COUNT(DISTINCT branch_id)
+                               FROM collections WHERE shamsi_date=%s""", (today,))
+                today_total, reported = cur.fetchone()
+                cur.execute("SELECT COUNT(*) FROM branches")
+                branch_count = cur.fetchone()[0]
+                cur.execute("""SELECT COALESCE(SUM(total_amount),0) FROM collections
+                               WHERE shamsi_date=%s""", (get_shamsi_date(-1),))
+                yesterday = cur.fetchone()[0]
+                change = ((today_total - yesterday) * 100 / yesterday) if yesterday else 0
+                cur.execute("""SELECT b.name,COALESCE(c.total_amount,0)
+                               FROM branches b LEFT JOIN collections c
+                               ON c.branch_id=b.id AND c.shamsi_date=%s
+                               ORDER BY COALESCE(c.total_amount,0) DESC LIMIT 5""", (today,))
+                top = cur.fetchall()
+                msg = _report_header("🌅 داشبورد مدیریتی امروز", get_shamsi_date_formatted(today))
+                msg += f"💰 وصول امروز: {_fmt_money(today_total)}\n{_trend_arrow(change)} تغییر با دیروز: {change:+.1f}%\n"
+                msg += f"🏢 ثبت‌کننده: {reported} از {branch_count} | ثبت‌نشده: {max(branch_count-reported,0)}\n\n🏆 پنج شعبه اول:\n"
+                msg += "\n".join(f"{i}. {name}: {_fmt_money(amount)}" for i, (name, amount) in enumerate(top, 1))
+                return msg
+
+            if report_key == "action_required":
+                cur.execute("""WITH stats AS (
+                    SELECT b.id,b.name,
+                      MAX(c.shamsi_date) last_date,
+                      AVG(c.total_amount) FILTER (WHERE c.shamsi_date >= %s) avg30,
+                      AVG(c.total_amount) FILTER (WHERE c.shamsi_date >= %s) avg7,
+                      BOOL_OR(c.shamsi_date=%s) reported_today
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id
+                    GROUP BY b.id,b.name)
+                    SELECT name,last_date,COALESCE(avg7,0),COALESCE(avg30,0),COALESCE(reported_today,false)
+                    FROM stats
+                    WHERE NOT COALESCE(reported_today,false) OR avg7 < avg30*0.7
+                    ORDER BY reported_today, CASE WHEN avg30>0 THEN avg7/avg30 ELSE 0 END""",
+                    (start_30, start_7, today))
+                rows = cur.fetchall()
+                msg = _report_header("🚨 شعب نیازمند اقدام")
+                if not rows:
+                    return msg + "✅ مورد بحرانی شناسایی نشد."
+                for name, last_date, avg7, avg30, reported_today in rows[:20]:
+                    reasons = []
+                    if not reported_today: reasons.append("ثبت امروز ندارد")
+                    if avg30 and avg7 < avg30 * .7: reasons.append(f"افت {100-(avg7*100/avg30):.0f}٪")
+                    msg += f"🔴 {name}: {'، '.join(reasons)} | آخرین ثبت: {last_date or 'ندارد'}\n"
+                return msg
+
+            if report_key == "target_outlook":
+                targets = get_all_active_targets() or []
+                msg = _report_header("🎯 پیشرفت و پیش‌بینی اهداف", "اهداف فعال")
+                if not targets: return msg + "هدف فعالی ثبت نشده است."
+                for _, branch_id, name, amount, target_date, created_at, _ in targets:
+                    p = get_target_progress(branch_id, target_date, amount, created_at)
+                    elapsed_start = jdatetime.datetime.fromgregorian(datetime=created_at).date()
+                    elapsed = max((jdatetime.date(*map(int, today.split('/'))) - elapsed_start).days, 1)
+                    daily = p['collected'] / elapsed
+                    required = p['remaining'] / max(p['days_left'], 1) if p['days_left'] >= 0 else p['remaining']
+                    status = "✅ در مسیر" if daily >= required else "⚠️ عقب از برنامه"
+                    msg += f"• {name}: {p['progress_percent']:.1f}٪ | {status}\n  روزانه فعلی: {_fmt_money(daily)}؛ لازم: {_fmt_money(required)}\n"
+                return msg
+
+            if report_key == "peer_comparison":
+                cur.execute("""WITH s AS (SELECT b.name,COALESCE(AVG(c.total_amount),0) avg_amount,
+                    COUNT(c.id) days FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    GROUP BY b.id,b.name), ranked AS
+                    (SELECT *,NTILE(3) OVER(ORDER BY avg_amount) peer_group FROM s)
+                    SELECT peer_group,name,avg_amount,days FROM ranked ORDER BY peer_group,avg_amount DESC""", (start_30,))
+                rows = cur.fetchall(); msg = _report_header("⚖️ مقایسه شعب مشابه")
+                for group in (3,2,1):
+                    msg += f"\n{'بزرگ/پربازده' if group==3 else 'متوسط' if group==2 else 'کوچک/کم‌حجم'}:\n"
+                    msg += "\n".join(f"• {n}: {_fmt_money(a)} ({d} روز)" for g,n,a,d in rows if g==group)
+                return msg
+
+            if report_key == "trend":
+                cur.execute("""SELECT b.name,
+                    COALESCE(AVG(c.total_amount) FILTER(WHERE c.shamsi_date>=%s),0) recent,
+                    COALESCE(AVG(c.total_amount) FILTER(WHERE c.shamsi_date>=%s AND c.shamsi_date<%s),0) previous
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id
+                    GROUP BY b.id,b.name""", (start_7,start_14,start_7))
+                ranked=[]
+                for name,recent,previous in cur.fetchall():
+                    pct=((recent-previous)*100/previous) if previous else 0
+                    ranked.append((abs(pct),pct,name))
+                ranked.sort(reverse=True)
+                msg=_report_header("📈 روند صعودی و نزولی","۷ روز اخیر در برابر ۷ روز قبل")
+                return msg+"\n".join(f"{_trend_arrow(p)} {n}: {p:+.1f}٪" for _,p,n in ranked[:20])
+
+            if report_key == "anomalies":
+                cur.execute("""WITH base AS (SELECT c.*,AVG(c.total_amount) OVER(PARTITION BY branch_id
+                    ORDER BY shamsi_date ROWS BETWEEN 14 PRECEDING AND 1 PRECEDING) baseline
+                    FROM collections c WHERE shamsi_date>=%s)
+                    SELECT b.name,base.shamsi_date,base.total_amount,base.baseline
+                    FROM base JOIN branches b ON b.id=base.branch_id
+                    WHERE baseline>0 AND (total_amount>baseline*2.5 OR total_amount<baseline*.25)
+                    ORDER BY shamsi_date DESC LIMIT 25""", (start_60,))
+                rows=cur.fetchall(); msg=_report_header("🔎 نوسان‌های غیرعادی","۶۰ روز اخیر")
+                return msg+("موردی شناسایی نشد." if not rows else "\n".join(
+                    f"• {n} | {d}: {_fmt_money(v)} در برابر میانگین {_fmt_money(a)}" for n,d,v,a in rows))
+
+            if report_key == "data_quality":
+                cur.execute("""SELECT b.name,COUNT(DISTINCT c.id),COUNT(n.id),
+                    SUM(CASE WHEN (c.created_at AT TIME ZONE 'Asia/Tehran')::time > TIME '16:30' THEN 1 ELSE 0 END)
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    LEFT JOIN notes n ON n.collection_id=c.id GROUP BY b.id,b.name ORDER BY 4 DESC NULLS LAST""", (start_30,))
+                rows=cur.fetchall(); msg=_report_header("✅ کیفیت ثبت اطلاعات")
+                return msg+"\n".join(f"• {n}: {cnt} ثبت | {notes} یادداشت | {late or 0} دیرهنگام" for n,cnt,notes,late in rows)
+
+            if report_key == "deputy_performance":
+                cur.execute("""SELECT u.full_name,b.name,COUNT(c.id),COALESCE(SUM(c.total_amount),0),
+                    COALESCE(AVG(c.total_amount),0),SUM(CASE WHEN (c.created_at AT TIME ZONE 'Asia/Tehran')::time<=TIME '16:30' THEN 1 ELSE 0 END)
+                    FROM users u LEFT JOIN branches b ON b.id=u.branch_id LEFT JOIN collections c
+                    ON c.recorded_by=u.id AND c.shamsi_date>=%s WHERE u.role='deputy'
+                    GROUP BY u.id,u.full_name,b.name ORDER BY 4 DESC""", (start_30,))
+                rows=cur.fetchall(); msg=_report_header("👤 عملکرد جامع معاونان")
+                return msg+"\n".join(f"• {u} ({b or 'بدون شعبه'}): {_fmt_money(total)} | {days} روز | به‌موقع {ontime or 0}" for u,b,days,total,avg,ontime in rows)
+
+            if report_key == "submission_discipline":
+                cur.execute("""SELECT b.name,COUNT(c.id),
+                    TO_CHAR(AVG((EXTRACT(EPOCH FROM (c.created_at AT TIME ZONE 'Asia/Tehran')::time))), 'FM999999')
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    GROUP BY b.id,b.name ORDER BY COUNT(c.id) DESC""", (start_30,))
+                rows=cur.fetchall(); msg=_report_header("⏰ انضباط ثبت روزانه")
+                for name,count,avg_seconds in rows:
+                    sec=int(float(avg_seconds or 0)); avg_time=f"{sec//3600:02d}:{(sec%3600)//60:02d}" if count else "—"
+                    msg+=f"• {name}: {count} روز | میانگین ساعت ثبت {avg_time}\n"
+                return msg
+
+            if report_key == "contribution_mix":
+                cur.execute("""SELECT b.name,COALESCE(SUM(c.deputy_amount),0),COALESCE(SUM(c.others_amount),0)
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    GROUP BY b.id,b.name ORDER BY SUM(c.total_amount) DESC NULLS LAST""", (start_30,))
+                rows=cur.fetchall(); msg=_report_header("🤝 سهم معاون و همکاران")
+                for name,dep,others in rows:
+                    total=dep+others; pct=dep*100/total if total else 0
+                    msg+=f"• {name}: معاون {pct:.1f}٪ | همکاران {100-pct:.1f}٪\n"
+                return msg
+
+            if report_key == "actual_accuracy":
+                cur.execute("""SELECT b.name,COUNT(a.id),AVG(CASE WHEN GREATEST(ABS(a.total_actual),ABS(c.total_amount))=0 THEN 100
+                    ELSE LEAST(ABS(a.total_actual),ABS(c.total_amount))*100.0/GREATEST(ABS(a.total_actual),ABS(c.total_amount)) END)
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s
+                    LEFT JOIN actual_stats a ON a.branch_id=c.branch_id AND a.shamsi_date=c.shamsi_date
+                    GROUP BY b.id,b.name ORDER BY 3 DESC NULLS LAST""", (start_30,))
+                rows=cur.fetchall(); msg=_report_header("🎯 دقت با آمار واقعی")
+                return msg+"\n".join(f"• {n}: {float(acc or 0):.1f}٪ ({cnt} تطبیق)" for n,cnt,acc in rows)
+
+            if report_key == "weekday_performance":
+                cur.execute("""SELECT EXTRACT(ISODOW FROM created_at AT TIME ZONE 'Asia/Tehran')::int,
+                    COUNT(*),AVG(total_amount),SUM(total_amount) FROM collections WHERE shamsi_date>=%s GROUP BY 1 ORDER BY 1""", (start_60,))
+                names={6:'شنبه',7:'یکشنبه',1:'دوشنبه',2:'سه‌شنبه',3:'چهارشنبه',4:'پنجشنبه',5:'جمعه'}
+                rows=cur.fetchall(); msg=_report_header("📆 عملکرد روزهای هفته","۶۰ روز اخیر")
+                return msg+"\n".join(f"• {names.get(day,str(day))}: میانگین {_fmt_money(avg)} | {cnt} ثبت" for day,cnt,avg,total in rows)
+
+            if report_key == "period_comparison":
+                cur.execute("""SELECT b.name,
+                    COALESCE(SUM(c.total_amount) FILTER(WHERE c.shamsi_date>=%s),0),
+                    COALESCE(SUM(c.total_amount) FILTER(WHERE c.shamsi_date>=%s AND c.shamsi_date<%s),0)
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id GROUP BY b.id,b.name""", (start_30,start_60,start_30))
+                rows=[]
+                for n,current,previous in cur.fetchall(): rows.append((((current-previous)*100/previous) if previous else 0,n,current,previous))
+                rows.sort(reverse=True); msg=_report_header("🔄 مقایسه دوره‌ای","۳۰ روز اخیر با ۳۰ روز قبل")
+                return msg+"\n".join(f"{_trend_arrow(p)} {n}: {p:+.1f}٪" for p,n,c,old in rows)
+
+            if report_key == "month_forecast":
+                prefix=today[:7]; cur.execute("SELECT COALESCE(SUM(total_amount),0),COUNT(DISTINCT shamsi_date) FROM collections WHERE shamsi_date LIKE %s", (prefix+'%',))
+                total,days=cur.fetchone(); y,m,d=map(int,today.split('/'))
+                next_month = jdatetime.date(y + 1, 1, 1) if m == 12 else jdatetime.date(y, m + 1, 1)
+                month_days = add_days_to_shamsi(next_month, -1).day
+                forecast=(total/days*month_days) if days else 0
+                cur.execute("SELECT COALESCE(SUM(target_amount),0) FROM branch_targets WHERE is_active=true")
+                targets=cur.fetchone()[0]
+                msg=_report_header("🔮 پیش‌بینی پایان ماه",prefix)
+                return msg+f"وصول فعلی: {_fmt_money(total)} در {days} روز\nپیش‌بینی پایان ماه: {_fmt_money(forecast)}\nاهداف فعال: {_fmt_money(targets)}\nفاصله پیش‌بینی با اهداف: {_fmt_money(forecast-targets)}"
+
+            if report_key == "multi_ranking":
+                cur.execute("""WITH x AS (SELECT b.name,COALESCE(SUM(c.total_amount),0) total,COUNT(c.id) days,
+                    COALESCE(SUM(CASE WHEN (c.created_at AT TIME ZONE 'Asia/Tehran')::time<=TIME '16:30' THEN 1 ELSE 0 END),0) ontime
+                    FROM branches b LEFT JOIN collections c ON c.branch_id=b.id AND c.shamsi_date>=%s GROUP BY b.id,b.name)
+                    SELECT name,total,days,ontime,ROUND((PERCENT_RANK() OVER(ORDER BY total)*60 +
+                    PERCENT_RANK() OVER(ORDER BY days)*20 + CASE WHEN days>0 THEN ontime*20.0/days ELSE 0 END)::numeric,1)
+                    FROM x ORDER BY 5 DESC""", (start_30,))
+                rows=cur.fetchall(); msg=_report_header("🏅 رتبه‌بندی چندمعیاره","وزن وصول ۶۰٪، نظم ۲۰٪، پوشش ثبت ۲۰٪")
+                return msg+"\n".join(f"{i}. {n}: امتیاز {score} | {_fmt_money(total)}" for i,(n,total,days,on,score) in enumerate(rows,1))
+
+            if report_key in ("system_health", "integrity_audit", "backup_readiness"):
+                if report_key == "system_health":
+                    cur.execute("SELECT pg_database_size(current_database()),now(),COUNT(*) FROM pg_stat_activity WHERE datname=current_database()")
+                    size,dbtime,connections=cur.fetchone(); cur.execute("SELECT MAX(created_at) FROM user_activity_log")
+                    last_activity=cur.fetchone()[0]
+                    return _report_header("🩺 سلامت سامانه جامع","وضعیت لحظه‌ای")+f"دیتابیس: {size/1024/1024:.1f} MB\nاتصال‌ها: {connections}\nزمان DB: {dbtime}\nآخرین فعالیت: {last_activity}\nScheduler: فعال در پردازش ربات"
+                if report_key == "integrity_audit":
+                    checks=[]
+                    for label,query in [
+                        ("کاربر بدون شعبه","SELECT COUNT(*) FROM users WHERE role='deputy' AND branch_id IS NULL"),
+                        ("وصول منفی","SELECT COUNT(*) FROM collections WHERE deputy_amount<0 OR others_amount<0"),
+                        ("وصول بدون ثبت‌کننده","SELECT COUNT(*) FROM collections WHERE recorded_by IS NULL"),
+                        ("هدف فعال تکراری","SELECT COUNT(*) FROM (SELECT branch_id FROM branch_targets WHERE is_active GROUP BY branch_id HAVING COUNT(*)>1)x"),
+                        ("تاریخ با قالب نامعتبر","SELECT COUNT(*) FROM collections WHERE shamsi_date !~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'")]:
+                        cur.execute(query); checks.append((label,cur.fetchone()[0]))
+                    return _report_header("🧹 کنترل کیفیت داده","فقط بررسی؛ بدون تغییر")+"\n".join(f"{'✅' if n==0 else '⚠️'} {label}: {n}" for label,n in checks)
+                counts=export_all_data_to_json()
+                if counts is None: return _report_header("💾 آمادگی پشتیبان‌گیری")+"❌ خواندن داده‌ها ناموفق بود."
+                total=sum(len(v) for v in counts.values())
+                return _report_header("💾 آمادگی پشتیبان‌گیری","بررسی خواندن تمام جداول")+f"✅ همه جداول قابل خواندن‌اند.\nتعداد جداول: {len(counts)}\nمجموع ردیف‌ها: {total:,}\nامضای بکاپ: فعال"
+
+            return "گزارش درخواستی شناخته نشد."
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.exception("Management report %s failed", report_key)
+        return "❌ تولید گزارش انجام نشد؛ جزئیات خطا در لاگ ثبت شد."
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+# ============================================================
 # توابع آمار واقعی
 # ============================================================
 def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
@@ -3841,6 +4115,7 @@ def get_super_admin_keyboard():
             [{"text": "⏰ تحلیل تاخیر معاونان"}],
             [{"text": "🎯 مدیریت اهداف وصولی"}, {"text": "📊 گزارش پیشرفت اهداف"}],
             [{"text": "🏆 رتبه‌بندی تحقق هدف"}],
+            [{"text": "📊 مرکز گزارش‌های مدیریتی"}],
             [{"text": "🩺 سلامت دیتابیس"}, {"text": "📦 آمار حجم جداول"}],
             [{"text": "💾 پشتیبان‌گیری از داده‌ها"}, {"text": "📂 بازیابی داده‌ها"}]
         ],
@@ -5175,6 +5450,26 @@ def handle_message(message):
         # بخش سوپرادمین
         # ============================================================
         if is_super_admin:
+            if text == "📊 مرکز گزارش‌های مدیریتی":
+                send_message(
+                    chat_id,
+                    "📊 **مرکز گزارش‌های مدیریتی**\n\nتمام گزارش‌های این بخش فقط خواندنی هستند و هیچ داده‌ای را تغییر نمی‌دهند.",
+                    get_management_reports_keyboard()
+                )
+                return
+
+            if text == "🔙 بازگشت به پنل سوپرادمین":
+                send_message(chat_id, "به پنل سوپرادمین بازگشتید.", get_super_admin_keyboard())
+                return
+
+            if text in MANAGEMENT_REPORT_BUTTONS:
+                report_key = MANAGEMENT_REPORT_BUTTONS[text]
+                send_message(chat_id, "⏳ در حال تهیه گزارش...", get_management_reports_keyboard())
+                report_text = generate_management_report(report_key)
+                send_message(chat_id, report_text, get_management_reports_keyboard())
+                log_user_activity(user_db_id, "management_report", report_key)
+                return
+
             if text == "🔧 کنترل خودکار":
                 reminder_status = "فعال ✅" if get_auto_reminder_status() else "غیرفعال ❌"
                 report_status = "فعال ✅" if get_auto_report_status() else "غیرفعال ❌"
