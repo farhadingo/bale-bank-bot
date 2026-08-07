@@ -50,6 +50,9 @@ except Exception:
     go = None
     PLOTLY_AVAILABLE = False
 
+_chart_engine_error = None
+ALLOW_LEGACY_CHART_FALLBACK = os.getenv('ALLOW_LEGACY_CHART_FALLBACK', 'false').lower() == 'true'
+
 # ============================================================
 # تنظیمات ثابت
 # ============================================================
@@ -2840,6 +2843,7 @@ MANAGEMENT_REPORT_BUTTONS = {
 }
 
 VISUAL_REPORT_BUTTONS = {
+    "🧪 تست موتور فارسی": "engine_test",
     "🏆 نمودار ۱۰ شعبه برتر": "top_branches",
     "📈 نمودار روند ۳۰ روزه": "province_trend",
     "🤝 نمودار ترکیب مشارکت": "contribution",
@@ -3456,8 +3460,36 @@ def _generate_chart_plotly(data, title, x_label, y_label, chart_type, figsize):
     width, height = int(figsize[0] * 110), int(figsize[1] * 110)
     return fig.to_image(format='png', width=width, height=height, scale=1.5, engine='kaleido')
 
+def get_chart_engine_status(force_test=False):
+    global _chart_engine_error
+    if not PLOTLY_AVAILABLE:
+        _chart_engine_error = "کتابخانه plotly نصب یا قابل import نیست"
+        return False, _chart_engine_error
+    if _chart_engine_error is None or force_test:
+        try:
+            probe = go.Figure(go.Bar(x=[1], y=[1]))
+            probe.update_layout(title="آزمون فارسی")
+            probe.to_image(format='png', width=200, height=120, engine='kaleido')
+            _chart_engine_error = ""
+        except Exception as exc:
+            _chart_engine_error = f"{type(exc).__name__}: {str(exc)[:500]}"
+    return not bool(_chart_engine_error), _chart_engine_error
+
 def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10, 6)):
+    global _chart_engine_error
     try:
+        engine_ok, engine_error = get_chart_engine_status()
+        if engine_ok:
+            try:
+                plotly_image = _generate_chart_plotly(data, title, x_label, y_label, chart_type, figsize)
+                if plotly_image:
+                    return plotly_image
+            except Exception as plotly_error:
+                _chart_engine_error = f"{type(plotly_error).__name__}: {str(plotly_error)[:500]}"
+                logger.exception("Plotly chart rendering failed")
+        if not ALLOW_LEGACY_CHART_FALLBACK:
+            logger.error("Persian chart was not generated because Plotly/Kaleido is unavailable: %s", _chart_engine_error)
+            return None
         try:
             plotly_image = _generate_chart_plotly(data, title, x_label, y_label, chart_type, figsize)
             if plotly_image:
@@ -3536,6 +3568,16 @@ def generate_chart(data, title, x_label, y_label, chart_type='bar', figsize=(10,
 
 def generate_visual_management_report(report_key):
     """Create read-only management charts from existing data."""
+    if report_key == 'engine_test':
+        ok, _ = get_chart_engine_status(force_test=True)
+        if not ok:
+            return None
+        return generate_chart(
+            {'labels':['شعبه مرکزی','میدان معلم','سعدی شمالی'],
+             'values':[1_250_000_000,980_000_000,760_000_000]},
+            'آزمون نمایش صحیح متن فارسی و عدد ۱۴۰۵',
+            'مبلغ وصول', 'نام شعبه', 'horizontal', (10,5)
+        )
     conn = None
     today = get_shamsi_date()
     start_7 = get_shamsi_date(-7)
@@ -5643,10 +5685,13 @@ def handle_message(message):
                 return
 
             if text == "📈 مرکز گزارش‌های تصویری":
-                engine = "Plotly/Kaleido" if PLOTLY_AVAILABLE else "Matplotlib fallback"
+                engine_ok, engine_error = get_chart_engine_status(force_test=True)
+                engine = "✅ Plotly/Kaleido آماده" if engine_ok else "❌ موتور فارسی آماده نیست"
                 send_message(
                     chat_id,
-                    f"📈 **مرکز گزارش‌های تصویری**\n\nموتور فعال: {engine}\nگزارش موردنظر را انتخاب کنید.",
+                    f"📈 **مرکز گزارش‌های تصویری**\n\nوضعیت: {engine}\n"
+                    + (f"علت: {engine_error}\n" if engine_error else "")
+                    + "گزارش موردنظر را انتخاب کنید.",
                     get_visual_reports_keyboard()
                 )
                 return
@@ -5671,7 +5716,11 @@ def handle_message(message):
                     send_photo(chat_id, chart_bytes, text, get_visual_reports_keyboard())
                     log_user_activity(user_db_id, "visual_management_report", report_key)
                 else:
-                    send_message(chat_id, "❌ داده کافی وجود ندارد یا تولید تصویر ناموفق بود.", get_visual_reports_keyboard())
+                    engine_ok, engine_error = get_chart_engine_status()
+                    if not engine_ok:
+                        send_message(chat_id, f"❌ موتور نمودار فارسی اجرا نشد.\nعلت: {engine_error}\n\nفایل requirements.txt جدید را نصب و سرویس را با پاک‌کردن Build Cache دوباره Deploy کنید.", get_visual_reports_keyboard())
+                    else:
+                        send_message(chat_id, "❌ داده کافی وجود ندارد یا تولید تصویر ناموفق بود.", get_visual_reports_keyboard())
                 return
 
             if text == "🔧 کنترل خودکار":
