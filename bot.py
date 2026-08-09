@@ -502,6 +502,12 @@ def validate_shamsi_date(shamsi_str):
     shamsi_str = normalize_digits(shamsi_str)
     if not re.match(r'^\d{4}/\d{2}/\d{2}$', shamsi_str):
         return False
+    try:
+        year, month, day = map(int, shamsi_str.split('/'))
+        jdatetime.date(year, month, day)
+        return True
+    except Exception:
+        return False
 
 def add_days_to_shamsi(value, days):
     """Date arithmetic through Gregorian dates for all supported jdatetime versions."""
@@ -509,12 +515,6 @@ def add_days_to_shamsi(value, days):
         value = jdatetime.date(*map(int, value.split('/')))
     gregorian = value.togregorian() + timedelta(days=days)
     return jdatetime.date.fromgregorian(date=gregorian)
-    try:
-        year, month, day = map(int, shamsi_str.split('/'))
-        jdatetime.date(year, month, day)
-        return True
-    except Exception:
-        return False
 
 def is_last_day_of_shamsi_month(shamsi_date_str):
     try:
@@ -2819,6 +2819,278 @@ def get_targets_progress_report():
     return report
 
 # ============================================================
+# همیار وصول مطالبات - موتور مشترک و کاملاً خواندنی
+# ============================================================
+def _shamsi_date_obj(value):
+    return jdatetime.date(*map(int, str(value).split('/')))
+
+def _shamsi_string(value):
+    return f"{value.year:04d}/{value.month:02d}/{value.day:02d}"
+
+def _working_dates(start_date, end_date, holidays=None):
+    holidays = set(holidays or [])
+    start = _shamsi_date_obj(start_date) if isinstance(start_date, str) else start_date
+    end = _shamsi_date_obj(end_date) if isinstance(end_date, str) else end_date
+    if end < start:
+        return []
+    result = []
+    current = start
+    while current <= end:
+        date_text = _shamsi_string(current)
+        # Friday is weekday 4 in Python's Gregorian calendar.
+        if current.togregorian().weekday() != 4 and date_text not in holidays:
+            result.append(date_text)
+        current = add_days_to_shamsi(current, 1)
+    return result
+
+def _assistant_status(actual_percent, expected_percent, days_left, achieved):
+    if achieved:
+        return "🏁", "هدف محقق شده"
+    gap = actual_percent - expected_percent
+    if days_left < 0:
+        return "⏳", "مهلت هدف پایان یافته"
+    if gap >= 10:
+        return "🔵", "جلوتر از برنامه"
+    if gap >= -5:
+        return "🟢", "روی مسیر"
+    if gap >= -15:
+        return "🟡", "نیازمند توجه"
+    if gap >= -30:
+        return "🟠", "عقب از برنامه"
+    return "🔴", "بحرانی"
+
+def build_collection_assistant_report(branch_id):
+    """Return (ok, message, metrics). It never changes database records."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT name FROM branches WHERE id=%s", (branch_id,))
+            branch_row = cur.fetchone()
+            if not branch_row:
+                return False, "❌ شعبه موردنظر پیدا نشد.", None
+            branch_name = branch_row[0]
+            cur.execute("""SELECT id,target_amount,target_date,created_at
+                           FROM branch_targets
+                           WHERE branch_id=%s AND is_active=TRUE
+                           ORDER BY created_at DESC LIMIT 1""", (branch_id,))
+            target = cur.fetchone()
+            if not target:
+                return False, f"⚪ در حال حاضر برای شعبه «{branch_name}» هدف فعالی تعریف نشده است.", None
+            target_id, target_amount, target_date, target_created_at = target
+            start_j = jdatetime.datetime.fromgregorian(datetime=target_created_at).date()
+            start_date = _shamsi_string(start_j)
+            today = get_shamsi_date()
+            cur.execute("SELECT shamsi_date FROM holidays WHERE shamsi_date BETWEEN %s AND %s",
+                        (min(start_date, target_date), max(today, target_date)))
+            holidays = {row[0] for row in cur.fetchall()}
+            cur.execute("""SELECT shamsi_date,deputy_amount,others_amount,total_amount,created_at
+                           FROM collections WHERE branch_id=%s AND shamsi_date BETWEEN %s AND %s
+                           ORDER BY shamsi_date""", (branch_id, start_date, max(today, target_date)))
+            records = cur.fetchall()
+
+        amounts = {row[0]: int(row[3] or 0) for row in records}
+        record_by_date = {row[0]: row for row in records}
+        analysis_end = min(today, target_date)
+        all_workdays = _working_dates(start_date, target_date, holidays)
+        elapsed_days = _working_dates(start_date, analysis_end, holidays) if analysis_end >= start_date else []
+        remaining_days = [day for day in all_workdays if day > today]
+        total_workdays = max(len(all_workdays), 1)
+        elapsed_count = max(len(elapsed_days), 1)
+        remaining_count = len(remaining_days)
+        collected = sum(amounts.get(day, 0) for day in elapsed_days)
+        remaining_amount = max(int(target_amount) - collected, 0)
+        actual_percent = collected * 100 / target_amount if target_amount else 0
+        expected_percent = min(len(elapsed_days) * 100 / total_workdays, 100)
+        expected_amount = int(target_amount * expected_percent / 100)
+        current_speed = collected / elapsed_count
+        required_speed = remaining_amount / remaining_count if remaining_count else remaining_amount
+        speed_gap = ((current_speed - required_speed) * 100 / required_speed) if required_speed else 0
+        target_obj = _shamsi_date_obj(target_date)
+        today_obj = _shamsi_date_obj(today)
+        days_left = (target_obj.togregorian() - today_obj.togregorian()).days
+        achieved = collected >= target_amount
+        status_icon, status_text = _assistant_status(actual_percent, expected_percent, days_left, achieved)
+
+        today_amount = amounts.get(today, 0)
+        minimum_today = max(int(required_speed * .85), 0)
+        suitable_today = max(int(required_speed), 0)
+        schedule_gap = max(expected_amount - collected, 0)
+        recovery_today = min(remaining_amount, int(required_speed + schedule_gap * .25)) if remaining_amount else 0
+
+        last_14 = elapsed_days[-14:]
+        recent_days, previous_days = last_14[-7:], last_14[-14:-7]
+        recent_avg = sum(amounts.get(day, 0) for day in recent_days) / max(len(recent_days), 1)
+        previous_avg = sum(amounts.get(day, 0) for day in previous_days) / max(len(previous_days), 1)
+        weekly_change = ((recent_avg - previous_avg) * 100 / previous_avg) if previous_avg else 0
+        recent_values = [amounts.get(day, 0) for day in recent_days]
+        mean_recent = float(np.mean(recent_values)) if recent_values else 0
+        variation = (float(np.std(recent_values)) * 100 / mean_recent) if mean_recent else 0
+        stability = "بسیار پایدار" if variation <= 15 else "پایدار" if variation <= 30 else "نسبتاً متغیر" if variation <= 55 else "پرنوسان"
+        no_report_days = sum(1 for day in elapsed_days if amounts.get(day, 0) == 0)
+        longest_gap = gap = 0
+        for day in elapsed_days:
+            if amounts.get(day, 0) == 0:
+                gap += 1; longest_gap = max(longest_gap, gap)
+            else:
+                gap = 0
+
+        period_records = [row for row in records if row[0] in elapsed_days]
+        deputy_total = sum(int(row[1] or 0) for row in period_records)
+        others_total = sum(int(row[2] or 0) for row in period_records)
+        participation_total = deputy_total + others_total
+        deputy_share = deputy_total * 100 / participation_total if participation_total else 0
+        others_share = 100 - deputy_share if participation_total else 0
+        positive_records = [row for row in period_records if int(row[3] or 0) > 0]
+        best = max(positive_records, key=lambda row: row[3]) if positive_records else None
+        worst = min(positive_records, key=lambda row: row[3]) if positive_records else None
+
+        weekday_totals = {}
+        for row in positive_records:
+            weekday = _shamsi_date_obj(row[0]).togregorian().weekday()
+            weekday_totals.setdefault(weekday, []).append(int(row[3]))
+        weekday_names = {0:'دوشنبه',1:'سه‌شنبه',2:'چهارشنبه',3:'پنجشنبه',4:'جمعه',5:'شنبه',6:'یکشنبه'}
+        weekday_averages = {day: sum(vals)/len(vals) for day,vals in weekday_totals.items() if vals}
+        strongest_day = max(weekday_averages, key=weekday_averages.get) if weekday_averages else None
+        weakest_day = min(weekday_averages, key=weekday_averages.get) if weekday_averages else None
+
+        forecast_speed = recent_avg if recent_days else current_speed
+        forecast_total = collected + forecast_speed * remaining_count
+        forecast_percent = forecast_total * 100 / target_amount if target_amount else 0
+        consistency_factor = max(0.55, 1 - min(variation, 90) / 200)
+        probability = max(2, min(98, (forecast_percent / 100) * 78 * consistency_factor + (actual_percent / max(expected_percent, 1)) * 22))
+
+        today_row = record_by_date.get(today)
+        if today_row:
+            registered_at = today_row[4].astimezone(IRAN_TZ) if today_row[4].tzinfo else today_row[4].replace(tzinfo=timezone.utc).astimezone(IRAN_TZ)
+            timing = "به‌موقع" if (registered_at.hour, registered_at.minute) <= (SCORE_DEADLINE_HOUR, SCORE_DEADLINE_MINUTE) else "دیرهنگام"
+            today_text = (f"✅ وصول ثبت‌شده امروز: {_fmt_money(today_amount)}\n"
+                          f"📌 مقدار مناسب امروز: {_fmt_money(suitable_today)}\n"
+                          f"↕️ اختلاف: {_fmt_money(abs(today_amount-suitable_today))} {'بالاتر' if today_amount>=suitable_today else 'پایین‌تر'} از برنامه\n"
+                          f"🕒 زمان ثبت: {registered_at.strftime('%H:%M')} — {timing}")
+        else:
+            deadline = get_iran_time().replace(hour=SCORE_DEADLINE_HOUR, minute=SCORE_DEADLINE_MINUTE, second=0, microsecond=0)
+            seconds_left = max(int((deadline-get_iran_time()).total_seconds()),0)
+            time_left = f"{seconds_left//3600} ساعت و {(seconds_left%3600)//60} دقیقه" if seconds_left else "مهلت امروز پایان یافته"
+            today_text = f"⏳ امروز هنوز وصولی ثبت نشده است.\n📌 مقدار مناسب امروز: {_fmt_money(suitable_today)}\n🕒 زمان باقی‌مانده: {time_left}"
+
+        insights = []
+        insights.append(f"سرعت فعلی {abs(speed_gap):.1f}٪ {'بیشتر' if speed_gap>=0 else 'کمتر'} از سرعت موردنیاز است.")
+        insights.append(f"روند هفت‌روزه نسبت به هفته قبل {abs(weekly_change):.1f}٪ {'رشد' if weekly_change>=0 else 'افت'} داشته است.")
+        if strongest_day is not None:
+            insights.append(f"{weekday_names[strongest_day]} قوی‌ترین روز شعبه با میانگین {_fmt_money(weekday_averages[strongest_day])} است.")
+        elif no_report_days:
+            insights.append(f"در دوره هدف {no_report_days} روز کاری بدون ثبت وجود دارد.")
+        else:
+            insights.append(f"عملکرد دوره با نوسان {variation:.1f}٪ در وضعیت {stability} قرار دارد.")
+
+        if achieved:
+            summary = f"هدف شعبه محقق شده و میزان تحقق به {actual_percent:.1f}٪ رسیده است."
+        elif days_left < 0:
+            summary = f"مهلت هدف پایان یافته و تحقق نهایی {actual_percent:.1f}٪ بوده است."
+        elif actual_percent >= expected_percent - 5:
+            summary = f"شعبه روی مسیر هدف قرار دارد و با حفظ میانگین روزانه {_fmt_money(required_speed)} می‌تواند هدف را محقق کند."
+        else:
+            summary = f"شعبه از برنامه زمانی عقب است و برای رسیدن به هدف به میانگین روزانه {_fmt_money(required_speed)} نیاز دارد."
+
+        msg = (
+            f"🤖 **همیار وصول مطالبات**\n🏢 شعبه: {branch_name}\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"{status_icon} **وضعیت: {status_text}**\n🎯 هدف: {_fmt_money(target_amount)}\n"
+            f"💰 وصول انجام‌شده: {_fmt_money(collected)}\n📊 تحقق: {actual_percent:.1f}٪\n"
+            f"📉 باقی‌مانده: {_fmt_money(remaining_amount)}\n📅 روزهای کاری باقی‌مانده: {remaining_count}\n\n"
+            f"⚡ **سرعت حرکت**\nمیانگین روزانه فعلی: {_fmt_money(current_speed)}\n"
+            f"میانگین روزانه لازم: {_fmt_money(required_speed)}\nاختلاف سرعت: {speed_gap:+.1f}٪\n\n"
+            f"📌 **پیشنهاد امروز**\nحداقل قابل‌قبول: {_fmt_money(minimum_today)}\n"
+            f"مقدار مناسب: {_fmt_money(suitable_today)}\nمقدار جبرانی: {_fmt_money(recovery_today)}\n\n"
+            f"📐 **برنامه زمانی**\nزمان سپری‌شده: {expected_percent:.1f}٪\nپیشرفت واقعی: {actual_percent:.1f}٪\n"
+            f"فاصله از برنامه: {actual_percent-expected_percent:+.1f} واحد درصد\n\n"
+            f"🔮 **پیش‌بینی موعد هدف**\nوصول پیش‌بینی‌شده: {_fmt_money(forecast_total)}\n"
+            f"تحقق پیش‌بینی‌شده: {forecast_percent:.1f}٪\nاحتمال تحقق کامل: {probability:.0f}٪\n\n"
+            f"📈 **روند و ثبات**\nمیانگین ۷ روز اخیر: {_fmt_money(recent_avg)}\n"
+            f"تغییر با ۷ روز قبل: {weekly_change:+.1f}٪\nثبات: {stability} | نوسان: {variation:.1f}٪\n"
+            f"روزهای بدون ثبت: {no_report_days} | طولانی‌ترین وقفه: {longest_gap} روز\n\n"
+            f"🤝 **ترکیب مشارکت**\nسهم معاون: {deputy_share:.1f}٪ | سهم همکاران: {others_share:.1f}٪\n\n"
+        )
+        if best:
+            msg += f"🏆 بهترین روز: {get_shamsi_date_formatted(best[0])} — {_fmt_money(best[3])}\n"
+        if worst:
+            msg += f"📉 ضعیف‌ترین روز ثبت‌شده: {get_shamsi_date_formatted(worst[0])} — {_fmt_money(worst[3])}\n"
+        if strongest_day is not None and weakest_day is not None:
+            msg += (f"📆 قوی‌ترین روز: {weekday_names[strongest_day]} ({_fmt_money(weekday_averages[strongest_day])})\n"
+                    f"📆 ضعیف‌ترین روز: {weekday_names[weakest_day]} ({_fmt_money(weekday_averages[weakest_day])})\n")
+        msg += f"\n📍 **عملکرد امروز**\n{today_text}\n\n🧠 **نکات همیار**\n"
+        msg += "\n".join(f"{idx}. {text}" for idx,text in enumerate(insights[:3],1))
+        msg += f"\n\n📋 **جمع‌بندی:** {summary}"
+
+        cumulative = 0
+        actual_path = []
+        expected_path = []
+        forecast_path = []
+        for index, day in enumerate(all_workdays, 1):
+            if day <= today:
+                cumulative += amounts.get(day, 0)
+                actual_path.append(cumulative)
+                forecast_path.append(cumulative)
+            else:
+                actual_path.append(None)
+                forecast_path.append(collected + forecast_speed * len([d for d in remaining_days if d <= day]))
+            expected_path.append(target_amount * index / total_workdays)
+        metrics = {
+            'branch_name': branch_name, 'target_id': target_id, 'target_amount': target_amount,
+            'labels': all_workdays, 'actual_path': actual_path, 'expected_path': expected_path,
+            'forecast_path': forecast_path, 'actual_percent': actual_percent, 'status': status_text,
+        }
+        return True, msg, metrics
+    except Exception:
+        if conn: conn.rollback()
+        logger.exception("Collection assistant report failed for branch_id=%s", branch_id)
+        return False, "❌ تولید گزارش همیار انجام نشد؛ جزئیات خطا ثبت شد.", None
+    finally:
+        if conn: return_db_connection(conn)
+
+def generate_collection_assistant_chart(metrics):
+    if not metrics:
+        return None
+    ok, _ = get_chart_engine_status()
+    if not ok:
+        return None
+    try:
+        labels = [_rtl_plotly_text(label) for label in metrics['labels']]
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=labels,y=metrics['expected_path'],mode='lines',name=_rtl_plotly_text('مسیر موردانتظار'),line=dict(color='#94A3B8',dash='dash',width=3)))
+        fig.add_trace(go.Scatter(x=labels,y=metrics['actual_path'],mode='lines+markers',name=_rtl_plotly_text('وصول واقعی'),line=dict(color='#2563EB',width=4)))
+        fig.add_trace(go.Scatter(x=labels,y=metrics['forecast_path'],mode='lines',name=_rtl_plotly_text('پیش‌بینی'),line=dict(color='#F59E0B',dash='dot',width=3)))
+        fig.update_layout(title=dict(text=f"<span dir='rtl'>مسیر هدف شعبه {html.escape(metrics['branch_name'])}</span>",x=.5),
+                          xaxis_title="تاریخ",yaxis_title="مبلغ وصول",font=dict(family="Vazirmatn, Noto Sans Arabic, DejaVu Sans",size=13),
+                          paper_bgcolor='white',plot_bgcolor='white',legend=dict(orientation='h',y=1.08),margin=dict(l=80,r=50,t=100,b=90))
+        fig.update_xaxes(tickangle=-45,gridcolor='#E5E7EB'); fig.update_yaxes(gridcolor='#E5E7EB')
+        return fig.to_image(format='png',width=1400,height=800,scale=1.3,engine='kaleido')
+    except Exception:
+        logger.exception("Collection assistant chart failed")
+        return None
+
+def send_collection_assistant_report(chat_id, branch_id, keyboard, viewer_user_id=None):
+    ok, message, metrics = build_collection_assistant_report(branch_id)
+    send_message(chat_id, message, keyboard)
+    if ok:
+        chart = generate_collection_assistant_chart(metrics)
+        if chart:
+            send_photo(chat_id, chart, f"📈 مسیر هدف — {metrics['branch_name']}", keyboard)
+        if viewer_user_id:
+            log_user_activity(viewer_user_id, "collection_assistant_view", f"branch_id={branch_id}")
+    return ok
+
+def get_assistant_branch_keyboard(branches):
+    rows = []
+    for index in range(0, len(branches), 2):
+        row = [{"text": f"🏢 {branches[index][1]}"}]
+        if index + 1 < len(branches):
+            row.append({"text": f"🏢 {branches[index + 1][1]}"})
+        rows.append(row)
+    rows.append([{"text":"🔙 انصراف"}])
+    return {"keyboard":rows,"resize_keyboard":True}
+
+# ============================================================
 # مرکز گزارش‌های مدیریتی سوپرادمین (تماماً خواندنی)
 # ============================================================
 MANAGEMENT_REPORT_BUTTONS = {
@@ -4286,6 +4558,7 @@ def send_maintenance_message(chat_id):
 def get_deputy_keyboard():
     return {
         "keyboard": [
+            [{"text": "🤖 همیار وصول مطالبات"}],
             [{"text": "💰 ثبت وصولی روزانه"}, {"text": "📊 گزارش وصولی"}],
             [{"text": "📈 مقایسه عملکرد"}, {"text": "📋 مشاهده ثبت امروز"}],
             [{"text": "📅 گزارش تاریخ خاص"}, {"text": "📊 تاریخچه کامل"}],
@@ -4299,6 +4572,7 @@ def get_deputy_keyboard():
 def get_admin_keyboard():
     return {
         "keyboard": [
+            [{"text": "👁 مشاهده وضعیت همیار"}],
             [{"text": "📊 گزارش امروز"}, {"text": "📈 گزارش ۱۰ روز اخیر"}],
             [{"text": "🏆 رتبه‌بندی شعب"}, {"text": "💹 آمار مفصل امروز"}],
             [{"text": "📉 مقایسه روزانه"}, {"text": "🎯 تحلیل مدیریتی"}],
@@ -4317,6 +4591,7 @@ def get_admin_keyboard():
 def get_super_admin_keyboard():
     return {
         "keyboard": [
+            [{"text": "👁 مشاهده وضعیت همیار"}],
             [{"text": "👥 مدیریت کاربران"}, {"text": "📊 مدیریت گزارش‌ها"}],
             [{"text": "👥 مدیریت معاونین"}, {"text": "📋 مشاهده لاگ‌ها"}],
             [{"text": "📊 گزارش امروز"}, {"text": "📈 گزارش ۱۰ روز اخیر"}],
@@ -5045,6 +5320,39 @@ def handle_message(message):
         branch_name = user_data["branch_name"]
         user_db_id = user_data["db_id"]
         is_super_admin = user_data.get("is_super_admin", False)
+
+        # ===== State: انتخاب شعبه برای مشاهده همیار توسط مدیران =====
+        if current_state == "WAITING_FOR_ASSISTANT_BRANCH":
+            if not (role == 'admin' or is_super_admin):
+                user_states.update(chat_id, {"state": "LOGGED_IN"})
+                send_message(chat_id, "⛔ دسترسی به این بخش برای شما مجاز نیست.", get_keyboard(role, is_super_admin))
+                return
+            if text == "🔙 انصراف":
+                user_states.update(chat_id, {"state": "LOGGED_IN", "assistant_branches": []})
+                send_message(chat_id, "به منوی اصلی بازگشتید.", get_keyboard(role, is_super_admin))
+                return
+            allowed_branches = user_state.get("assistant_branches") or get_all_branches()
+            selected = next(
+                ((item[0], item[1]) for item in allowed_branches if text == f"🏢 {item[1]}"),
+                None
+            )
+            if not selected:
+                send_message(
+                    chat_id,
+                    "❌ لطفاً شعبه را فقط از فهرست زیر انتخاب کنید.",
+                    get_assistant_branch_keyboard(allowed_branches)
+                )
+                return
+            selected_id, selected_name = selected
+            user_states.update(chat_id, {"state": "LOGGED_IN", "assistant_branches": []})
+            send_message(chat_id, f"⏳ در حال تهیه گزارش همیار شعبه {selected_name}...", get_keyboard(role, is_super_admin))
+            send_collection_assistant_report(
+                chat_id,
+                selected_id,
+                get_keyboard(role, is_super_admin),
+                user_db_id
+            )
+            return
 
         # ===== State: WAITING_FOR_DEPUTY_AMOUNT =====
         if current_state == "WAITING_FOR_DEPUTY_AMOUNT":
@@ -6562,6 +6870,22 @@ def handle_message(message):
         # ادامه منوی ادمین
         # ============================================================
         if role == 'admin' or is_super_admin:
+            if text == "👁 مشاهده وضعیت همیار":
+                branches = get_all_branches()
+                if not branches:
+                    send_message(chat_id, "❌ فهرست شعب در دسترس نیست.", get_keyboard(role, is_super_admin))
+                    return
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_ASSISTANT_BRANCH",
+                    "assistant_branches": branches
+                })
+                send_message(
+                    chat_id,
+                    "🏢 شعبه موردنظر را برای مشاهده همان گزارش همیار معاون انتخاب کنید:",
+                    get_assistant_branch_keyboard(branches)
+                )
+                return
+
             if text == "🎯 تحلیل مدیریتی":
                 if is_holiday():
                     send_message(chat_id, "📅 امروز تعطیل است، گزارشی ثبت نشده است.", get_keyboard(role, is_super_admin))
@@ -7253,6 +7577,14 @@ def handle_message(message):
         # منوی معاون
         # ============================================================
         if role == 'deputy':
+            if text == "🤖 همیار وصول مطالبات":
+                if not branch_id:
+                    send_message(chat_id, "❌ برای حساب شما شعبه‌ای تعیین نشده است.", get_deputy_keyboard())
+                    return
+                send_message(chat_id, "⏳ در حال تهیه گزارش اختصاصی همیار وصول مطالبات...", get_deputy_keyboard())
+                send_collection_assistant_report(chat_id, branch_id, get_deputy_keyboard(), user_db_id)
+                return
+
             if text == "💰 ثبت وصولی روزانه":
                 shamsi_today = get_shamsi_date()
                 if is_holiday(shamsi_today):
