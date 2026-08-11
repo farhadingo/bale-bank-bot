@@ -63,15 +63,29 @@ EDIT_DEADLINE_HOUR = 23   # تا پایان همان روز
 EDIT_DEADLINE_MINUTE = 59
 SCORE_DEADLINE_HOUR = 16   # ۱۶:۳۰
 SCORE_DEADLINE_MINUTE = 30
+MAX_AMOUNT_MILLIONS = 4_000_000_000_000
 BACKUP_FORMAT_VERSION = 3
 BACKUP_SECRET = os.getenv("SUPER_ADMIN_PASSWORD", "")
 MAX_BACKUP_COMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_BYTES", 25 * 1024 * 1024))
 MAX_BACKUP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_UNCOMPRESSED_BYTES", 200 * 1024 * 1024))
+ALLOW_UNSIGNED_LEGACY_BACKUP = os.getenv("ALLOW_UNSIGNED_LEGACY_BACKUP", "false").lower() == "true"
 BACKUP_TABLES = (
     'branches', 'users', 'collections', 'notes', 'user_activity_log',
     'settings', 'holidays', 'problems', 'scores', 'feature_settings',
     'actual_stats', 'branch_targets'
 )
+RESTORE_IDENTITY_FIELDS = {
+    'branches': ('name',),
+    'users': ('employee_number',),
+    'collections': ('branch_id', 'shamsi_date'),
+    'notes': ('collection_id', 'user_id'),
+    'user_activity_log': ('user_id', 'action', 'created_at'),
+    'holidays': ('shamsi_date',),
+    'problems': ('user_id', 'created_at'),
+    'scores': ('collection_id',),
+    'actual_stats': ('branch_id', 'shamsi_date'),
+    'branch_targets': ('branch_id', 'target_date', 'created_at'),
+}
 
 # ============================================================
 # تنظیمات لاگین
@@ -118,10 +132,27 @@ logger.info(f"✅ Bale API URL: {safe_base_url}")
 # Flask
 # ============================================================
 flask_app = Flask(__name__)
+_scheduler = None
 
 @flask_app.route('/health')
 def health():
-    return jsonify({"status": "healthy", "timestamp": time.time()})
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        scheduler_ok = bool(_scheduler and _scheduler.running)
+        status = "healthy" if scheduler_ok else "degraded"
+        return jsonify({"status": status, "database": "ok", "scheduler": scheduler_ok,
+                        "timestamp": time.time()}), (200 if scheduler_ok else 503)
+    except Exception:
+        logger.exception("Health check failed")
+        return jsonify({"status": "unhealthy", "database": "error", "scheduler": False,
+                        "timestamp": time.time()}), 503
+    finally:
+        if conn:
+            return_db_connection(conn)
 
 @flask_app.route('/')
 def root():
@@ -168,6 +199,7 @@ class SafeConnectionPool:
         self._pool = None
         self._lock = threading.RLock()
         self._direct_connection_ids = set()
+        self._direct_semaphore = threading.BoundedSemaphore(5)
         self._create_pool()
 
     def _create_pool(self):
@@ -188,13 +220,17 @@ class SafeConnectionPool:
                 try:
                     return self._pool.getconn()
                 except Exception as e:
-                    logger.error(f"Pool getconn error: {e}, falling back to direct connect")
-                    conn = psycopg2.connect(self.dsn)
-                    self._direct_connection_ids.add(id(conn))
-                    return conn
-            conn = psycopg2.connect(self.dsn)
-            self._direct_connection_ids.add(id(conn))
-            return conn
+                    logger.error(f"Pool getconn error: {e}")
+                    raise
+            if not self._direct_semaphore.acquire(timeout=10):
+                raise psycopg2.OperationalError("Direct database connection limit reached")
+            try:
+                conn = psycopg2.connect(self.dsn)
+                self._direct_connection_ids.add(id(conn))
+                return conn
+            except Exception:
+                self._direct_semaphore.release()
+                raise
 
     def putconn(self, conn):
         if conn is None:
@@ -204,8 +240,10 @@ class SafeConnectionPool:
                 self._direct_connection_ids.discard(id(conn))
                 try:
                     conn.close()
-                except:
+                except Exception:
                     pass
+                finally:
+                    self._direct_semaphore.release()
                 return
             if self._pool is not None:
                 try:
@@ -215,7 +253,7 @@ class SafeConnectionPool:
                     logger.error(f"Pool putconn error: {e}, closing directly")
             try:
                 conn.close()
-            except:
+            except Exception:
                 pass
 
 db_pool = SafeConnectionPool(5, 30, DB_URL)
@@ -351,6 +389,9 @@ def normalize_digits(text):
     text = text.replace(',', '').replace('،', '').replace(' ', '')
     return text
 
+def safe_log_value(value, limit=200):
+    return re.sub(r'[\r\n\t]+', ' ', str(value))[:limit]
+
 def parse_number(text):
     try:
         if not text or text.strip() == '':
@@ -367,7 +408,7 @@ def parse_number(text):
             return int(float(text))
         return int(text)
     except (OverflowError, ValueError, MemoryError):
-        logger.error(f"parse_number error for '{text}'")
+        logger.error("parse_number error for '%s'", safe_log_value(text))
         return None
 
 def escape_markdown(text):
@@ -671,9 +712,20 @@ def create_all_tables_if_not_exists():
                 )
             """)
             cur.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_active_target
-                ON branch_targets(branch_id)
-                WHERE is_active = TRUE
+                DO $safe_index$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public'
+                                   AND indexname='idx_unique_active_target') THEN
+                        IF NOT EXISTS (SELECT branch_id FROM branch_targets WHERE is_active=TRUE
+                                       GROUP BY branch_id HAVING COUNT(*) > 1) THEN
+                            EXECUTE 'CREATE UNIQUE INDEX idx_unique_active_target '
+                                    'ON branch_targets(branch_id) WHERE is_active=TRUE';
+                        ELSE
+                            RAISE WARNING 'Active target duplicates exist; unique index was not created';
+                        END IF;
+                    END IF;
+                END
+                $safe_index$;
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_branch_date ON collections(branch_id, shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_shamsi ON collections(shamsi_date);")
@@ -993,11 +1045,20 @@ def get_consecutive_days(branch_id, shamsi_date):
             if not dates:
                 return 0
             target_date = jdatetime.date(*map(int, shamsi_date.split('/')))
+            earliest = add_days_to_shamsi(target_date, -45)
+            cur.execute("SELECT shamsi_date FROM holidays WHERE shamsi_date BETWEEN %s AND %s",
+                        (_shamsi_string(earliest), shamsi_date))
+            holidays = {row[0] for row in cur.fetchall()}
             count = 0
-            # فقط روزهای کاری را در نظر می‌گیریم (اینجا ساده‌سازی شده)
-            for i in range(1, 30):
-                check_date = add_days_to_shamsi(target_date, -i)
+            checked_workdays = 0
+            offset = 1
+            while checked_workdays < 29 and offset <= 45:
+                check_date = add_days_to_shamsi(target_date, -offset)
+                offset += 1
                 check_str = f"{check_date.year}/{check_date.month:02d}/{check_date.day:02d}"
+                if check_date.togregorian().weekday() == 4 or check_str in holidays:
+                    continue
+                checked_workdays += 1
                 if check_str in dates:
                     count += 1
                 else:
@@ -1418,6 +1479,9 @@ def can_edit_collection(collection_created_at):
 def save_or_update_collection_with_note(branch_id, deputy_amount_millions, others_amount_millions, shamsi_date, user_id, note_text=None, update_existing=False):
     conn = None
     created_at_iran = get_iran_time()
+    if not (0 <= deputy_amount_millions <= MAX_AMOUNT_MILLIONS and
+            0 <= others_amount_millions <= MAX_AMOUNT_MILLIONS):
+        return False, None
     deputy_amount = deputy_amount_millions * 1_000_000
     others_amount = others_amount_millions * 1_000_000
     collection_id = None
@@ -1441,7 +1505,7 @@ def save_or_update_collection_with_note(branch_id, deputy_amount_millions, other
                 result = cur.fetchone()
                 if result:
                     collection_id = result[0]
-                    delete_score(collection_id)
+                    cur.execute("DELETE FROM scores WHERE collection_id = %s", (collection_id,))
                 else:
                     return False, None
             else:
@@ -1559,18 +1623,24 @@ def get_today_province_report(shamsi_date):
                 ORDER BY COALESCE(c.total_amount, 0) DESC
             """, (shamsi_date,))
             raw_result = cur.fetchall()
+            target_starts = {}
+            for row in raw_result:
+                if row[5] is not None and row[7] is not None:
+                    target_start = jdatetime.datetime.fromgregorian(datetime=row[7])
+                    target_starts[row[0]] = f"{target_start.year}/{target_start.month:02d}/{target_start.day:02d}"
+            collected_by_branch = {branch_id: 0 for branch_id in target_starts}
+            if target_starts:
+                cur.execute("""SELECT branch_id, shamsi_date, total_amount
+                               FROM collections
+                               WHERE branch_id = ANY(%s) AND shamsi_date <= %s""",
+                            (list(target_starts), shamsi_date))
+                for collection_branch, collection_date, amount in cur.fetchall():
+                    if collection_date >= target_starts[collection_branch]:
+                        collected_by_branch[collection_branch] += int(amount or 0)
             result = []
             for row in raw_result:
                 row = list(row)
-                if row[5] is not None and row[7] is not None:
-                    target_start = jdatetime.datetime.fromgregorian(datetime=row[7])
-                    start_date = f"{target_start.year}/{target_start.month:02d}/{target_start.day:02d}"
-                    cur.execute("""
-                        SELECT COALESCE(SUM(total_amount), 0)
-                        FROM collections
-                        WHERE branch_id=%s AND shamsi_date BETWEEN %s AND %s
-                    """, (row[0], start_date, shamsi_date))
-                    row[8] = cur.fetchone()[0]
+                row[8] = collected_by_branch.get(row[0], 0)
                 result.append(tuple(row))
             cache_today_report.set(cache_key, result)
             return result
@@ -1944,17 +2014,28 @@ def delete_user(user_id):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM collections WHERE recorded_by = %s", (user_id,))
-            if cur.fetchone()[0] > 0:
-                return False, "این کاربر دارای سابقه وصول است و قابل حذف نمی‌باشد"
+            cur.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM collections WHERE recorded_by=%s),
+                    (SELECT COUNT(*) FROM notes WHERE user_id=%s),
+                    (SELECT COUNT(*) FROM user_activity_log WHERE user_id=%s),
+                    (SELECT COUNT(*) FROM problems WHERE user_id=%s),
+                    (SELECT COUNT(*) FROM actual_stats WHERE recorded_by=%s),
+                    (SELECT COUNT(*) FROM branch_targets WHERE created_by=%s)
+            """, (user_id, user_id, user_id, user_id, user_id, user_id))
+            dependencies = cur.fetchone()
+            if any(dependencies):
+                return False, "این کاربر دارای سابقه عملیاتی است؛ برای حفظ اطلاعات امکان حذف فیزیکی وجود ندارد"
             cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+            if cur.rowcount != 1:
+                return False, "کاربر یافت نشد"
             conn.commit()
             return True, "حذف شد"
     except Exception as e:
         logger.error(f"delete_user: {e}")
         if conn:
             conn.rollback()
-        return False, str(e)
+        return False, "حذف کاربر انجام نشد؛ جزئیات خطا ثبت شد"
     finally:
         if conn:
             return_db_connection(conn)
@@ -1983,30 +2064,12 @@ def get_all_collections(limit=100):
             return_db_connection(conn)
 
 def delete_collection(collection_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM collections WHERE id = %s", (collection_id,))
-            conn.commit()
-            cache_today_report.invalidate_all()
-            cache_top_branches.invalidate('top5')
-            cache_10day_report.invalidate('10day')
-            cache_adaptive.invalidate('adaptive')
-            cache_forecast_all.invalidate('forecast_all')
-            invalidate_branches_cache()
-            cache_targets.invalidate_all()
-            return True
-    except Exception as e:
-        logger.error(f"delete_collection: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_db_connection(conn)
+    logger.warning("Physical collection deletion blocked to preserve historical data; id=%s", collection_id)
+    return False
 
 def update_collection(collection_id, deputy_amount, others_amount):
+    if deputy_amount < 0 or others_amount < 0:
+        return False
     conn = None
     try:
         conn = get_db_connection()
@@ -2016,6 +2079,10 @@ def update_collection(collection_id, deputy_amount, others_amount):
                 SET deputy_amount = %s, others_amount = %s, updated_at = %s
                 WHERE id = %s
             """, (deputy_amount, others_amount, get_iran_time(), collection_id))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
+            cur.execute("DELETE FROM scores WHERE collection_id = %s", (collection_id,))
             conn.commit()
             cache_today_report.invalidate_all()
             cache_top_branches.invalidate('top5')
@@ -2024,7 +2091,6 @@ def update_collection(collection_id, deputy_amount, others_amount):
             cache_forecast_all.invalidate('forecast_all')
             invalidate_branches_cache()
             cache_targets.invalidate_all()
-            delete_score(collection_id)
             return True
     except Exception as e:
         logger.error(f"update_collection: {e}")
@@ -2036,28 +2102,15 @@ def update_collection(collection_id, deputy_amount, others_amount):
             return_db_connection(conn)
 
 def reset_all_collections():
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM collections")
-            conn.commit()
-            cache_today_report.invalidate_all()
-            cache_top_branches.invalidate('top5')
-            cache_10day_report.invalidate('10day')
-            cache_adaptive.invalidate('adaptive')
-            cache_forecast_all.invalidate('forecast_all')
-            invalidate_branches_cache()
-            cache_targets.invalidate_all()
-            return True
-    except Exception as e:
-        logger.error(f"reset_all_collections: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        if conn:
-            return_db_connection(conn)
+    """بازنشانی امن خروجی گزارش‌ها؛ هیچ رکوردی از دیتابیس حذف نمی‌شود."""
+    cache_today_report.invalidate_all()
+    cache_top_branches.invalidate_all()
+    cache_10day_report.invalidate_all()
+    cache_adaptive.invalidate_all()
+    cache_forecast_all.invalidate_all()
+    invalidate_branches_cache()
+    cache_targets.invalidate_all()
+    return True
 
 def get_all_deputies():
     conn = None
@@ -2680,6 +2733,8 @@ def get_active_target(branch_id):
                 SELECT id, branch_id, target_amount, target_date, created_by, created_at
                 FROM branch_targets
                 WHERE branch_id = %s AND is_active = TRUE
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
             """, (branch_id,))
             result = cur.fetchone()
             if result:
@@ -2703,16 +2758,19 @@ def get_active_target(branch_id):
         if conn:
             return_db_connection(conn)
 
-def get_branch_collection_since_date(branch_id, start_date):
+def get_branch_collection_since_date(branch_id, start_date, end_date=None):
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COALESCE(SUM(total_amount), 0)
-                FROM collections
-                WHERE branch_id = %s AND shamsi_date >= %s
-            """, (branch_id, start_date))
+            if end_date:
+                cur.execute("""SELECT COALESCE(SUM(total_amount), 0) FROM collections
+                               WHERE branch_id=%s AND shamsi_date BETWEEN %s AND %s""",
+                            (branch_id, start_date, end_date))
+            else:
+                cur.execute("""SELECT COALESCE(SUM(total_amount), 0) FROM collections
+                               WHERE branch_id=%s AND shamsi_date >= %s""",
+                            (branch_id, start_date))
             return cur.fetchone()[0]
     except Exception as e:
         logger.error(f"get_branch_collection_since_date error: {e}")
@@ -2730,12 +2788,13 @@ def get_target_progress(branch_id, target_date, target_amount, created_at=None):
         start_date = f"{start_date_obj.year}/{start_date_obj.month:02d}/{start_date_obj.day:02d}"
     else:
         start_date = shamsi_today
-    collected = get_branch_collection_since_date(branch_id, start_date)
+    collection_end = min(shamsi_today, target_date)
+    collected = get_branch_collection_since_date(branch_id, start_date, collection_end)
     progress_percent = (collected / target_amount * 100) if target_amount > 0 else 0
     try:
         target_date_obj = jdatetime.date(*map(int, target_date.split('/')))
         today_obj = jdatetime.date(*map(int, shamsi_today.split('/')))
-        days_left = (target_date_obj - today_obj).days
+        days_left = (target_date_obj.togregorian() - today_obj.togregorian()).days
     except Exception:
         days_left = 0
     remaining = target_amount - collected
@@ -2783,7 +2842,12 @@ def delete_target(target_id):
             if not result:
                 return False
             branch_id = result[0]
-            cur.execute("DELETE FROM branch_targets WHERE id = %s", (target_id,))
+            cur.execute("""UPDATE branch_targets
+                           SET is_active=FALSE, updated_at=%s
+                           WHERE id=%s AND is_active=TRUE""", (get_iran_time(), target_id))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return False
             conn.commit()
             cache_targets.invalidate(f'target_{branch_id}')
             cache_targets.invalidate_all()
@@ -2893,8 +2957,9 @@ def build_collection_assistant_report(branch_id):
         record_by_date = {row[0]: row for row in records}
         analysis_end = min(today, target_date)
         all_workdays = _working_dates(start_date, target_date, holidays)
-        elapsed_days = _working_dates(start_date, analysis_end, holidays) if analysis_end >= start_date else []
-        remaining_days = [day for day in all_workdays if day > today]
+        candidate_elapsed = _working_dates(start_date, analysis_end, holidays) if analysis_end >= start_date else []
+        elapsed_days = [day for day in candidate_elapsed if day < today or day in record_by_date]
+        remaining_days = [day for day in all_workdays if day > today or (day == today and day not in record_by_date)]
         total_workdays = max(len(all_workdays), 1)
         elapsed_count = max(len(elapsed_days), 1)
         remaining_count = len(remaining_days)
@@ -2926,7 +2991,7 @@ def build_collection_assistant_report(branch_id):
         recent_values = [amounts.get(day, 0) for day in recent_days]
         mean_recent = float(np.mean(recent_values)) if recent_values else 0
         variation = (float(np.std(recent_values)) * 100 / mean_recent) if mean_recent else 0
-        stability = "بسیار پایدار" if variation <= 15 else "پایدار" if variation <= 30 else "نسبتاً متغیر" if variation <= 55 else "پرنوسان"
+        stability = "داده کافی نیست" if mean_recent == 0 else "بسیار پایدار" if variation <= 15 else "پایدار" if variation <= 30 else "نسبتاً متغیر" if variation <= 55 else "پرنوسان"
         no_report_days = sum(1 for day in elapsed_days if amounts.get(day, 0) == 0)
         longest_gap = gap = 0
         for day in elapsed_days:
@@ -2959,6 +3024,10 @@ def build_collection_assistant_report(branch_id):
         forecast_percent = forecast_total * 100 / target_amount if target_amount else 0
         consistency_factor = max(0.55, 1 - min(variation, 90) / 200)
         probability = max(2, min(98, (forecast_percent / 100) * 78 * consistency_factor + (actual_percent / max(expected_percent, 1)) * 22))
+        if achieved:
+            probability = 100
+        elif days_left < 0:
+            probability = 0
 
         today_row = record_by_date.get(today)
         if today_row:
@@ -3005,7 +3074,7 @@ def build_collection_assistant_report(branch_id):
             f"📐 **برنامه زمانی**\nزمان سپری‌شده: {expected_percent:.1f}٪\nپیشرفت واقعی: {actual_percent:.1f}٪\n"
             f"فاصله از برنامه: {actual_percent-expected_percent:+.1f} واحد درصد\n\n"
             f"🔮 **پیش‌بینی موعد هدف**\nوصول پیش‌بینی‌شده: {_fmt_money(forecast_total)}\n"
-            f"تحقق پیش‌بینی‌شده: {forecast_percent:.1f}٪\nاحتمال تحقق کامل: {probability:.0f}٪\n\n"
+            f"تحقق پیش‌بینی‌شده: {forecast_percent:.1f}٪\nامتیاز تقریبی احتمال تحقق: {probability:.0f}٪\n\n"
             f"📈 **روند و ثبات**\nمیانگین ۷ روز اخیر: {_fmt_money(recent_avg)}\n"
             f"تغییر با ۷ روز قبل: {weekly_change:+.1f}٪\nثبات: {stability} | نوسان: {variation:.1f}٪\n"
             f"روزهای بدون ثبت: {no_report_days} | طولانی‌ترین وقفه: {longest_gap} روز\n\n"
@@ -3608,15 +3677,22 @@ def get_forecast(branch_id=None, days=7):
             ss_res = np.sum((y - y_pred_all) ** 2)
             r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
             last_date = dates[-1]
+            last_shamsi = data[0][0]
+            cur.execute("SELECT shamsi_date FROM holidays WHERE shamsi_date > %s", (last_shamsi,))
+            future_holidays = {row[0] for row in cur.fetchall()}
             forecast = []
-            for i in range(1, days + 1):
-                future_date = last_date + i
+            calendar_offset = 1
+            while len(forecast) < days and calendar_offset <= days * 4:
+                future_date = last_date + calendar_offset
+                calendar_offset += 1
+                future_greg_date = datetime.fromordinal(future_date).date()
+                future_shamsi_date = jdatetime.date.fromgregorian(date=future_greg_date)
+                shamsi_str = _shamsi_string(future_shamsi_date)
+                if future_greg_date.weekday() == 4 or shamsi_str in future_holidays:
+                    continue
                 predicted = slope * future_date + intercept
                 lower = predicted - 1.96 * rmse
                 upper = predicted + 1.96 * rmse
-                future_greg = datetime.fromordinal(future_date)
-                future_shamsi = jdatetime.datetime.fromgregorian(datetime=future_greg)
-                shamsi_str = f"{future_shamsi.year}/{future_shamsi.month:02d}/{future_shamsi.day:02d}"
                 forecast.append({
                     'date': shamsi_str,
                     'predicted': max(0, predicted),
@@ -3904,10 +3980,13 @@ def generate_visual_management_report(report_key):
                 return generate_chart({'labels':[r[0] for r in rows], 'values':[r[1] or 0 for r in rows], 'display_scale':1},
                                       'تعداد ثبت‌های دیرهنگام در ۳۰ روز اخیر','تعداد ثبت دیرهنگام','شعبه','horizontal',(12,8))
             if report_key == 'weekday':
-                cur.execute("""SELECT EXTRACT(ISODOW FROM created_at AT TIME ZONE 'Asia/Tehran')::int,AVG(total_amount)
-                    FROM collections WHERE shamsi_date>=%s GROUP BY 1 ORDER BY 1""", (start_60,))
+                cur.execute("SELECT shamsi_date,total_amount FROM collections WHERE shamsi_date>=%s", (start_60,))
                 names={6:'شنبه',7:'یکشنبه',1:'دوشنبه',2:'سه‌شنبه',3:'چهارشنبه',4:'پنجشنبه',5:'جمعه'}
-                rows=cur.fetchall()
+                weekday_values = {}
+                for date_text, amount in cur.fetchall():
+                    iso_day = _shamsi_date_obj(date_text).togregorian().isoweekday()
+                    weekday_values.setdefault(iso_day, []).append(float(amount or 0))
+                rows = [(day, sum(values) / len(values)) for day, values in sorted(weekday_values.items())]
                 return generate_chart({'labels':[names.get(r[0],str(r[0])) for r in rows], 'values':[r[1] for r in rows]},
                                       'میانگین وصول بر اساس روز هفته','روز هفته','میانگین وصول','bar',(11,7))
             if report_key == 'periods':
@@ -4179,21 +4258,17 @@ def delete_deputy(user_id):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM collections WHERE recorded_by = %s", (user_id,))
-            if cur.fetchone()[0] > 0:
-                return False, "این معاون دارای سابقه وصول است و قابل حذف نمی‌باشد"
             cur.execute("SELECT role FROM users WHERE id = %s", (user_id,))
             result = cur.fetchone()
             if not result or result[0] != 'deputy':
                 return False, "کاربر معاون نیست"
-            cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
-            conn.commit()
-            return True, "حذف شد"
+            conn.rollback()
+            return delete_user(user_id)
     except Exception as e:
         logger.error(f"delete_deputy error: {e}")
         if conn:
             conn.rollback()
-        return False, str(e)
+        return False, "حذف معاون انجام نشد؛ جزئیات خطا ثبت شد"
     finally:
         if conn:
             return_db_connection(conn)
@@ -4311,10 +4386,11 @@ def import_all_data_from_json(json_data, clear_existing=False, dry_run=False):
         with conn.cursor() as cur:
             cur.execute("SET LOCAL lock_timeout = '5s'")
             cur.execute("SET LOCAL statement_timeout = '120s'")
-            for table, rows in json_data.items():
-                if table not in BACKUP_TABLES:
-                    logger.warning("Ignoring unexpected backup table: %s", table)
-                    continue
+            for unexpected in set(json_data) - set(BACKUP_TABLES):
+                logger.warning("Ignoring unexpected backup table: %s", unexpected)
+            # ترتیب ثابت والد به فرزند، برای رعایت کلیدهای خارجی.
+            for table in BACKUP_TABLES:
+                rows = json_data.get(table, [])
                 if not rows:
                     summary['inserted'][table] = 0
                     summary['skipped'][table] = 0
@@ -4337,6 +4413,33 @@ def import_all_data_from_json(json_data, clear_existing=False, dry_run=False):
                 if not columns:
                     summary['skipped'][table] = len(rows)
                     continue
+
+                # برخورد یک شناسه با رکوردی با هویت متفاوت می‌تواند وابستگی‌ها را
+                # به شعبه/کاربر اشتباه متصل کند؛ در این حالت کل تراکنش متوقف می‌شود.
+                identity_fields = RESTORE_IDENTITY_FIELDS.get(table, ())
+                if 'id' in columns and identity_fields:
+                    comparable = [field for field in identity_fields if field in columns]
+                else:
+                    comparable = []
+                if comparable:
+                    for row in rows:
+                        if row.get('id') is None:
+                            continue
+                        select_columns = sql.SQL(', ').join(sql.Identifier(field) for field in comparable)
+                        cur.execute(
+                            sql.SQL("SELECT {} FROM {} WHERE id=%s").format(
+                                select_columns, sql.Identifier(table)
+                            ),
+                            (row['id'],)
+                        )
+                        existing = cur.fetchone()
+                        if existing and any(
+                            str(existing[index]) != str(row.get(field))
+                            for index, field in enumerate(comparable)
+                        ):
+                            raise ValueError(
+                                f"تعارض هویتی در جدول {table} برای id={row['id']}; بازیابی متوقف شد"
+                            )
                 values = [tuple(row.get(column) for column in columns) for row in rows]
                 statement = sql.SQL(
                     "INSERT INTO {} ({}) VALUES %s ON CONFLICT DO NOTHING"
@@ -4382,6 +4485,19 @@ def import_all_data_from_json(json_data, clear_existing=False, dry_run=False):
             return_db_connection(conn)
 
 def generate_backup_file():
+    size_conn = None
+    try:
+        size_conn = get_db_connection()
+        with size_conn.cursor() as cur:
+            cur.execute("SELECT COALESCE(SUM(pg_total_relation_size(to_regclass('public.' || name))),0) FROM unnest(%s::text[]) AS t(name)",
+                        (list(BACKUP_TABLES),))
+            estimated_size = int(cur.fetchone()[0] or 0)
+            if estimated_size > MAX_BACKUP_UNCOMPRESSED_BYTES:
+                logger.error("Backup refused: source relations are too large (%s bytes)", estimated_size)
+                return None
+    finally:
+        if size_conn:
+            return_db_connection(size_conn)
     data = export_all_data_to_json()
     if data is None:
         return None
@@ -4395,6 +4511,9 @@ def generate_backup_file():
     }
     canonical = json.dumps(payload, default=str, ensure_ascii=False,
                            sort_keys=True, separators=(',', ':')).encode('utf-8')
+    if len(canonical) > MAX_BACKUP_UNCOMPRESSED_BYTES:
+        logger.error("Backup refused: serialized payload is too large (%s bytes)", len(canonical))
+        return None
     envelope = {
         'payload': payload,
         'sha256': hashlib.sha256(canonical).hexdigest(),
@@ -4425,7 +4544,9 @@ def restore_from_file(file_bytes, dry_run=True):
                 return False, "امضای فایل معتبر نیست؛ BACKUP_SECRET یکسان نیست.", None
             data = payload.get('tables', {})
         else:
-            data = document  # بکاپ‌های قدیمی نسخه ۸.۹
+            if not ALLOW_UNSIGNED_LEGACY_BACKUP:
+                return False, "بکاپ قدیمی فاقد امضای امنیتی است. برای ورود آگاهانه آن، ALLOW_UNSIGNED_LEGACY_BACKUP=true را موقتاً تنظیم کنید.", None
+            data = document
         required_tables = ['branches', 'users', 'collections']
         for tbl in required_tables:
             if tbl not in data:
@@ -4438,7 +4559,7 @@ def restore_from_file(file_bytes, dry_run=True):
             return False, "خطا در بازیابی داده‌ها.", summary
     except Exception as e:
         logger.error(f"restore_from_file error: {e}")
-        return False, f"خطا: {str(e)}", None
+        return False, "ساختار فایل پشتیبان معتبر نیست؛ جزئیات خطا ثبت شد.", None
 
 # ============================================================
 # ارسال پیام و عکس
@@ -4740,7 +4861,7 @@ def check_and_auto_score():
 
 def generate_weekly_report():
     shamsi_today = get_shamsi_date()
-    shamsi_week_ago = get_shamsi_date(-7)
+    shamsi_week_ago = get_shamsi_date(-6)
     conn = None
     try:
         conn = get_db_connection()
@@ -4816,8 +4937,6 @@ def send_weekly_report_to_all():
     if not get_bot_status() or not get_weekly_report_status():
         return
     shamsi_today = get_shamsi_date()
-    if is_holiday(shamsi_today):
-        return
     report_data = generate_weekly_report()
     if not report_data:
         return
@@ -4831,12 +4950,11 @@ def send_weekly_report_to_all():
         if conn:
             return_db_connection(conn)
     msg = f"📊 **گزارش هفتگی عملکرد شعب**\n"
-    msg += f"📅 بازه: {get_shamsi_date_formatted(get_shamsi_date(-7))} تا {get_shamsi_date_formatted(shamsi_today)}\n"
+    msg += f"📅 بازه: {get_shamsi_date_formatted(get_shamsi_date(-6))} تا {get_shamsi_date_formatted(shamsi_today)}\n"
     msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-    total_all = 0
+    total_all = sum(int(row[3] or 0) for row in report_data)
     for idx, row in enumerate(report_data[:10], 1):
         branch_id, name, count, total, avg, on_time, late = row
-        total_all += total
         msg += f"{idx}. 🏢 {name}\n"
         msg += f"   📊 تعداد گزارش: {count}\n"
         msg += f"   💰 کل وصول: {total//1_000_000:,.0f} میلیون ریال\n"
@@ -4849,13 +4967,11 @@ def send_weekly_report_to_all():
         if chat_id:
             send_message(chat_id, msg)
 
-def send_monthly_report_to_all():
+def send_monthly_report_to_all(force=False):
     if not get_bot_status() or not get_monthly_report_status():
         return
     shamsi_today = get_shamsi_date()
-    if not is_last_day_of_shamsi_month(shamsi_today):
-        return
-    if is_holiday(shamsi_today):
+    if not force and not is_last_day_of_shamsi_month(shamsi_today):
         return
     report_data = generate_monthly_report()
     if not report_data:
@@ -4870,12 +4986,12 @@ def send_monthly_report_to_all():
         if conn:
             return_db_connection(conn)
     msg = f"📊 **گزارش ماهانه عملکرد شعب**\n"
-    msg += f"📅 بازه: {get_shamsi_date_formatted(get_shamsi_date(-30))} تا {get_shamsi_date_formatted(shamsi_today)}\n"
+    month_start, month_end = get_shamsi_month_range()
+    msg += f"📅 بازه: {get_shamsi_date_formatted(month_start)} تا {get_shamsi_date_formatted(month_end)}\n"
     msg += f"━━━━━━━━━━━━━━━━━━\n\n"
-    total_all = 0
+    total_all = sum(int(row[3] or 0) for row in report_data)
     for idx, row in enumerate(report_data[:10], 1):
         branch_id, name, count, total, avg, on_time, late = row
-        total_all += total
         msg += f"{idx}. 🏢 {name}\n"
         msg += f"   📊 تعداد گزارش: {count}\n"
         msg += f"   💰 کل وصول: {total//1_000_000:,.0f} میلیون ریال\n"
@@ -4996,6 +5112,49 @@ def generate_and_send_forecast(chat_id, role, is_super_admin):
         logger.error(f"generate_and_send_forecast error: {e}")
         send_message(chat_id, "❌ خطا در تولید پیش‌بینی.", get_cancel_keyboard())
 
+def generate_and_send_management_report(chat_id, report_key, user_db_id):
+    try:
+        report_text = generate_management_report(report_key)
+        send_message(chat_id, report_text, get_management_reports_keyboard())
+        log_user_activity(user_db_id, "management_report", report_key)
+    except Exception:
+        logger.exception("Asynchronous management report failed")
+        send_message(chat_id, "❌ تولید گزارش انجام نشد؛ جزئیات خطا ثبت شد.", get_management_reports_keyboard())
+
+def generate_and_send_visual_report(chat_id, report_key, button_text, user_db_id):
+    try:
+        chart_bytes = generate_visual_management_report(report_key)
+        if chart_bytes:
+            send_photo(chat_id, chart_bytes, button_text, get_visual_reports_keyboard())
+            log_user_activity(user_db_id, "visual_management_report", report_key)
+            return
+        engine_ok, engine_error = get_chart_engine_status()
+        if not engine_ok:
+            send_message(chat_id, f"❌ موتور نمودار فارسی اجرا نشد.\nعلت: {engine_error}", get_visual_reports_keyboard())
+        else:
+            send_message(chat_id, "❌ داده کافی وجود ندارد یا تولید تصویر ناموفق بود.", get_visual_reports_keyboard())
+    except Exception:
+        logger.exception("Asynchronous visual report failed")
+        send_message(chat_id, "❌ تولید نمودار انجام نشد؛ جزئیات خطا ثبت شد.", get_visual_reports_keyboard())
+
+def generate_and_send_backup(chat_id, user_db_id):
+    try:
+        backup_data = generate_backup_file()
+        if not backup_data:
+            send_message(chat_id, "❌ تولید پشتیبان انجام نشد یا حجم داده از حد ایمن بیشتر است.", get_super_admin_keyboard())
+            return
+        backup_name = f"zanjan-backup-{get_iran_time().strftime('%Y%m%d-%H%M%S')}.json.gz"
+        files = {'document': (backup_name, backup_data, 'application/gzip')}
+        data = {'chat_id': chat_id, 'caption': '📦 فایل پشتیبان امضاشده از تمام داده‌ها'}
+        res = get_http_session().post(f"{BASE_URL}/sendDocument", data=data, files=files, timeout=60)
+        if res.status_code == 200:
+            log_user_activity(user_db_id, "backup", "دریافت فایل پشتیبان")
+        else:
+            send_message(chat_id, "❌ خطا در ارسال فایل پشتیبان. لطفاً دوباره تلاش کنید.", get_super_admin_keyboard())
+    except Exception:
+        logger.exception("Asynchronous backup failed")
+        send_message(chat_id, "❌ تولید پشتیبان انجام نشد؛ جزئیات در لاگ ثبت شد.", get_super_admin_keyboard())
+
 # ============================================================
 # offset management
 # ============================================================
@@ -5004,6 +5163,7 @@ _last_offset_save = time_module.time()
 _OFFSET_SAVE_INTERVAL = 10
 _offset_pending = False
 _offset_lock = threading.Lock()
+_latest_offset = 0
 
 def save_offset(offset):
     global _offset_pending
@@ -5013,15 +5173,16 @@ def save_offset(offset):
         _flush_offset(offset)
 
 def _flush_offset(offset):
-    global _last_offset_save, _offset_pending
+    global _last_offset_save, _offset_pending, _latest_offset
     with _offset_lock:
         try:
             temp_path = OFFSET_FILE + '.tmp'
-            with open(temp_path, 'wb') as f:
-                pickle.dump(offset, f)
+            with open(temp_path, 'w', encoding='ascii') as f:
+                f.write(str(max(int(offset), 0)))
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_path, OFFSET_FILE)
+            _latest_offset = offset
             _last_offset_save = time_module.time()
             _offset_pending = False
         except Exception as e:
@@ -5030,17 +5191,40 @@ def _flush_offset(offset):
 def load_offset():
     try:
         if os.path.exists(OFFSET_FILE):
+            if os.path.getsize(OFFSET_FILE) > 64:
+                raise ValueError("offset file is unexpectedly large")
             with open(OFFSET_FILE, 'rb') as f:
-                return pickle.load(f)
+                raw = f.read()
+            try:
+                value = int(raw.decode('ascii').strip())
+            except (UnicodeDecodeError, ValueError):
+                # مهاجرت محدود از فایل pickle قدیمی که فقط یک عدد صحیح ساده داشته است.
+                value = _load_legacy_integer_offset(raw)
+            return max(value, 0)
     except Exception as e:
         logger.error(f"Failed to load offset: {e}")
     return 0
+
+def _load_legacy_integer_offset(raw):
+    """Parse only the small integer forms produced by previous bot versions."""
+    if len(raw) >= 5 and raw[:2] in (b'\x80\x03', b'\x80\x04', b'\x80\x05') and raw[-1:] == b'.':
+        opcode = raw[2:3]
+        if opcode == b'K' and len(raw) == 5:
+            return raw[3]
+        if opcode == b'M' and len(raw) == 6:
+            return int.from_bytes(raw[3:5], 'little', signed=False)
+        if opcode == b'J' and len(raw) == 8:
+            return int.from_bytes(raw[3:7], 'little', signed=True)
+    raise ValueError("unsupported legacy offset format")
 
 # ============================================================
 # Scheduler
 # ============================================================
 def start_scheduler():
-    scheduler = BackgroundScheduler(timezone='Asia/Tehran')
+    global _scheduler
+    scheduler = BackgroundScheduler(timezone='Asia/Tehran', job_defaults={
+        'coalesce': True, 'max_instances': 1, 'misfire_grace_time': 300
+    })
     scheduler.add_job(
         check_and_send_reminders,
         CronTrigger(hour=15, minute=0),
@@ -5078,19 +5262,21 @@ def start_scheduler():
         replace_existing=True
     )
     scheduler.start()
+    _scheduler = scheduler
     logger.info("✅ Scheduler started")
 
 # ============================================================
 # Main
 # ============================================================
 def main():
-    global requests_session, processed_set
+    global requests_session, processed_set, _latest_offset
     offset = load_offset()
+    _latest_offset = offset
     logger.info(f"🤖 Bot started successfully with offset: {offset}")
     threading.Thread(target=run_flask, daemon=True).start()
     logger.info(f"🌐 Flask server started on port {PORT}")
     start_scheduler()
-    atexit.register(lambda: _flush_offset(offset))
+    atexit.register(lambda: _flush_offset(_latest_offset))
     last_offset_save_time = time_module.time()
     while True:
         try:
@@ -5109,34 +5295,29 @@ def main():
                             if len(processed_updates) == processed_updates.maxlen:
                                 processed_set.discard(processed_updates[0])
                             processed_updates.append(update_id)
-                        if "message" in update:
-                            handle_message(update["message"])
+                        try:
+                            if "message" in update:
+                                handle_message(update["message"])
+                        except Exception:
+                            with processed_set_lock:
+                                processed_set.discard(update_id)
+                                try:
+                                    processed_updates.remove(update_id)
+                                except ValueError:
+                                    pass
+                            logger.exception("Update processing failed; offset was not advanced: %s", update_id)
+                            break
                         offset = update_id + 1
+                        _latest_offset = offset
                         if time_module.time() - last_offset_save_time > _OFFSET_SAVE_INTERVAL:
                             _flush_offset(offset)
                             last_offset_save_time = time_module.time()
                 else:
-                    if res.status_code == 409:
-                        logger.warning("⚠️ Conflict (409) – another instance is running. Resetting offset...")
-                        try:
-                            res2 = requests_session.get(f"{BASE_URL}/getUpdates", timeout=10)
-                            if res2.status_code == 200:
-                                data2 = res2.json()
-                                if data2.get("ok") and data2.get("result"):
-                                    last_update = data2["result"][-1]
-                                    offset = last_update["update_id"] + 1
-                                    logger.info(f"✅ Offset reset to {offset}")
-                                    _flush_offset(offset)
-                                else:
-                                    offset = 0
-                            else:
-                                offset = 0
-                        except Exception:
-                            offset = 0
-                        time.sleep(3)
-                    else:
-                        logger.warning(f"⚠️ API response not ok: {data}")
-                        time.sleep(2)
+                    logger.warning(f"⚠️ API response not ok: {data}")
+                    time.sleep(2)
+            elif res.status_code == 409:
+                logger.error("⚠️ تعارض 409: نمونه دیگری از ربات با همین توکن فعال است؛ این نمونه منتظر می‌ماند.")
+                time.sleep(10)
             else:
                 logger.error(f"❌ HTTP error: {res.status_code} - {res.text}")
                 time.sleep(5)
@@ -5296,25 +5477,25 @@ def handle_message(message):
                     send_message(chat_id, f"❌ رمز عبور اشتباه است. {5 - failed_attempts} تلاش باقی مانده است.")
             return
 
-        user_data = user_state.get("user_data", {})
-        if not user_data:
-            user = find_user_by_telegram_id(chat_id)
-            if not user:
-                user_states.set(chat_id, {"state": "LOGGED_OUT"})
-                send_message(chat_id, "⚠️ نشست شما منقضی شده است. لطفاً شماره کارمندی خود را وارد کنید.", remove_keyboard=True)
-                return
-            db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = user
-            user_data = {
-                "db_id": db_id,
-                "emp_num": emp_num,
-                "name": name,
-                "role": role,
-                "title": title,
-                "branch_id": branch_id,
-                "branch_name": branch_name,
-                "is_super_admin": is_super_admin
-            }
-            user_states.update(chat_id, {"user_data": user_data})
+        # نقش و شعبه در هر پیام از دیتابیس تازه‌خوانی می‌شود تا تغییر سطح دسترسی
+        # بلافاصله اعمال شود؛ شیوه احراز هویت موجود تغییری نکرده است.
+        user = find_user_by_telegram_id(chat_id)
+        if not user:
+            user_states.set(chat_id, {"state": "LOGGED_OUT"})
+            send_message(chat_id, "⚠️ نشست شما منقض شده است. لطفاً شماره کارمندی خود را وارد کنید.", remove_keyboard=True)
+            return
+        db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = user
+        user_data = {
+            "db_id": db_id,
+            "emp_num": emp_num,
+            "name": name,
+            "role": role,
+            "title": title,
+            "branch_id": branch_id,
+            "branch_name": branch_name,
+            "is_super_admin": is_super_admin
+        }
+        user_states.update(chat_id, {"user_data": user_data})
         role = user_data["role"]
         branch_id = user_data["branch_id"]
         branch_name = user_data["branch_name"]
@@ -5346,12 +5527,8 @@ def handle_message(message):
             selected_id, selected_name = selected
             user_states.update(chat_id, {"state": "LOGGED_IN", "assistant_branches": []})
             send_message(chat_id, f"⏳ در حال تهیه گزارش همیار شعبه {selected_name}...", get_keyboard(role, is_super_admin))
-            send_collection_assistant_report(
-                chat_id,
-                selected_id,
-                get_keyboard(role, is_super_admin),
-                user_db_id
-            )
+            executor.submit(send_collection_assistant_report, chat_id, selected_id,
+                            get_keyboard(role, is_super_admin), user_db_id)
             return
 
         # ===== State: WAITING_FOR_DEPUTY_AMOUNT =====
@@ -5720,7 +5897,7 @@ def handle_message(message):
                 if not targets:
                     send_message(chat_id, "📭 هیچ هدف فعالی برای حذف وجود ندارد.", get_super_admin_keyboard())
                     return
-                msg = "🗑️ **انتخاب هدف برای حذف**\n\n"
+                msg = "🗑️ **انتخاب هدف برای غیرفعال‌سازی**\n\n"
                 for idx, target in enumerate(targets, 1):
                     target_id, branch_id, branch_name, target_amount, target_date, created_at, created_by_name = target
                     msg += f"{idx}. {branch_name} - هدف: {target_amount//1_000_000:,.0f} میلیون ریال تا {get_shamsi_date_formatted(target_date)}\n"
@@ -5792,7 +5969,7 @@ def handle_message(message):
                         return
                     branch_id = user_state.get("target_branch_id")
                     amount = user_state.get("target_amount")
-                    success, result = set_branch_target(branch_id, amount, shamsi_date, user_db_id)
+                    success, result = set_branch_target(branch_id, amount * 1_000_000, shamsi_date, user_db_id)
                     if success:
                         branch_name = user_state.get("target_branch_name", "شعبه")
                         send_message(chat_id, f"✅ هدف برای شعبه {branch_name} با موفقیت تعیین شد.\n"
@@ -5821,8 +5998,8 @@ def handle_message(message):
                         target_id = target[0]
                         branch_name = target[2]
                         if delete_target(target_id):
-                            send_message(chat_id, f"✅ هدف شعبه {branch_name} با موفقیت حذف شد.", get_super_admin_keyboard())
-                            log_user_activity(user_db_id, "delete_target", f"حذف هدف شعبه {branch_name}")
+                            send_message(chat_id, f"✅ هدف شعبه {branch_name} غیرفعال شد و سابقه آن محفوظ ماند.", get_super_admin_keyboard())
+                            log_user_activity(user_db_id, "deactivate_target", f"غیرفعال‌سازی هدف شعبه {branch_name}")
                         else:
                             send_message(chat_id, "❌ خطا در حذف هدف.", get_super_admin_keyboard())
                     else:
@@ -6011,24 +6188,13 @@ def handle_message(message):
             if text in MANAGEMENT_REPORT_BUTTONS:
                 report_key = MANAGEMENT_REPORT_BUTTONS[text]
                 send_message(chat_id, "⏳ در حال تهیه گزارش...", get_management_reports_keyboard())
-                report_text = generate_management_report(report_key)
-                send_message(chat_id, report_text, get_management_reports_keyboard())
-                log_user_activity(user_db_id, "management_report", report_key)
+                executor.submit(generate_and_send_management_report, chat_id, report_key, user_db_id)
                 return
 
             if text in VISUAL_REPORT_BUTTONS:
                 report_key = VISUAL_REPORT_BUTTONS[text]
                 send_message(chat_id, "⏳ در حال ساخت نمودار فارسی...", get_visual_reports_keyboard())
-                chart_bytes = generate_visual_management_report(report_key)
-                if chart_bytes:
-                    send_photo(chat_id, chart_bytes, text, get_visual_reports_keyboard())
-                    log_user_activity(user_db_id, "visual_management_report", report_key)
-                else:
-                    engine_ok, engine_error = get_chart_engine_status()
-                    if not engine_ok:
-                        send_message(chat_id, f"❌ موتور نمودار فارسی اجرا نشد.\nعلت: {engine_error}\n\nفایل requirements.txt جدید را نصب و سرویس را با پاک‌کردن Build Cache دوباره Deploy کنید.", get_visual_reports_keyboard())
-                    else:
-                        send_message(chat_id, "❌ داده کافی وجود ندارد یا تولید تصویر ناموفق بود.", get_visual_reports_keyboard())
+                executor.submit(generate_and_send_visual_report, chat_id, report_key, text, user_db_id)
                 return
 
             if text == "🔧 کنترل خودکار":
@@ -6308,7 +6474,7 @@ def handle_message(message):
                     ],
                     "resize_keyboard": True
                 }
-                send_message(chat_id, "⚠️ **هشدار!**\nآیا از ریست کردن تمام گزارش‌ها اطمینان دارید؟\nاین عمل غیرقابل بازگشت است.", keyboard)
+                send_message(chat_id, "🔄 این عملیات فقط حافظه موقت گزارش‌ها را پاک و خروجی‌ها را تازه‌سازی می‌کند؛ هیچ وصول، یادداشت یا سابقه‌ای حذف نمی‌شود.\n\nآیا ادامه می‌دهید؟", keyboard)
                 user_states.update(chat_id, {"state": "WAITING_FOR_RESET_CONFIRM"})
                 return
 
@@ -6436,7 +6602,7 @@ def handle_message(message):
                         if delete_collection(col_id):
                             send_message(chat_id, f"✅ گزارش {col_id} حذف شد.", get_super_admin_keyboard())
                         else:
-                            send_message(chat_id, "❌ خطا در حذف گزارش.", get_super_admin_keyboard())
+                            send_message(chat_id, "⛔ حذف فیزیکی گزارش برای حفظ سوابق غیرفعال است؛ در صورت نیاز از ویرایش گزارش استفاده کنید.", get_super_admin_keyboard())
                     except Exception:
                         send_message(chat_id, "❌ فرمت: /delete_collection [id]", get_super_admin_keyboard())
                 else:
@@ -6461,15 +6627,13 @@ def handle_message(message):
                 return
 
             if text == "📊 گزارش هفتگی":
-                send_message(chat_id, "🔄 در حال تولید گزارش هفتگی...", get_super_admin_keyboard())
-                send_weekly_report_to_all()
-                send_message(chat_id, "✅ گزارش هفتگی به تمام کاربران ارسال شد.", get_super_admin_keyboard())
+                send_message(chat_id, "🔄 گزارش هفتگی در پس‌زمینه تولید و برای کاربران ارسال می‌شود.", get_super_admin_keyboard())
+                executor.submit(send_weekly_report_to_all)
                 return
 
             if text == "📊 گزارش ماهانه":
-                send_message(chat_id, "🔄 در حال تولید گزارش ماهانه...", get_super_admin_keyboard())
-                send_monthly_report_to_all()
-                send_message(chat_id, "✅ گزارش ماهانه به تمام کاربران ارسال شد.", get_super_admin_keyboard())
+                send_message(chat_id, "🔄 گزارش ماه جاری در پس‌زمینه تولید و برای کاربران ارسال می‌شود.", get_super_admin_keyboard())
+                executor.submit(send_monthly_report_to_all, True)
                 return
 
             if text == "👥 مدیریت کاربران":
@@ -6770,23 +6934,7 @@ def handle_message(message):
 
             if text == "💾 پشتیبان‌گیری از داده‌ها":
                 send_message(chat_id, "⏳ در حال تولید فایل پشتیبان... لطفاً صبر کنید.", get_super_admin_keyboard())
-                try:
-                    backup_data = generate_backup_file()
-                    if backup_data:
-                        backup_name = f"zanjan-backup-{get_iran_time().strftime('%Y%m%d-%H%M%S')}.json.gz"
-                        files = {'document': (backup_name, backup_data, 'application/gzip')}
-                        url = f"{BASE_URL}/sendDocument"
-                        data = {'chat_id': chat_id, 'caption': '📦 فایل پشتیبان امضاشده از تمام داده‌ها'}
-                        res = get_http_session().post(url, data=data, files=files, timeout=60)
-                        if res.status_code == 200:
-                            log_user_activity(user_db_id, "backup", "دریافت فایل پشتیبان")
-                        else:
-                            send_message(chat_id, "❌ خطا در ارسال فایل پشتیبان. لطفاً دوباره تلاش کنید.", get_super_admin_keyboard())
-                    else:
-                        send_message(chat_id, "❌ خطا در تولید فایل پشتیبان.", get_super_admin_keyboard())
-                except Exception as e:
-                    logger.error(f"Backup error: {e}")
-                    send_message(chat_id, "❌ تولید پشتیبان انجام نشد؛ جزئیات در لاگ ثبت شد.", get_super_admin_keyboard())
+                executor.submit(generate_and_send_backup, chat_id, user_db_id)
                 return
 
             if text == "📂 بازیابی داده‌ها":
@@ -6809,9 +6957,30 @@ def handle_message(message):
                             if file_url_res.status_code == 200 and file_url_res.json().get('ok'):
                                 file_path = file_url_res.json().get('result', {}).get('file_path')
                                 if file_path:
-                                    file_data_res = get_http_session().get(f"https://tapi.bale.ai/file/bot{BOT_TOKEN}/{file_path}", timeout=60)
+                                    file_data_res = get_http_session().get(
+                                        f"https://tapi.bale.ai/file/bot{BOT_TOKEN}/{file_path}",
+                                        timeout=60,
+                                        stream=True
+                                    )
                                     if file_data_res.status_code == 200:
-                                        file_bytes = file_data_res.content
+                                        declared_size = int(file_data_res.headers.get('Content-Length') or 0)
+                                        if declared_size > MAX_BACKUP_COMPRESSED_BYTES:
+                                            file_data_res.close()
+                                            send_message(chat_id, "❌ حجم فایل بیش از حد مجاز است.", get_cancel_keyboard())
+                                            return
+                                        chunks = []
+                                        downloaded = 0
+                                        for chunk in file_data_res.iter_content(chunk_size=64 * 1024):
+                                            if not chunk:
+                                                continue
+                                            downloaded += len(chunk)
+                                            if downloaded > MAX_BACKUP_COMPRESSED_BYTES:
+                                                file_data_res.close()
+                                                send_message(chat_id, "❌ حجم فایل بیش از حد مجاز است.", get_cancel_keyboard())
+                                                return
+                                            chunks.append(chunk)
+                                        file_data_res.close()
+                                        file_bytes = b''.join(chunks)
                                         success, msg, summary = restore_from_file(file_bytes, dry_run=True)
                                         if success:
                                             inserted = sum(summary.get('inserted', {}).values())
@@ -7559,8 +7728,8 @@ def handle_message(message):
             if current_state == "WAITING_FOR_RESET_CONFIRM" and is_super_admin:
                 if text == "✅ بله، ریست کن":
                     if reset_all_collections():
-                        send_message(chat_id, "✅ تمام گزارش‌ها با موفقیت ریست شدند.", get_super_admin_keyboard())
-                        log_user_activity(user_db_id, "reset_reports", "ریست کامل گزارش‌ها")
+                        send_message(chat_id, "✅ حافظه موقت گزارش‌ها پاک شد؛ همه اطلاعات ثبت‌شده محفوظ هستند.", get_super_admin_keyboard())
+                        log_user_activity(user_db_id, "refresh_report_cache", "تازه‌سازی امن حافظه گزارش‌ها")
                     else:
                         send_message(chat_id, "❌ خطا در ریست گزارش‌ها.", get_super_admin_keyboard())
                 else:
@@ -7582,7 +7751,8 @@ def handle_message(message):
                     send_message(chat_id, "❌ برای حساب شما شعبه‌ای تعیین نشده است.", get_deputy_keyboard())
                     return
                 send_message(chat_id, "⏳ در حال تهیه گزارش اختصاصی همیار وصول مطالبات...", get_deputy_keyboard())
-                send_collection_assistant_report(chat_id, branch_id, get_deputy_keyboard(), user_db_id)
+                executor.submit(send_collection_assistant_report, chat_id, branch_id,
+                                get_deputy_keyboard(), user_db_id)
                 return
 
             if text == "💰 ثبت وصولی روزانه":
@@ -7773,6 +7943,7 @@ def handle_message(message):
             send_message(message['chat']['id'], "❌ خطایی رخ داد. لطفاً مجدداً تلاش کنید.")
         except Exception:
             pass
+        raise
 
 if __name__ == "__main__":
     main()
