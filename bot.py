@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۰.۰ (بکاپ/ریستور افزایشی امن و ابزارهای سوپرادمین)
+# bot.py - نسخه ۹.۱.۰ (تاریخچه انتصاب و جابه‌جایی امن معاونان)
 # ============================================================
 import os
 import time
@@ -72,7 +72,8 @@ ALLOW_UNSIGNED_LEGACY_BACKUP = os.getenv("ALLOW_UNSIGNED_LEGACY_BACKUP", "false"
 BACKUP_TABLES = (
     'branches', 'users', 'collections', 'notes', 'user_activity_log',
     'settings', 'holidays', 'problems', 'scores', 'feature_settings',
-    'actual_stats', 'branch_targets'
+    'actual_stats', 'branch_targets', 'deputy_transfer_operations',
+    'deputy_branch_assignments'
 )
 RESTORE_IDENTITY_FIELDS = {
     'branches': ('name',),
@@ -85,6 +86,8 @@ RESTORE_IDENTITY_FIELDS = {
     'scores': ('collection_id',),
     'actual_stats': ('branch_id', 'shamsi_date'),
     'branch_targets': ('branch_id', 'target_date', 'created_at'),
+    'deputy_transfer_operations': ('operation_uuid',),
+    'deputy_branch_assignments': ('deputy_id', 'branch_id', 'effective_from'),
 }
 
 # ============================================================
@@ -166,7 +169,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/9.0.0'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/9.1.0'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -712,6 +715,42 @@ def create_all_tables_if_not_exists():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS deputy_transfer_operations (
+                    id BIGSERIAL PRIMARY KEY,
+                    operation_uuid VARCHAR(36) NOT NULL UNIQUE,
+                    first_deputy_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    second_deputy_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    first_old_branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,
+                    first_new_branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,
+                    second_old_branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,
+                    second_new_branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,
+                    effective_date VARCHAR(10) NOT NULL,
+                    performed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    reason TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (effective_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'),
+                    CHECK (first_deputy_id <> second_deputy_id),
+                    CHECK (first_old_branch_id <> first_new_branch_id),
+                    CHECK (second_old_branch_id <> second_new_branch_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS deputy_branch_assignments (
+                    id BIGSERIAL PRIMARY KEY,
+                    deputy_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,
+                    effective_from VARCHAR(10) NOT NULL,
+                    effective_to VARCHAR(10),
+                    operation_id BIGINT REFERENCES deputy_transfer_operations(id) ON DELETE RESTRICT,
+                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    source VARCHAR(30) NOT NULL DEFAULT 'manual',
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (effective_from ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'),
+                    CHECK (effective_to IS NULL OR effective_to ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'),
+                    CHECK (effective_to IS NULL OR effective_to >= effective_from)
+                )
+            """)
+            cur.execute("""
                 DO $safe_index$
                 BEGIN
                     IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public'
@@ -736,6 +775,42 @@ def create_all_tables_if_not_exists():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_recorded_by ON collections(recorded_by);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_collection ON scores(collection_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_actual_stats_branch_date ON actual_stats(branch_id, shamsi_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_assignments_deputy_dates ON deputy_branch_assignments(deputy_id, effective_from, effective_to);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_assignments_branch_dates ON deputy_branch_assignments(branch_id, effective_from, effective_to);")
+            cur.execute("""
+                DO $assignment_indexes$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='idx_deputy_assignment_one_active')
+                       AND NOT EXISTS (SELECT deputy_id FROM deputy_branch_assignments WHERE effective_to IS NULL GROUP BY deputy_id HAVING COUNT(*)>1) THEN
+                        CREATE UNIQUE INDEX idx_deputy_assignment_one_active
+                        ON deputy_branch_assignments(deputy_id) WHERE effective_to IS NULL;
+                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='idx_branch_assignment_one_active')
+                       AND NOT EXISTS (SELECT branch_id FROM deputy_branch_assignments WHERE effective_to IS NULL GROUP BY branch_id HAVING COUNT(*)>1) THEN
+                        CREATE UNIQUE INDEX idx_branch_assignment_one_active
+                        ON deputy_branch_assignments(branch_id) WHERE effective_to IS NULL;
+                    END IF;
+                END
+                $assignment_indexes$;
+            """)
+            # فقط برای معاونانی که هیچ انتصاب فعالی ندارند، وضعیت جاری بدون تغییر
+            # داده‌های قبلی به‌عنوان نقطه شروع تاریخچه ثبت می‌شود.
+            cur.execute("""
+                INSERT INTO deputy_branch_assignments
+                    (deputy_id, branch_id, effective_from, source, created_at)
+                SELECT u.id, u.branch_id, '0001/01/01', 'initial_backfill', CURRENT_TIMESTAMP
+                FROM users u
+                WHERE u.role='deputy' AND u.branch_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM deputy_branch_assignments dba
+                      WHERE dba.deputy_id=u.id AND dba.effective_to IS NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM deputy_branch_assignments dba
+                      WHERE dba.branch_id=u.branch_id AND dba.effective_to IS NULL
+                  )
+                ON CONFLICT DO NOTHING
+            """)
             conn.commit()
             logger.info("✅ All tables and indexes created/verified successfully.")
     except Exception as e:
@@ -1975,6 +2050,13 @@ def update_user_role(user_id, new_role):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
+            cur.execute("SELECT role FROM users WHERE id=%s", (user_id,))
+            current = cur.fetchone()
+            if not current:
+                return False
+            if current[0] != new_role and ('deputy' in (current[0], new_role)):
+                logger.warning("Role conversion to/from deputy blocked to protect assignment history; user_id=%s", user_id)
+                return False
             is_super = new_role == 'super_admin'
             cur.execute("""
                 UPDATE users
@@ -1997,6 +2079,13 @@ def update_user_branch(user_id, branch_id):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
+            cur.execute("SELECT role, branch_id FROM users WHERE id=%s", (user_id,))
+            user_row = cur.fetchone()
+            if not user_row:
+                return False
+            if user_row[0] == 'deputy' and user_row[1] != branch_id:
+                logger.warning("Direct deputy branch change blocked; use transfer workflow. user_id=%s", user_id)
+                return False
             cur.execute("UPDATE users SET branch_id = %s, updated_at = %s WHERE id = %s", (branch_id, get_iran_time(), user_id))
             conn.commit()
             return True
@@ -2021,8 +2110,11 @@ def delete_user(user_id):
                     (SELECT COUNT(*) FROM user_activity_log WHERE user_id=%s),
                     (SELECT COUNT(*) FROM problems WHERE user_id=%s),
                     (SELECT COUNT(*) FROM actual_stats WHERE recorded_by=%s),
-                    (SELECT COUNT(*) FROM branch_targets WHERE created_by=%s)
-            """, (user_id, user_id, user_id, user_id, user_id, user_id))
+                    (SELECT COUNT(*) FROM branch_targets WHERE created_by=%s),
+                    (SELECT COUNT(*) FROM deputy_branch_assignments WHERE deputy_id=%s),
+                    (SELECT COUNT(*) FROM deputy_transfer_operations WHERE first_deputy_id=%s OR second_deputy_id=%s)
+            """, (user_id, user_id, user_id, user_id, user_id, user_id,
+                  user_id, user_id, user_id))
             dependencies = cur.fetchone()
             if any(dependencies):
                 return False, "این کاربر دارای سابقه عملیاتی است؛ برای حفظ اطلاعات امکان حذف فیزیکی وجود ندارد"
@@ -2478,7 +2570,7 @@ def get_deputy_accuracy_ranking(days=30):
                 SELECT
                     u.id,
                     u.full_name,
-                    b.name as branch_name,
+                    COALESCE(STRING_AGG(DISTINCT b.name, '، ' ORDER BY b.name), 'بدون ثبت') as branch_name,
                     COUNT(c.id) as total_days,
                     COALESCE(AVG(
                         CASE
@@ -2493,11 +2585,11 @@ def get_deputy_accuracy_ranking(days=30):
                         END
                     ), 0) as avg_accuracy
                 FROM users u
-                JOIN branches b ON u.branch_id = b.id
                 LEFT JOIN collections c ON u.id = c.recorded_by AND c.shamsi_date >= %s
+                LEFT JOIN branches b ON b.id = c.branch_id
                 LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
                 WHERE u.role = 'deputy'
-                GROUP BY u.id, u.full_name, b.name
+                GROUP BY u.id, u.full_name
                 HAVING COUNT(c.id) > 0
                 ORDER BY avg_accuracy DESC
             """, (get_shamsi_date(-days),))
@@ -2653,7 +2745,7 @@ def get_deputy_late_analysis(days=30):
                 SELECT
                     u.id,
                     u.full_name,
-                    b.name as branch_name,
+                    COALESCE(STRING_AGG(DISTINCT b.name, '، ' ORDER BY b.name), 'بدون ثبت') as branch_name,
                     COUNT(c.id) as total_days,
                     SUM(CASE WHEN (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') > 16)
                                 OR (EXTRACT(HOUR FROM c.created_at AT TIME ZONE 'Asia/Tehran') = 16
@@ -2664,10 +2756,10 @@ def get_deputy_late_analysis(days=30):
                                     AND EXTRACT(MINUTE FROM c.created_at AT TIME ZONE 'Asia/Tehran') > 30)
                              THEN 1 ELSE 0 END) / NULLIF(COUNT(c.id), 0), 1) as late_percent
                 FROM users u
-                JOIN branches b ON u.branch_id = b.id
                 LEFT JOIN collections c ON u.id = c.recorded_by AND c.shamsi_date >= %s
+                LEFT JOIN branches b ON b.id = c.branch_id
                 WHERE u.role = 'deputy'
-                GROUP BY u.id, u.full_name, b.name
+                GROUP BY u.id, u.full_name
                 HAVING COUNT(c.id) > 0
                 ORDER BY late_percent DESC
             """, (get_shamsi_date(-days),))
@@ -3351,11 +3443,12 @@ def generate_management_report(report_key):
                 return msg+"\n".join(f"• {n}: {cnt} ثبت | {notes} یادداشت | {late or 0} دیرهنگام" for n,cnt,notes,late in rows)
 
             if report_key == "deputy_performance":
-                cur.execute("""SELECT u.full_name,b.name,COUNT(c.id),COALESCE(SUM(c.total_amount),0),
+                cur.execute("""SELECT u.full_name,COALESCE(STRING_AGG(DISTINCT b.name,'، ' ORDER BY b.name),MAX(current_b.name)),COUNT(c.id),COALESCE(SUM(c.total_amount),0),
                     COALESCE(AVG(c.total_amount),0),SUM(CASE WHEN (c.created_at AT TIME ZONE 'Asia/Tehran')::time<=TIME '16:30' THEN 1 ELSE 0 END)
-                    FROM users u LEFT JOIN branches b ON b.id=u.branch_id LEFT JOIN collections c
-                    ON c.recorded_by=u.id AND c.shamsi_date>=%s WHERE u.role='deputy'
-                    GROUP BY u.id,u.full_name,b.name ORDER BY 4 DESC""", (start_30,))
+                    FROM users u LEFT JOIN collections c ON c.recorded_by=u.id AND c.shamsi_date>=%s
+                    LEFT JOIN branches b ON b.id=c.branch_id LEFT JOIN branches current_b ON current_b.id=u.branch_id
+                    WHERE u.role='deputy'
+                    GROUP BY u.id,u.full_name ORDER BY 4 DESC""", (start_30,))
                 rows=cur.fetchall(); msg=_report_header("👤 عملکرد جامع معاونان")
                 return msg+"\n".join(f"• {u} ({b or 'بدون شعبه'}): {_fmt_money(total)} | {days} روز | به‌موقع {ontime or 0}" for u,b,days,total,avg,ontime in rows)
 
@@ -3437,6 +3530,19 @@ def generate_management_report(report_key):
                     checks=[]
                     for label,query in [
                         ("کاربر بدون شعبه","SELECT COUNT(*) FROM users WHERE role='deputy' AND branch_id IS NULL"),
+                        ("معاون بدون سابقه انتصاب فعال","""SELECT COUNT(*) FROM users u
+                            WHERE u.role='deputy' AND u.branch_id IS NOT NULL
+                            AND NOT EXISTS (SELECT 1 FROM deputy_branch_assignments a
+                                WHERE a.deputy_id=u.id AND a.effective_to IS NULL)"""),
+                        ("ناهماهنگی شعبه فعلی و سابقه انتصاب","""SELECT COUNT(*) FROM users u
+                            JOIN deputy_branch_assignments a ON a.deputy_id=u.id AND a.effective_to IS NULL
+                            WHERE u.role='deputy' AND u.branch_id IS DISTINCT FROM a.branch_id"""),
+                        ("انتصاب فعال تکراری برای معاون","""SELECT COUNT(*) FROM (
+                            SELECT deputy_id FROM deputy_branch_assignments WHERE effective_to IS NULL
+                            GROUP BY deputy_id HAVING COUNT(*)>1) x"""),
+                        ("انتصاب فعال تکراری برای شعبه","""SELECT COUNT(*) FROM (
+                            SELECT branch_id FROM deputy_branch_assignments WHERE effective_to IS NULL
+                            GROUP BY branch_id HAVING COUNT(*)>1) x"""),
                         ("وصول منفی","SELECT COUNT(*) FROM collections WHERE deputy_amount<0 OR others_amount<0"),
                         ("وصول بدون ثبت‌کننده","SELECT COUNT(*) FROM collections WHERE recorded_by IS NULL"),
                         ("هدف فعال تکراری","SELECT COUNT(*) FROM (SELECT branch_id FROM branch_targets WHERE is_active GROUP BY branch_id HAVING COUNT(*)>1)x"),
@@ -4191,6 +4297,231 @@ def get_all_deputies_with_details():
         if conn:
             return_db_connection(conn)
 
+def preview_deputy_swap(first_deputy_id, second_deputy_id, effective_date):
+    """اعتبارسنجی و پیش‌نمایش کاملاً خواندنی؛ هیچ داده‌ای تغییر نمی‌کند."""
+    effective_date = normalize_digits(effective_date)
+    if first_deputy_id == second_deputy_id or not validate_shamsi_date(effective_date):
+        return False, "معاونان یا تاریخ مؤثر معتبر نیستند.", None
+    if effective_date > get_shamsi_date():
+        return False, "تاریخ مؤثر نمی‌تواند بعد از تاریخ امروز باشد.", None
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT u.id,u.employee_number,u.full_name,u.title,u.branch_id,b.name
+                           FROM users u LEFT JOIN branches b ON b.id=u.branch_id
+                           WHERE u.id=ANY(%s) AND u.role='deputy' ORDER BY u.id""",
+                        ([first_deputy_id, second_deputy_id],))
+            rows = {row[0]: row for row in cur.fetchall()}
+            if len(rows) != 2:
+                return False, "هر دو کاربر باید معاون فعال و معتبر باشند.", None
+            first, second = rows[first_deputy_id], rows[second_deputy_id]
+            if not first[4] or not second[4]:
+                return False, "برای یکی از معاونان شعبه فعلی تعیین نشده است.", None
+            if first[4] == second[4]:
+                return False, "دو معاون در حال حاضر به یک شعبه متصل‌اند؛ جابه‌جایی دوطرفه ممکن نیست.", None
+            cur.execute("""SELECT deputy_id,branch_id,effective_from,effective_to
+                           FROM deputy_branch_assignments
+                           WHERE deputy_id=ANY(%s) AND effective_to IS NULL FOR SHARE""",
+                        ([first_deputy_id, second_deputy_id],))
+            active = {row[0]: row for row in cur.fetchall()}
+            if len(active) != 2:
+                return False, "تاریخچه فعال یکی از معاونان ناقص است؛ ابتدا باید توسط مدیر سیستم بررسی شود.", None
+            if active[first_deputy_id][1] != first[4] or active[second_deputy_id][1] != second[4]:
+                return False, "شعبه فعلی کاربر با تاریخچه انتصاب هماهنگ نیست؛ عملیات متوقف شد.", None
+            if active[first_deputy_id][2] > effective_date or active[second_deputy_id][2] > effective_date:
+                return False, "تاریخ مؤثر قبل از شروع انتصاب فعلی است و با تاریخچه موجود تداخل دارد.", None
+            cur.execute("""SELECT deputy_id,branch_id,effective_from,effective_to
+                           FROM deputy_branch_assignments
+                           WHERE deputy_id=ANY(%s) AND effective_from>%s""",
+                        ([first_deputy_id, second_deputy_id], effective_date))
+            if cur.fetchone():
+                return False, "بعد از تاریخ انتخابی انتصاب دیگری ثبت شده است؛ جابه‌جایی عطف‌به‌ماسبق امن نیست.", None
+
+            audit = {}
+            for deputy in (first, second):
+                cur.execute("""SELECT c.branch_id,b.name,COUNT(*),COALESCE(SUM(c.total_amount),0)
+                               FROM collections c JOIN branches b ON b.id=c.branch_id
+                               WHERE c.recorded_by=%s AND c.shamsi_date>=%s
+                               GROUP BY c.branch_id,b.name ORDER BY COUNT(*) DESC""",
+                            (deputy[0], effective_date))
+                audit[deputy[0]] = cur.fetchall()
+            preview = {
+                'first': first, 'second': second, 'effective_date': effective_date,
+                'first_new_branch_id': second[4], 'first_new_branch_name': second[5],
+                'second_new_branch_id': first[4], 'second_new_branch_name': first[5],
+                'audit': audit,
+            }
+            return True, "پیش‌نمایش معتبر است.", preview
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Deputy swap preview failed")
+        return False, "بررسی جابه‌جایی انجام نشد؛ جزئیات خطا ثبت شد.", None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def execute_deputy_swap(first_deputy_id, second_deputy_id, effective_date,
+                        expected_first_branch_id, expected_second_branch_id,
+                        performed_by, reason=None):
+    """جابه‌جایی اتمیک؛ فقط انتصاب و شعبه فعلی تغییر می‌کند."""
+    effective_date = normalize_digits(effective_date)
+    previous_date = _shamsi_string(add_days_to_shamsi(effective_date, -1))
+    operation_uuid = str(uuid.uuid4())
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            lock_key = min(first_deputy_id, second_deputy_id) * 1_000_000 + max(first_deputy_id, second_deputy_id)
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            cur.execute("""SELECT u.id,u.full_name,u.title,u.branch_id,b.name
+                           FROM users u JOIN branches b ON b.id=u.branch_id
+                           WHERE u.id=ANY(%s) AND u.role='deputy' ORDER BY u.id FOR UPDATE OF u""",
+                        ([first_deputy_id, second_deputy_id],))
+            users = {row[0]: row for row in cur.fetchall()}
+            if len(users) != 2:
+                raise ValueError("هر دو معاون معتبر نیستند")
+            first, second = users[first_deputy_id], users[second_deputy_id]
+            if first[3] != expected_first_branch_id or second[3] != expected_second_branch_id:
+                raise ValueError("شعبه یکی از معاونان پس از پیش‌نمایش تغییر کرده است")
+            cur.execute("""SELECT id,deputy_id,branch_id,effective_from
+                           FROM deputy_branch_assignments
+                           WHERE deputy_id=ANY(%s) AND effective_to IS NULL
+                           ORDER BY deputy_id FOR UPDATE""",
+                        ([first_deputy_id, second_deputy_id],))
+            assignments = {row[1]: row for row in cur.fetchall()}
+            if len(assignments) != 2:
+                raise ValueError("انتصاب فعال معاونان کامل نیست")
+            for deputy_id, expected_branch in (
+                (first_deputy_id, expected_first_branch_id),
+                (second_deputy_id, expected_second_branch_id),
+            ):
+                assignment = assignments[deputy_id]
+                if assignment[2] != expected_branch or assignment[3] > effective_date:
+                    raise ValueError("تاریخچه انتصاب با پیش‌نمایش سازگار نیست")
+            cur.execute("""SELECT 1 FROM deputy_branch_assignments
+                           WHERE deputy_id=ANY(%s) AND effective_from>%s LIMIT 1""",
+                        ([first_deputy_id, second_deputy_id], effective_date))
+            if cur.fetchone():
+                raise ValueError("انتصاب متداخل بعد از تاریخ مؤثر وجود دارد")
+
+            first_title = first[2].replace(first[4], second[4]) if first[4] in first[2] else first[2]
+            second_title = second[2].replace(second[4], first[4]) if second[4] in second[2] else second[2]
+            cur.execute("""INSERT INTO deputy_transfer_operations
+                           (operation_uuid,first_deputy_id,second_deputy_id,
+                            first_old_branch_id,first_new_branch_id,
+                            second_old_branch_id,second_new_branch_id,
+                            effective_date,performed_by,reason,created_at)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                        (operation_uuid, first_deputy_id, second_deputy_id,
+                         first[3], second[3], second[3], first[3], effective_date,
+                         performed_by, reason, get_iran_time()))
+            operation_id = cur.fetchone()[0]
+            cur.execute("""UPDATE deputy_branch_assignments SET effective_to=%s
+                           WHERE id=ANY(%s) AND effective_to IS NULL""",
+                        (previous_date, [assignments[first_deputy_id][0], assignments[second_deputy_id][0]]))
+            if cur.rowcount != 2:
+                raise ValueError("بستن انتصاب‌های قبلی کامل نشد")
+            cur.execute("""INSERT INTO deputy_branch_assignments
+                           (deputy_id,branch_id,effective_from,operation_id,created_by,source,created_at)
+                           VALUES (%s,%s,%s,%s,%s,'swap',%s),(%s,%s,%s,%s,%s,'swap',%s)""",
+                        (first_deputy_id, second[3], effective_date, operation_id, performed_by, get_iran_time(),
+                         second_deputy_id, first[3], effective_date, operation_id, performed_by, get_iran_time()))
+            cur.execute("UPDATE users SET branch_id=%s,title=%s,updated_at=%s WHERE id=%s",
+                        (second[3], first_title, get_iran_time(), first_deputy_id))
+            cur.execute("UPDATE users SET branch_id=%s,title=%s,updated_at=%s WHERE id=%s",
+                        (first[3], second_title, get_iran_time(), second_deputy_id))
+            conn.commit()
+            cache_admins.invalidate_all()
+            invalidate_branches_cache()
+            return True, "جابه‌جایی با موفقیت ثبت شد.", {
+                'operation_uuid': operation_uuid, 'first_name': first[1], 'second_name': second[1],
+                'first_old': first[4], 'first_new': second[4],
+                'second_old': second[4], 'second_new': first[4],
+                'effective_date': effective_date,
+            }
+    except ValueError as exc:
+        if conn:
+            conn.rollback()
+        logger.warning("Deputy swap validation stopped: %s", safe_log_value(exc))
+        return False, safe_log_value(exc), None
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Deputy swap transaction failed")
+        return False, "خطای فنی رخ داد؛ جزئیات در لاگ ثبت شد", None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_deputy_assignment_history(limit=30):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT dba.id,u.full_name,u.employee_number,b.name,
+                                  dba.effective_from,dba.effective_to,dba.source,
+                                  dto.operation_uuid
+                           FROM deputy_branch_assignments dba
+                           JOIN users u ON u.id=dba.deputy_id
+                           JOIN branches b ON b.id=dba.branch_id
+                           LEFT JOIN deputy_transfer_operations dto ON dto.id=dba.operation_id
+                           ORDER BY dba.created_at DESC,dba.id DESC LIMIT %s""", (limit,))
+            return cur.fetchall()
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Loading deputy assignment history failed")
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def format_deputy_swap_preview(preview):
+    first, second = preview['first'], preview['second']
+    message = (
+        "🔎 **پیش‌نمایش جابه‌جایی معاونان**\n━━━━━━━━━━━━━━━━━━\n\n"
+        f"📅 تاریخ مؤثر: {get_shamsi_date_formatted(preview['effective_date'])}\n\n"
+        f"👤 {first[2]} ({first[1]})\n"
+        f"   {first[5]} ← تا روز قبل از تاریخ مؤثر\n"
+        f"   {preview['first_new_branch_name']} ← از تاریخ مؤثر\n\n"
+        f"👤 {second[2]} ({second[1]})\n"
+        f"   {second[5]} ← تا روز قبل از تاریخ مؤثر\n"
+        f"   {preview['second_new_branch_name']} ← از تاریخ مؤثر\n\n"
+        "🛡 **اطلاعاتی که تغییر نمی‌کنند:**\n"
+        "وصول‌ها، مبالغ، تاریخ‌ها، ثبت‌کننده‌ها، یادداشت‌ها، امتیازها، اهداف و آمار واقعی.\n\n"
+        "ℹ️ شعبه فعلی دو حساب جابه‌جا می‌شود و اگر نام شعبه در عنوان سازمانی آن‌ها باشد، همان نام نیز اصلاح می‌شود.\n\n"
+        "📋 **کنترل ثبت‌های موجود از تاریخ مؤثر:**\n"
+    )
+    for deputy in (first, second):
+        rows = preview['audit'].get(deputy[0], [])
+        if not rows:
+            message += f"• {deputy[2]}: هیچ وصولی ثبت نکرده است.\n"
+            continue
+        expected_branch_id = (preview['first_new_branch_id'] if deputy[0] == first[0]
+                              else preview['second_new_branch_id'])
+        details = "، ".join(
+            f"{'✅' if branch_id == expected_branch_id else '⚠️'} {name}: {count} ثبت"
+            for branch_id, name, count, _ in rows
+        )
+        message += f"• {deputy[2]}: {details}\n"
+    message += (
+        "\n⚠️ این فهرست فقط برای کنترل است؛ حتی در صورت مغایرت، هیچ وصول قبلی خودکار جابه‌جا نمی‌شود.\n"
+        "با تأیید نهایی فقط شعبه فعلی و تاریخچه انتصاب دو معاون ثبت خواهد شد."
+    )
+    return message
+
+def get_deputy_transfer_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "🔄 جابه‌جایی دو معاون"}],
+            [{"text": "📜 تاریخچه انتصاب معاونان"}],
+            [{"text": "🔙 انصراف"}],
+        ],
+        "resize_keyboard": True,
+    }
+
 def add_deputy(employee_number, full_name, title, branch_id, is_super_admin=False):
     conn = None
     try:
@@ -4203,9 +4534,14 @@ def add_deputy(employee_number, full_name, title, branch_id, is_super_admin=Fals
                 RETURNING id
             """, (employee_number, full_name, title, branch_id, is_super_admin, get_iran_time()))
             result = cur.fetchone()
-            conn.commit()
             if result:
+                cur.execute("""INSERT INTO deputy_branch_assignments
+                               (deputy_id,branch_id,effective_from,source,created_at)
+                               VALUES (%s,%s,%s,'deputy_created',%s)""",
+                            (result[0], branch_id, get_shamsi_date(), get_iran_time()))
+                conn.commit()
                 return result[0]
+            conn.rollback()
             return None
     except Exception as e:
         logger.error(f"add_deputy error: {e}")
@@ -4221,6 +4557,14 @@ def update_deputy(user_id, employee_number=None, full_name=None, title=None, bra
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
+            if branch_id is not None:
+                cur.execute("SELECT branch_id FROM users WHERE id=%s AND role='deputy'", (user_id,))
+                current = cur.fetchone()
+                if not current:
+                    return False
+                if current[0] != branch_id:
+                    logger.warning("Direct deputy branch edit blocked; use transfer workflow. user_id=%s", user_id)
+                    return False
             updates = []  # ترتیب صریح و ثابت؛ مقادیر همگی پارامتری هستند.
             params = []
             if employee_number is not None:
@@ -4232,9 +4576,6 @@ def update_deputy(user_id, employee_number=None, full_name=None, title=None, bra
             if title is not None:
                 updates.append("title = %s")
                 params.append(title)
-            if branch_id is not None:
-                updates.append("branch_id = %s")
-                params.append(branch_id)
             if not updates:
                 return False
             updates.append("updated_at = %s")
@@ -4299,11 +4640,6 @@ def get_deputy_match_report(user_id, days=30):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SELECT branch_id FROM users WHERE id = %s", (user_id,))
-            branch = cur.fetchone()
-            if not branch:
-                return None
-            branch_id = branch[0]
             shamsi_start = get_shamsi_date(-days)
             cur.execute("""
                 SELECT
@@ -4323,11 +4659,11 @@ def get_deputy_match_report(user_id, days=30):
                     (ABS(a.total_actual) - ABS(c.total_amount)) as diff
                 FROM collections c
                 LEFT JOIN actual_stats a ON c.branch_id = a.branch_id AND c.shamsi_date = a.shamsi_date
-                WHERE c.branch_id = %s
+                WHERE c.recorded_by = %s
                 AND c.shamsi_date >= %s
                 AND a.total_actual IS NOT NULL
                 ORDER BY c.shamsi_date DESC
-            """, (branch_id, shamsi_start))
+            """, (user_id, shamsi_start))
             return cur.fetchall()
     except Exception as e:
         logger.error(f"get_deputy_match_report error: {e}")
@@ -4715,6 +5051,7 @@ def get_super_admin_keyboard():
             [{"text": "👁 مشاهده وضعیت همیار"}],
             [{"text": "👥 مدیریت کاربران"}, {"text": "📊 مدیریت گزارش‌ها"}],
             [{"text": "👥 مدیریت معاونین"}, {"text": "📋 مشاهده لاگ‌ها"}],
+            [{"text": "🔁 مدیریت جابه‌جایی معاونان"}],
             [{"text": "📊 گزارش امروز"}, {"text": "📈 گزارش ۱۰ روز اخیر"}],
             [{"text": "🏆 رتبه‌بندی شعب"}, {"text": "💹 آمار مفصل امروز"}],
             [{"text": "🎯 تحلیل مدیریتی"}, {"text": "📅 گزارش تاریخ خاص"}],
@@ -6145,7 +6482,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۸.۹.۲ (رفع خطای export)\n"
+                "📅 نسخه: ۹.۱.۰ (تاریخچه انتصاب و جابه‌جایی امن معاونان)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_keyboard(role, is_super_admin)
@@ -6161,6 +6498,193 @@ def handle_message(message):
         # بخش سوپرادمین
         # ============================================================
         if is_super_admin:
+            if text == "🔁 مدیریت جابه‌جایی معاونان":
+                send_message(
+                    chat_id,
+                    "🔁 **مدیریت جابه‌جایی معاونان**\n\n"
+                    "این بخش انتصاب‌ها را با تاریخ مؤثر و در یک تراکنش ثبت می‌کند. "
+                    "هیچ سابقه مالی تغییر نمی‌کند.",
+                    get_deputy_transfer_keyboard()
+                )
+                return
+
+            if text == "🔄 جابه‌جایی دو معاون":
+                deputies = [row for row in get_all_deputies_with_details() if row[4] is not None]
+                if len(deputies) < 2:
+                    send_message(chat_id, "❌ حداقل دو معاون دارای شعبه برای جابه‌جایی لازم است.", get_deputy_transfer_keyboard())
+                    return
+                msg = "1️⃣ **معاون اول را انتخاب کنید:**\n\n"
+                for index, deputy in enumerate(deputies, 1):
+                    msg += f"{index}. {deputy[2]} — {deputy[5]}\n"
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_SWAP_FIRST_DEPUTY",
+                    "swap_deputies": deputies,
+                })
+                send_message(chat_id, msg, get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_SWAP_FIRST_DEPUTY":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                deputies = user_state.get("swap_deputies", [])
+                try:
+                    index = int(normalize_digits(text)) - 1
+                except (TypeError, ValueError):
+                    index = -1
+                if not 0 <= index < len(deputies):
+                    send_message(chat_id, "❌ شماره معاون معتبر نیست.", get_cancel_keyboard())
+                    return
+                first = deputies[index]
+                candidates = [deputy for deputy in deputies if deputy[0] != first[0] and deputy[4] != first[4]]
+                msg = f"✅ معاون اول: {first[2]} — {first[5]}\n\n2️⃣ **معاون دوم را انتخاب کنید:**\n\n"
+                for candidate_index, deputy in enumerate(candidates, 1):
+                    msg += f"{candidate_index}. {deputy[2]} — {deputy[5]}\n"
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_SWAP_SECOND_DEPUTY",
+                    "swap_first": first,
+                    "swap_candidates": candidates,
+                })
+                send_message(chat_id, msg, get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_SWAP_SECOND_DEPUTY":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                candidates = user_state.get("swap_candidates", [])
+                try:
+                    index = int(normalize_digits(text)) - 1
+                except (TypeError, ValueError):
+                    index = -1
+                if not 0 <= index < len(candidates):
+                    send_message(chat_id, "❌ شماره معاون معتبر نیست.", get_cancel_keyboard())
+                    return
+                second = candidates[index]
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_SWAP_EFFECTIVE_DATE",
+                    "swap_second": second,
+                })
+                send_message(
+                    chat_id,
+                    f"✅ معاون دوم: {second[2]} — {second[5]}\n\n"
+                    "📅 تاریخ مؤثر جابه‌جایی را به فرمت YYYY/MM/DD وارد کنید.\n"
+                    "مثال: ۱۴۰۵/۰۵/۲۶",
+                    get_cancel_keyboard()
+                )
+                return
+
+            if current_state == "WAITING_FOR_SWAP_EFFECTIVE_DATE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                effective_date = normalize_digits(text)
+                first = user_state.get("swap_first")
+                second = user_state.get("swap_second")
+                if not first or not second or not validate_shamsi_date(effective_date):
+                    send_message(chat_id, "❌ تاریخ معتبر نیست. نمونه صحیح: ۱۴۰۵/۰۵/۲۶", get_cancel_keyboard())
+                    return
+                ok, error, _ = preview_deputy_swap(first[0], second[0], effective_date)
+                if not ok:
+                    send_message(chat_id, f"❌ {error}", get_cancel_keyboard())
+                    return
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_SWAP_REASON",
+                    "swap_effective_date": effective_date,
+                })
+                reason_keyboard = {
+                    "keyboard": [[{"text": "⏭ بدون توضیح"}], [{"text": "🔙 انصراف"}]],
+                    "resize_keyboard": True,
+                }
+                send_message(chat_id, "📝 علت یا توضیح اداری جابه‌جایی را بنویسید؛ این بخش اختیاری است.", reason_keyboard)
+                return
+
+            if current_state == "WAITING_FOR_SWAP_REASON":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                first = user_state.get("swap_first")
+                second = user_state.get("swap_second")
+                effective_date = user_state.get("swap_effective_date")
+                reason = None if text == "⏭ بدون توضیح" else text[:500]
+                ok, error, preview = preview_deputy_swap(first[0], second[0], effective_date)
+                if not ok:
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, f"❌ {error}\nهیچ تغییری اعمال نشد.", get_super_admin_keyboard())
+                    return
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_SWAP_CONFIRM",
+                    "swap_reason": reason,
+                    "swap_preview": preview,
+                    "swap_expires_at": time.time() + 600,
+                })
+                confirm_keyboard = {
+                    "keyboard": [[{"text": "✅ تأیید نهایی جابه‌جایی"}], [{"text": "🔙 انصراف"}]],
+                    "resize_keyboard": True,
+                }
+                send_message(chat_id, format_deputy_swap_preview(preview), confirm_keyboard)
+                return
+
+            if current_state == "WAITING_FOR_SWAP_CONFIRM":
+                if text == "🔙 انصراف" or text != "✅ تأیید نهایی جابه‌جایی":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "swap_preview": None})
+                    send_message(chat_id, "عملیات لغو شد و هیچ تغییری اعمال نشد.", get_super_admin_keyboard())
+                    return
+                if time.time() > user_state.get("swap_expires_at", 0):
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "swap_preview": None})
+                    send_message(chat_id, "⌛ اعتبار پیش‌نمایش پایان یافته است؛ عملیات را دوباره آغاز کنید.", get_super_admin_keyboard())
+                    return
+                preview = user_state.get("swap_preview")
+                if not preview:
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "❌ اطلاعات پیش‌نمایش در دسترس نیست؛ هیچ تغییری اعمال نشد.", get_super_admin_keyboard())
+                    return
+                # قبل از اجرای تراکنش state بسته می‌شود تا لمس دوباره دکمه، عملیات را تکرار نکند.
+                user_states.update(chat_id, {"state": "LOGGED_IN", "swap_preview": None})
+                success, result_message, receipt = execute_deputy_swap(
+                    preview['first'][0], preview['second'][0], preview['effective_date'],
+                    preview['first'][4], preview['second'][4], user_db_id,
+                    user_state.get("swap_reason")
+                )
+                if not success:
+                    send_message(chat_id, f"❌ جابه‌جایی انجام نشد: {result_message}\nهیچ تغییر ناقصی ثبت نشده است.", get_super_admin_keyboard())
+                    return
+                log_user_activity(
+                    user_db_id,
+                    "deputy_swap",
+                    f"operation={receipt['operation_uuid']} effective={receipt['effective_date']}"
+                )
+                receipt_text = (
+                    "✅ **رسید ثبت جابه‌جایی معاونان**\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🆔 شناسه عملیات: `{receipt['operation_uuid']}`\n"
+                    f"📅 تاریخ مؤثر: {get_shamsi_date_formatted(receipt['effective_date'])}\n\n"
+                    f"👤 {receipt['first_name']}: {receipt['first_old']} ← {receipt['first_new']}\n"
+                    f"👤 {receipt['second_name']}: {receipt['second_old']} ← {receipt['second_new']}\n\n"
+                    "🔒 تعداد سوابق مالی تغییرکرده: صفر\n"
+                    "تاریخچه انتصاب، شعبه فعلی و عنوان وابسته به شعبه در یک تراکنش ثبت شد."
+                )
+                send_message(chat_id, receipt_text, get_super_admin_keyboard())
+                return
+
+            if text == "📜 تاریخچه انتصاب معاونان":
+                history = get_deputy_assignment_history(40)
+                if not history:
+                    send_message(chat_id, "تاریخچه‌ای برای نمایش وجود ندارد.", get_deputy_transfer_keyboard())
+                    return
+                msg = "📜 **تاریخچه انتصاب معاونان**\n━━━━━━━━━━━━━━━━━━\n"
+                for _, name, employee_number, branch, start, end, source, operation_uuid in history:
+                    end_text = get_shamsi_date_formatted(end) if end else "اکنون"
+                    start_text = "آغاز ثبت سیستم" if start == '0001/01/01' else get_shamsi_date_formatted(start)
+                    msg += f"• {name} ({employee_number})\n  {branch}: {start_text} تا {end_text}\n"
+                    if operation_uuid:
+                        msg += f"  شناسه عملیات: `{operation_uuid}`\n"
+                send_message(chat_id, msg, get_deputy_transfer_keyboard())
+                return
+
             if text == "📊 مرکز گزارش‌های مدیریتی":
                 send_message(
                     chat_id,
@@ -6334,7 +6858,8 @@ def handle_message(message):
                     msg += "برای مدیریت:\n"
                     msg += "▪️ /add_deputy [شماره کارمندی] | [نام کامل] | [شناسه شعبه] | [سمت]\n"
                     msg += "▪️ /edit_deputy [user_id] [field] [value]\n"
-                    msg += "▪️ /delete_deputy [user_id]"
+                    msg += "▪️ /delete_deputy [user_id]\n"
+                    msg += "🔒 تغییر شعبه معاون فقط از بخش «مدیریت جابه‌جایی معاونان» انجام می‌شود."
                     send_message(chat_id, msg, get_super_admin_keyboard())
                 else:
                     send_message(chat_id, "هیچ معاونی یافت نشد.", get_super_admin_keyboard())
@@ -7088,7 +7613,7 @@ def handle_message(message):
                     dep_id, dep_chat_id, dep_name, branch_id, branch_name = dep
                     perf = get_deputy_performance_report(dep_id, 30)
                     if perf:
-                        msg += f"👤 {dep_name} - {branch_name or 'بدون شعبه'}\n"
+                        msg += f"👤 {dep_name} - شعبه فعلی: {branch_name or 'بدون شعبه'}\n"
                         msg += f"   📅 ثبت به‌موقع: {perf['on_time']} روز\n"
                         msg += f"   📅 تاخیر: {perf['late']} روز\n"
                         msg += f"   💰 میانگین وصول: {perf['avg_amount']//1_000_000:,.0f} میلیون ریال\n"
