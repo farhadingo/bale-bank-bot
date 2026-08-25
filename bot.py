@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۱.۰ (تاریخچه انتصاب و جابه‌جایی امن معاونان)
+# bot.py - نسخه ۹.۲.۰ (مرکز پیام‌رسانی و جابه‌جایی امن معاونان)
 # ============================================================
 import os
 import time
@@ -39,6 +39,7 @@ import hashlib
 import binascii
 import hmac
 import uuid
+import base64
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from zoneinfo import ZoneInfo  # Python 3.9+
@@ -73,7 +74,7 @@ BACKUP_TABLES = (
     'branches', 'users', 'collections', 'notes', 'user_activity_log',
     'settings', 'holidays', 'problems', 'scores', 'feature_settings',
     'actual_stats', 'branch_targets', 'deputy_transfer_operations',
-    'deputy_branch_assignments'
+    'deputy_branch_assignments', 'message_campaigns', 'message_deliveries'
 )
 RESTORE_IDENTITY_FIELDS = {
     'branches': ('name',),
@@ -88,7 +89,11 @@ RESTORE_IDENTITY_FIELDS = {
     'branch_targets': ('branch_id', 'target_date', 'created_at'),
     'deputy_transfer_operations': ('operation_uuid',),
     'deputy_branch_assignments': ('deputy_id', 'branch_id', 'effective_from'),
+    'message_campaigns': ('campaign_uuid',),
+    'message_deliveries': ('campaign_id', 'user_id'),
 }
+MAX_CAMPAIGN_TEXT_LENGTH = 3500
+MAX_CAMPAIGN_MEDIA_BYTES = 5 * 1024 * 1024
 
 # ============================================================
 # تنظیمات لاگین
@@ -751,6 +756,50 @@ def create_all_tables_if_not_exists():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS message_campaigns (
+                    id BIGSERIAL PRIMARY KEY,
+                    campaign_uuid VARCHAR(36) NOT NULL UNIQUE,
+                    message_type VARCHAR(20) NOT NULL
+                        CHECK (message_type IN ('occasion', 'announcement', 'urgent')),
+                    message_text TEXT NOT NULL,
+                    media_base64 TEXT,
+                    media_mime VARCHAR(100),
+                    media_name VARCHAR(255),
+                    audience_type VARCHAR(20) NOT NULL
+                        CHECK (audience_type IN ('all', 'deputies', 'admins', 'branches', 'manual')),
+                    audience_config JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    personalize BOOLEAN NOT NULL DEFAULT FALSE,
+                    status VARCHAR(20) NOT NULL DEFAULT 'draft'
+                        CHECK (status IN ('draft', 'scheduled', 'sending', 'completed', 'partial', 'cancelled')),
+                    scheduled_at TIMESTAMP WITH TIME ZONE,
+                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    total_recipients INTEGER NOT NULL DEFAULT 0,
+                    sent_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    started_at TIMESTAMP WITH TIME ZONE,
+                    completed_at TIMESTAMP WITH TIME ZONE,
+                    cancelled_at TIMESTAMP WITH TIME ZONE,
+                    CHECK (char_length(message_text) BETWEEN 1 AND 3500)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS message_deliveries (
+                    id BIGSERIAL PRIMARY KEY,
+                    campaign_id BIGINT NOT NULL REFERENCES message_campaigns(id) ON DELETE RESTRICT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+                    telegram_id BIGINT NOT NULL,
+                    recipient_name VARCHAR(255) NOT NULL,
+                    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'cancelled')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    sent_at TIMESTAMP WITH TIME ZONE,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT unique_campaign_recipient UNIQUE (campaign_id, user_id)
+                )
+            """)
+            cur.execute("""
                 DO $safe_index$
                 BEGIN
                     IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public'
@@ -777,6 +826,8 @@ def create_all_tables_if_not_exists():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_actual_stats_branch_date ON actual_stats(branch_id, shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_assignments_deputy_dates ON deputy_branch_assignments(deputy_id, effective_from, effective_to);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_assignments_branch_dates ON deputy_branch_assignments(branch_id, effective_from, effective_to);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_message_campaigns_due ON message_campaigns(status, scheduled_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_message_deliveries_campaign_status ON message_deliveries(campaign_id, status);")
             cur.execute("""
                 DO $assignment_indexes$
                 BEGIN
@@ -2112,9 +2163,10 @@ def delete_user(user_id):
                     (SELECT COUNT(*) FROM actual_stats WHERE recorded_by=%s),
                     (SELECT COUNT(*) FROM branch_targets WHERE created_by=%s),
                     (SELECT COUNT(*) FROM deputy_branch_assignments WHERE deputy_id=%s),
-                    (SELECT COUNT(*) FROM deputy_transfer_operations WHERE first_deputy_id=%s OR second_deputy_id=%s)
+                    (SELECT COUNT(*) FROM deputy_transfer_operations WHERE first_deputy_id=%s OR second_deputy_id=%s),
+                    (SELECT COUNT(*) FROM message_deliveries WHERE user_id=%s)
             """, (user_id, user_id, user_id, user_id, user_id, user_id,
-                  user_id, user_id, user_id))
+                  user_id, user_id, user_id, user_id))
             dependencies = cur.fetchone()
             if any(dependencies):
                 return False, "این کاربر دارای سابقه عملیاتی است؛ برای حفظ اطلاعات امکان حذف فیزیکی وجود ندارد"
@@ -4776,7 +4828,11 @@ def import_all_data_from_json(json_data, clear_existing=False, dry_run=False):
                             raise ValueError(
                                 f"تعارض هویتی در جدول {table} برای id={row['id']}; بازیابی متوقف شد"
                             )
-                values = [tuple(row.get(column) for column in columns) for row in rows]
+                values = [tuple(
+                    json.dumps(row.get(column), ensure_ascii=False)
+                    if isinstance(row.get(column), (dict, list)) else row.get(column)
+                    for column in columns
+                ) for row in rows]
                 statement = sql.SQL(
                     "INSERT INTO {} ({}) VALUES %s ON CONFLICT DO NOTHING"
                 ).format(
@@ -5000,6 +5056,426 @@ def send_photo(chat_id, photo_bytes, caption="", reply_markup=None):
         logger.error(f"sendPhoto error: {e}")
         return None
 
+def send_campaign_photo(chat_id, photo_bytes, mime_type, file_name, caption=""):
+    """Send an optional campaign image without assuming that it is a chart PNG."""
+    if not photo_bytes or not str(mime_type or '').startswith('image/'):
+        return None
+    files = {'photo': (file_name or 'message-image', photo_bytes, mime_type)}
+    data = {'chat_id': chat_id, 'caption': caption[:1024]}
+    try:
+        response = get_http_session().post(f"{BASE_URL}/sendPhoto", data=data, files=files, timeout=45)
+        payload = response.json() if response.status_code == 200 else None
+        return payload if payload and payload.get('ok', True) else None
+    except Exception:
+        logger.exception("Campaign photo send failed for chat_id=%s", chat_id)
+        return None
+
+def send_campaign_text(chat_id, text):
+    """Campaigns are administrative notices and must not turn into maintenance messages."""
+    try:
+        response = get_http_session().post(
+            f"{BASE_URL}/sendMessage", json={'chat_id': chat_id, 'text': text}, timeout=30
+        )
+        payload = response.json() if response.status_code == 200 else None
+        return payload if payload and payload.get('ok', True) else None
+    except Exception:
+        logger.exception("Campaign text send failed for chat_id=%s", chat_id)
+        return None
+
+# ============================================================
+# مرکز پیام‌رسانی سوپرادمین
+# ============================================================
+def get_messaging_center_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "🎉 پیام مناسبتی"}, {"text": "📢 اطلاعیه"}],
+            [{"text": "🚨 پیام فوری"}],
+            [{"text": "📝 پیش‌نویس‌ها"}, {"text": "📜 تاریخچه پیام‌ها"}],
+            [{"text": "⛔ لغو پیام زمان‌بندی‌شده"}],
+            [{"text": "🔁 ارسال مجدد ناموفق‌ها"}],
+            [{"text": "🔙 بازگشت به منوی اصلی"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+def get_campaign_audience_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "👥 همه کاربران"}, {"text": "🏢 همه معاونان"}],
+            [{"text": "👤 همه ادمین‌ها"}, {"text": "🏬 انتخاب شعب"}],
+            [{"text": "☑️ انتخاب دستی کاربران"}],
+            [{"text": "🔙 انصراف"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+def get_campaign_recipients(audience_type, audience_config=None):
+    config = audience_config or {}
+    clauses = ["u.telegram_id IS NOT NULL"]
+    params = []
+    if audience_type == 'deputies':
+        clauses.append("u.role='deputy'")
+    elif audience_type == 'admins':
+        clauses.append("(u.role IN ('admin','super_admin') OR u.is_super_admin=TRUE)")
+    elif audience_type == 'branches':
+        branch_ids = [int(value) for value in config.get('branch_ids', [])]
+        if not branch_ids:
+            return []
+        clauses.append("u.branch_id=ANY(%s)")
+        params.append(branch_ids)
+    elif audience_type == 'manual':
+        user_ids = [int(value) for value in config.get('user_ids', [])]
+        if not user_ids:
+            return []
+        clauses.append("u.id=ANY(%s)")
+        params.append(user_ids)
+    elif audience_type != 'all':
+        return []
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(f"""SELECT u.id,u.telegram_id,u.full_name,u.title,u.role,b.name
+                FROM users u LEFT JOIN branches b ON b.id=u.branch_id
+                WHERE {' AND '.join(clauses)} ORDER BY u.full_name""", params)
+            return cur.fetchall()
+    except Exception:
+        logger.exception("Campaign recipient resolution failed")
+        if conn:
+            conn.rollback()
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def download_bale_media(file_id, max_bytes=MAX_CAMPAIGN_MEDIA_BYTES):
+    try:
+        metadata = get_http_session().get(f"{BASE_URL}/getFile", params={"file_id": file_id}, timeout=30)
+        if metadata.status_code != 200 or not metadata.json().get('ok'):
+            return False, "اطلاعات تصویر دریافت نشد.", None
+        file_path = metadata.json().get('result', {}).get('file_path')
+        if not file_path:
+            return False, "مسیر تصویر دریافت نشد.", None
+        response = get_http_session().get(f"https://tapi.bale.ai/file/bot{BOT_TOKEN}/{file_path}", timeout=60, stream=True)
+        if response.status_code != 200:
+            return False, "دریافت تصویر ناموفق بود.", None
+        declared_size = int(response.headers.get('Content-Length') or 0)
+        if declared_size > max_bytes:
+            response.close()
+            return False, "حجم تصویر بیشتر از ۵ مگابایت است.", None
+        chunks, total = [], 0
+        for chunk in response.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                response.close()
+                return False, "حجم تصویر بیشتر از ۵ مگابایت است.", None
+            chunks.append(chunk)
+        response.close()
+        return True, "", b''.join(chunks)
+    except Exception:
+        logger.exception("Campaign media download failed")
+        return False, "دریافت تصویر انجام نشد.", None
+
+def parse_campaign_schedule(value):
+    normalized = normalize_digits(value).strip()
+    match = re.fullmatch(r'(\d{4})/(\d{2})/(\d{2})\s+(\d{1,2}):(\d{2})', normalized)
+    if not match:
+        return None
+    year, month, day, hour, minute = map(int, match.groups())
+    if hour > 23 or minute > 59:
+        return None
+    try:
+        gregorian = jdatetime.datetime(year, month, day, hour, minute).togregorian()
+        scheduled = gregorian.replace(tzinfo=IRAN_TZ)
+        return scheduled if scheduled > get_iran_time() else None
+    except (ValueError, TypeError):
+        return None
+
+def format_campaign_preview(draft, recipients, scheduled_at=None):
+    type_names = {'occasion': '🎉 مناسبتی', 'announcement': '📢 اطلاعیه', 'urgent': '🚨 فوری'}
+    audience_names = {'all': 'همه کاربران', 'deputies': 'همه معاونان', 'admins': 'همه ادمین‌ها',
+                      'branches': 'شعب انتخابی', 'manual': 'کاربران انتخابی'}
+    names = '، '.join(row[2] for row in recipients[:8])
+    if len(recipients) > 8:
+        names += f" و {len(recipients)-8} نفر دیگر"
+    if scheduled_at:
+        local_time = scheduled_at.astimezone(IRAN_TZ)
+        shamsi_time = jdatetime.datetime.fromgregorian(datetime=local_time.replace(tzinfo=None))
+        when = f"{shamsi_time.year:04d}/{shamsi_time.month:02d}/{shamsi_time.day:02d} {shamsi_time.hour:02d}:{shamsi_time.minute:02d}"
+    else:
+        when = 'هنوز تعیین نشده'
+    return (
+        "📋 **پیش‌نمایش پیام**\n━━━━━━━━━━━━━━━━━━\n"
+        f"نوع: {type_names.get(draft['message_type'])}\n"
+        f"مخاطب: {audience_names.get(draft['audience_type'])}\n"
+        f"تعداد دریافت‌کننده: {len(recipients)}\n"
+        f"شخصی‌سازی: {'فعال' if draft.get('personalize') else 'غیرفعال'}\n"
+        f"تصویر: {'دارد' if draft.get('media_base64') else 'ندارد'}\n"
+        f"زمان: {when}\n"
+        f"گیرندگان: {names or '—'}\n\n"
+        f"متن:\n{draft['message_text']}"
+    )
+
+def personalize_campaign_text(text, recipient, enabled):
+    if not enabled:
+        return text
+    _, _, full_name, title, _, branch_name = recipient
+    return (text.replace('{name}', full_name or '')
+                .replace('{title}', title or '')
+                .replace('{branch}', branch_name or ''))
+
+def create_message_campaign(draft, created_by, scheduled_at, initial_status='scheduled'):
+    recipients = get_campaign_recipients(draft['audience_type'], draft.get('audience_config'))
+    if not recipients:
+        return False, "هیچ کاربر متصل به ربات در گروه انتخاب‌شده وجود ندارد.", None
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            campaign_uuid = str(uuid.uuid4())
+            cur.execute("""INSERT INTO message_campaigns
+                (campaign_uuid,message_type,message_text,media_base64,media_mime,media_name,
+                 audience_type,audience_config,personalize,status,scheduled_at,created_by,total_recipients)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s)
+                RETURNING id""", (
+                    campaign_uuid, draft['message_type'], draft['message_text'],
+                    draft.get('media_base64'), draft.get('media_mime'), draft.get('media_name'),
+                    draft['audience_type'], json.dumps(draft.get('audience_config') or {}),
+                    bool(draft.get('personalize')), initial_status, scheduled_at, created_by, len(recipients)
+                ))
+            campaign_id = cur.fetchone()[0]
+            execute_values(cur, """INSERT INTO message_deliveries
+                (campaign_id,user_id,telegram_id,recipient_name)
+                VALUES %s ON CONFLICT (campaign_id,user_id) DO NOTHING""",
+                [(campaign_id, row[0], row[1], row[2]) for row in recipients], page_size=200)
+        conn.commit()
+        return True, "پیام ثبت شد.", {'id': campaign_id, 'uuid': campaign_uuid, 'count': len(recipients)}
+    except Exception:
+        logger.exception("Campaign creation failed")
+        if conn:
+            conn.rollback()
+        return False, "ثبت پیام انجام نشد؛ هیچ ارسال ناقصی آغاز نشده است.", None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def schedule_draft_campaign(campaign_id, scheduled_at, requested_by):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE message_campaigns SET status='scheduled',scheduled_at=%s
+                WHERE id=%s AND status='draft' RETURNING campaign_uuid,total_recipients""", (scheduled_at, campaign_id))
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return False, "پیش‌نویس معتبر نیست یا قبلاً زمان‌بندی شده است.", None
+        conn.commit()
+        log_user_activity(requested_by, 'campaign_schedule_draft', f"campaign={row[0]}")
+        return True, "پیش‌نویس در صف ارسال قرار گرفت.", {'uuid': row[0], 'count': row[1]}
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Draft campaign scheduling failed")
+        return False, "زمان‌بندی پیش‌نویس انجام نشد.", None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def _campaign_delivery_payload(campaign_id, user_id):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT d.id,d.telegram_id,u.id,u.telegram_id,u.full_name,u.title,u.role,b.name,
+                c.message_text,c.personalize,c.media_base64,c.media_mime,c.media_name
+                FROM message_deliveries d JOIN message_campaigns c ON c.id=d.campaign_id
+                JOIN users u ON u.id=d.user_id LEFT JOIN branches b ON b.id=u.branch_id
+                WHERE d.campaign_id=%s AND d.user_id=%s""", (campaign_id, user_id))
+            return cur.fetchone()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def process_message_campaign(campaign_id):
+    """Idempotent delivery worker; a recipient is claimed before network sending."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT status,scheduled_at FROM message_campaigns WHERE id=%s FOR UPDATE", (campaign_id,))
+            row = cur.fetchone()
+            if not row or row[0] not in ('scheduled', 'partial') or (row[1] and row[1] > get_iran_time()):
+                conn.rollback()
+                return
+            cur.execute("UPDATE message_campaigns SET status='sending',started_at=COALESCE(started_at,CURRENT_TIMESTAMP) WHERE id=%s", (campaign_id,))
+            cur.execute("SELECT user_id FROM message_deliveries WHERE campaign_id=%s AND status IN ('pending','failed') ORDER BY id", (campaign_id,))
+            user_ids = [item[0] for item in cur.fetchall()]
+        conn.commit()
+    except Exception:
+        logger.exception("Campaign start failed id=%s", campaign_id)
+        if conn:
+            conn.rollback()
+        return
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+    for user_id in user_ids:
+        conn = None
+        claim = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("""UPDATE message_deliveries SET status='sending',attempts=attempts+1,last_error=NULL
+                    WHERE campaign_id=%s AND user_id=%s AND status IN ('pending','failed') RETURNING id""", (campaign_id, user_id))
+                claim = cur.fetchone()
+            conn.commit()
+        except Exception:
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                return_db_connection(conn)
+        if not claim:
+            continue
+        success = False
+        error_text = None
+        try:
+            payload = _campaign_delivery_payload(campaign_id, user_id)
+            if not payload:
+                raise RuntimeError("اطلاعات گیرنده در دسترس نیست")
+            _, chat_id, db_user_id, _, name, title, role, branch, body, personalized, media_b64, mime, media_name = payload
+            recipient = (db_user_id, chat_id, name, title, role, branch)
+            rendered = personalize_campaign_text(body, recipient, personalized)
+            if media_b64:
+                media = base64.b64decode(media_b64, validate=True)
+                photo_result = send_campaign_photo(chat_id, media, mime, media_name, rendered if len(rendered) <= 1024 else '')
+                if not photo_result:
+                    raise RuntimeError("ارسال تصویر ناموفق بود")
+                result = True if len(rendered) <= 1024 else send_campaign_text(chat_id, rendered)
+            else:
+                result = send_campaign_text(chat_id, rendered)
+            success = bool(result)
+            if not success:
+                error_text = "پاسخ موفق از سرویس پیام دریافت نشد"
+        except Exception as exc:
+            error_text = str(exc)[:500]
+            logger.exception("Campaign delivery failed campaign=%s user=%s", campaign_id, user_id)
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                if success:
+                    cur.execute("UPDATE message_deliveries SET status='sent',sent_at=CURRENT_TIMESTAMP,last_error=NULL WHERE campaign_id=%s AND user_id=%s", (campaign_id, user_id))
+                else:
+                    cur.execute("UPDATE message_deliveries SET status='failed',last_error=%s WHERE campaign_id=%s AND user_id=%s", (error_text, campaign_id, user_id))
+            conn.commit()
+        finally:
+            if conn:
+                return_db_connection(conn)
+        time.sleep(0.12)
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(*) FILTER(WHERE status='sent'),COUNT(*) FILTER(WHERE status='failed'),
+                COUNT(*) FILTER(WHERE status IN ('pending','sending')) FROM message_deliveries WHERE campaign_id=%s""", (campaign_id,))
+            sent, failed, unfinished = cur.fetchone()
+            final_status = 'completed' if failed == 0 and unfinished == 0 else 'partial'
+            cur.execute("""UPDATE message_campaigns SET status=%s,sent_count=%s,failed_count=%s,
+                completed_at=CURRENT_TIMESTAMP WHERE id=%s AND status='sending'""", (final_status, sent, failed, campaign_id))
+        conn.commit()
+    except Exception:
+        logger.exception("Campaign finalization failed id=%s", campaign_id)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def process_due_message_campaigns():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM message_campaigns WHERE status='scheduled' AND scheduled_at<=CURRENT_TIMESTAMP ORDER BY scheduled_at LIMIT 10")
+            campaign_ids = [row[0] for row in cur.fetchall()]
+    except Exception:
+        logger.exception("Reading scheduled campaigns failed")
+        return
+    finally:
+        if conn:
+            return_db_connection(conn)
+    for campaign_id in campaign_ids:
+        process_message_campaign(campaign_id)
+
+def get_campaign_history(limit=10):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,campaign_uuid,message_type,status,total_recipients,sent_count,failed_count,
+                scheduled_at,created_at,LEFT(message_text,80) FROM message_campaigns ORDER BY id DESC LIMIT %s""", (limit,))
+            return cur.fetchall()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def cancel_scheduled_campaign(campaign_id, cancelled_by):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE message_campaigns SET status='cancelled',cancelled_at=CURRENT_TIMESTAMP
+                WHERE id=%s AND status='scheduled' RETURNING campaign_uuid""", (campaign_id,))
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return False, "این پیام زمان‌بندی‌شده نیست یا ارسال آن آغاز شده است."
+            cur.execute("UPDATE message_deliveries SET status='cancelled' WHERE campaign_id=%s AND status='pending'", (campaign_id,))
+        conn.commit()
+        log_user_activity(cancelled_by, 'campaign_cancel', f"campaign={row[0]}")
+        return True, f"پیام {row[0]} لغو شد."
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Campaign cancellation failed")
+        return False, "لغو پیام انجام نشد."
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def retry_failed_campaign(campaign_id, requested_by):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT campaign_uuid,status FROM message_campaigns WHERE id=%s FOR UPDATE", (campaign_id,))
+            row = cur.fetchone()
+            if not row or row[1] != 'partial':
+                conn.rollback()
+                return False, "این پیام تحویل ناموفق قابل ارسال مجدد ندارد."
+            cur.execute("UPDATE message_deliveries SET status='pending',last_error=NULL WHERE campaign_id=%s AND status='failed'", (campaign_id,))
+            if cur.rowcount == 0:
+                conn.rollback()
+                return False, "گیرنده ناموفقی یافت نشد."
+            cur.execute("UPDATE message_campaigns SET status='scheduled',scheduled_at=CURRENT_TIMESTAMP,failed_count=0 WHERE id=%s", (campaign_id,))
+        conn.commit()
+        log_user_activity(requested_by, 'campaign_retry', f"campaign={row[0]}")
+        return True, "ارسال مجدد فقط برای گیرندگان ناموفق در صف قرار گرفت."
+    except Exception:
+        if conn:
+            conn.rollback()
+        logger.exception("Campaign retry failed")
+        return False, "ثبت ارسال مجدد انجام نشد."
+    finally:
+        if conn:
+            return_db_connection(conn)
+
 def send_maintenance_message(chat_id):
     msg = "🔧 با عرض پوزش، ربات در حال بروزرسانی می‌باشد.\nلطفاً بعداً مجدداً تلاش کنید."
     url = f"{BASE_URL}/sendMessage"
@@ -5051,6 +5527,7 @@ def get_super_admin_keyboard():
             [{"text": "👁 مشاهده وضعیت همیار"}],
             [{"text": "👥 مدیریت کاربران"}, {"text": "📊 مدیریت گزارش‌ها"}],
             [{"text": "👥 مدیریت معاونین"}, {"text": "📋 مشاهده لاگ‌ها"}],
+            [{"text": "📣 مرکز پیام‌رسانی"}],
             [{"text": "🔁 مدیریت جابه‌جایی معاونان"}],
             [{"text": "📊 گزارش امروز"}, {"text": "📈 گزارش ۱۰ روز اخیر"}],
             [{"text": "🏆 رتبه‌بندی شعب"}, {"text": "💹 آمار مفصل امروز"}],
@@ -5059,7 +5536,7 @@ def get_super_admin_keyboard():
             [{"text": "📋 عملکرد معاونان"}, {"text": "👥 عملکرد همکاران"}],
             [{"text": "📝 مشاهده یادداشت‌ها"}, {"text": "📋 لاگ ورود/خروج"}],
             [{"text": "🔧 کنترل خودکار"}, {"text": "📅 مدیریت تعطیلات"}],
-            [{"text": "📨 ارسال پیام به معاونین"}, {"text": "🔄 ریست گزارش‌ها"}],
+            [{"text": "🔄 ریست گزارش‌ها"}],
             [{"text": "⚙️ مدیریت مشکلات"}, {"text": "📊 گزارش هفتگی"}],
             [{"text": "📊 گزارش ماهانه"}, {"text": "📊 گزارش تطبیقی"}],
             [{"text": "📈 پیش‌بینی عملکرد"}, {"text": "📊 نمودار استان"}],
@@ -5598,6 +6075,13 @@ def start_scheduler():
         id='monthly_report_job',
         replace_existing=True
     )
+    scheduler.add_job(
+        process_due_message_campaigns,
+        'interval',
+        seconds=60,
+        id='message_campaign_job',
+        replace_existing=True
+    )
     scheduler.start()
     _scheduler = scheduler
     logger.info("✅ Scheduler started")
@@ -5691,10 +6175,13 @@ def handle_message(message):
             # سند بکاپ معمولاً text ندارد؛ باید تا بخش پردازش ریستور ادامه پیدا کند.
             if current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document'):
                 pass
+            if current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')):
+                pass
             if current_state in ["WAITING_FOR_NOTE", "WAITING_FOR_NOTE_FOR_COLLECTION"]:
                 send_message(chat_id, "❌ لطفاً یک متن وارد کنید.")
                 return
-            elif not (current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document')):
+            elif not ((current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document'))
+                      or (current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')))):
                 return
 
         if not get_bot_status() and not is_super_admin_user(chat_id):
@@ -6443,7 +6930,7 @@ def handle_message(message):
                 "   • فعال/غیرفعال کردن ربات\n"
                 "   • کنترل اعمال خودکار\n"
                 "   • ریست کردن گزارش‌ها\n"
-                "   • ارسال پیام به معاونین\n"
+                "   • مرکز پیام‌رسانی: پیام مناسبتی، اطلاعیه و پیام فوری\n"
                 "   • مدیریت تعطیلات\n"
                 "   • مشاهده لاگ کامل فعالیت‌ها\n"
                 "   • مدیریت مشکلات ثبت شده\n"
@@ -6482,7 +6969,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۹.۱.۰ (تاریخچه انتصاب و جابه‌جایی امن معاونان)\n"
+                "📅 نسخه: ۹.۲.۰ (مرکز پیام‌رسانی و جابه‌جایی امن معاونان)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_keyboard(role, is_super_admin)
@@ -6498,6 +6985,382 @@ def handle_message(message):
         # بخش سوپرادمین
         # ============================================================
         if is_super_admin:
+            if text == "📣 مرکز پیام‌رسانی":
+                user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                send_message(chat_id, "📣 **مرکز پیام‌رسانی**\n\nپیام مناسبتی، اطلاعیه یا پیام فوری را ایجاد و مدیریت کنید.", get_messaging_center_keyboard())
+                return
+
+            if text == "🔙 بازگشت به منوی اصلی":
+                user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                send_message(chat_id, "به منوی اصلی بازگشتید.", get_super_admin_keyboard())
+                return
+
+            campaign_types = {"🎉 پیام مناسبتی": "occasion", "📢 اطلاعیه": "announcement", "🚨 پیام فوری": "urgent"}
+            if text in campaign_types:
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_CAMPAIGN_TEXT",
+                    "campaign_draft": {"message_type": campaign_types[text]},
+                })
+                template_keyboard = {"keyboard": [[{"text": "📄 استفاده از قالب آماده"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(
+                    chat_id,
+                    "✍️ متن پیام را وارد کنید.\n\nبرای شخصی‌سازی می‌توانید از `{name}`، `{title}` و `{branch}` استفاده کنید.",
+                    template_keyboard
+                )
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_TEXT":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                draft = dict(user_state.get('campaign_draft') or {})
+                if text == "📄 استفاده از قالب آماده":
+                    templates = {
+                        'occasion': "{name} گرامی،\nفرارسیدن این مناسبت را به شما و همکاران محترم شعبه {branch} تبریک عرض می‌کنیم.\nبا آرزوی سلامتی و موفقیت روزافزون",
+                        'announcement': "همکار گرامی {name}،\nبه اطلاع می‌رساند:\n\n[متن اطلاعیه]\n\nبا سپاس",
+                        'urgent': "🚨 پیام فوری\n\n{name} گرامی، لطفاً در اولین فرصت اطلاعیه زیر را بررسی فرمایید:\n\n[متن پیام فوری]",
+                    }
+                    text = templates.get(draft.get('message_type'), '')
+                if not text or len(text) > MAX_CAMPAIGN_TEXT_LENGTH:
+                    send_message(chat_id, f"❌ متن باید بین ۱ تا {MAX_CAMPAIGN_TEXT_LENGTH} نویسه باشد.", get_cancel_keyboard())
+                    return
+                draft['message_text'] = text
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_MEDIA", "campaign_draft": draft})
+                keyboard = {"keyboard": [[{"text": "⏭ بدون تصویر"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, "🖼 در صورت تمایل یک تصویر حداکثر ۵ مگابایت ارسال کنید؛ یا «بدون تصویر» را بزنید.", keyboard)
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_MEDIA":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                draft = dict(user_state.get('campaign_draft') or {})
+                if text != "⏭ بدون تصویر":
+                    document = message.get('document') or {}
+                    photos = message.get('photo') or []
+                    if document:
+                        file_id = document.get('file_id')
+                        mime = document.get('mime_type') or ''
+                        file_name = document.get('file_name') or 'message-image'
+                    elif photos:
+                        selected_photo = photos[-1]
+                        file_id = selected_photo.get('file_id')
+                        mime = 'image/jpeg'
+                        file_name = 'message-image.jpg'
+                    else:
+                        send_message(chat_id, "❌ لطفاً تصویر ارسال کنید یا گزینه «بدون تصویر» را بزنید.", get_cancel_keyboard())
+                        return
+                    if not mime.startswith('image/'):
+                        send_message(chat_id, "❌ فقط فایل تصویری مجاز است.", get_cancel_keyboard())
+                        return
+                    ok, media_error, media_bytes = download_bale_media(file_id)
+                    if not ok:
+                        send_message(chat_id, f"❌ {media_error}", get_cancel_keyboard())
+                        return
+                    draft.update({
+                        'media_base64': base64.b64encode(media_bytes).decode('ascii'),
+                        'media_mime': mime[:100], 'media_name': file_name[:255],
+                    })
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_PERSONALIZE", "campaign_draft": draft})
+                keyboard = {"keyboard": [[{"text": "✅ شخصی‌سازی فعال"}, {"text": "❌ بدون شخصی‌سازی"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, "👤 آیا جایگزینی `{name}`، `{title}` و `{branch}` برای هر گیرنده فعال باشد؟", keyboard)
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_PERSONALIZE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                if text not in ("✅ شخصی‌سازی فعال", "❌ بدون شخصی‌سازی"):
+                    send_message(chat_id, "یکی از گزینه‌های شخصی‌سازی را انتخاب کنید.")
+                    return
+                draft = dict(user_state.get('campaign_draft') or {})
+                draft['personalize'] = text == "✅ شخصی‌سازی فعال"
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_AUDIENCE", "campaign_draft": draft})
+                send_message(chat_id, "🎯 دریافت‌کنندگان پیام را انتخاب کنید.", get_campaign_audience_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_AUDIENCE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                audience_map = {"👥 همه کاربران": "all", "🏢 همه معاونان": "deputies", "👤 همه ادمین‌ها": "admins"}
+                draft = dict(user_state.get('campaign_draft') or {})
+                if text in audience_map:
+                    draft.update({'audience_type': audience_map[text], 'audience_config': {}})
+                elif text == "🏬 انتخاب شعب":
+                    branches = get_all_branches()
+                    msg = "شماره یک یا چند شعبه را با ویرگول وارد کنید:\n\n" + "\n".join(f"{i}. {row[1]}" for i, row in enumerate(branches, 1))
+                    user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_BRANCHES", "campaign_draft": draft, "campaign_choices": branches})
+                    send_message(chat_id, msg, get_cancel_keyboard())
+                    return
+                elif text == "☑️ انتخاب دستی کاربران":
+                    conn = None
+                    try:
+                        conn = get_db_connection()
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT id,full_name,role FROM users WHERE telegram_id IS NOT NULL ORDER BY full_name")
+                            choices = cur.fetchall()
+                    finally:
+                        if conn:
+                            return_db_connection(conn)
+                    msg = "شماره کاربران را با ویرگول وارد کنید:\n\n" + "\n".join(f"{i}. {row[1]} ({row[2]})" for i, row in enumerate(choices, 1))
+                    user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_USERS", "campaign_draft": draft, "campaign_choices": choices})
+                    send_message(chat_id, msg, get_cancel_keyboard())
+                    return
+                else:
+                    send_message(chat_id, "❌ گروه مخاطبان معتبر نیست.", get_campaign_audience_keyboard())
+                    return
+                recipients = get_campaign_recipients(draft['audience_type'], draft['audience_config'])
+                if not recipients:
+                    send_message(chat_id, "❌ در این گروه کاربر متصل به ربات وجود ندارد.", get_campaign_audience_keyboard())
+                    return
+                user_states.update(chat_id, {"state": "CAMPAIGN_PREVIEW", "campaign_draft": draft, "campaign_recipients": recipients})
+                preview_keyboard = {"keyboard": [[{"text": "🧪 ارسال آزمایشی برای خودم"}], [{"text": "💾 ذخیره پیش‌نویس"}, {"text": "➡️ تعیین زمان ارسال"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, format_campaign_preview(draft, recipients), preview_keyboard)
+                return
+
+            if current_state in ("WAITING_FOR_CAMPAIGN_BRANCHES", "WAITING_FOR_CAMPAIGN_USERS"):
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                choices = user_state.get('campaign_choices') or []
+                try:
+                    indexes = sorted(set(int(part.strip()) - 1 for part in normalize_digits(text).split(',')))
+                except (ValueError, TypeError):
+                    indexes = []
+                if not indexes or any(index < 0 or index >= len(choices) for index in indexes):
+                    send_message(chat_id, "❌ شماره‌ها معتبر نیستند؛ نمونه: ۱,۳,۵", get_cancel_keyboard())
+                    return
+                draft = dict(user_state.get('campaign_draft') or {})
+                if current_state == "WAITING_FOR_CAMPAIGN_BRANCHES":
+                    draft.update({'audience_type': 'branches', 'audience_config': {'branch_ids': [choices[i][0] for i in indexes]}})
+                else:
+                    draft.update({'audience_type': 'manual', 'audience_config': {'user_ids': [choices[i][0] for i in indexes]}})
+                recipients = get_campaign_recipients(draft['audience_type'], draft['audience_config'])
+                if not recipients:
+                    send_message(chat_id, "❌ هیچ‌کدام از انتخاب‌ها به ربات متصل نیستند.", get_cancel_keyboard())
+                    return
+                user_states.update(chat_id, {"state": "CAMPAIGN_PREVIEW", "campaign_draft": draft, "campaign_recipients": recipients})
+                preview_keyboard = {"keyboard": [[{"text": "🧪 ارسال آزمایشی برای خودم"}], [{"text": "💾 ذخیره پیش‌نویس"}, {"text": "➡️ تعیین زمان ارسال"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, format_campaign_preview(draft, recipients), preview_keyboard)
+                return
+
+            if current_state == "CAMPAIGN_PREVIEW":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                draft = user_state.get('campaign_draft') or {}
+                if text == "💾 ذخیره پیش‌نویس":
+                    ok, result_text, result = create_message_campaign(draft, user_db_id, None, initial_status='draft')
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None, "campaign_recipients": None})
+                    if ok:
+                        log_user_activity(user_db_id, 'campaign_draft', f"campaign={result['uuid']}")
+                        send_message(chat_id, f"✅ پیش‌نویس ذخیره شد.\nشماره: #{result['id']}\nرسید: `{result['uuid']}`", get_messaging_center_keyboard())
+                    else:
+                        send_message(chat_id, f"❌ {result_text}", get_messaging_center_keyboard())
+                    return
+                if text == "🧪 ارسال آزمایشی برای خودم":
+                    self_rows = get_campaign_recipients('manual', {'user_ids': [user_db_id]})
+                    rendered = personalize_campaign_text(draft['message_text'], self_rows[0], draft.get('personalize')) if self_rows else draft['message_text']
+                    if draft.get('media_base64'):
+                        result = send_campaign_photo(chat_id, base64.b64decode(draft['media_base64']), draft.get('media_mime'), draft.get('media_name'), rendered if len(rendered) <= 1024 else '')
+                        if result and len(rendered) > 1024:
+                            result = send_message(chat_id, rendered, parse_mode=None)
+                    else:
+                        result = send_message(chat_id, rendered, parse_mode=None)
+                    send_message(chat_id, "✅ ارسال آزمایشی موفق بود." if result else "❌ ارسال آزمایشی ناموفق بود.")
+                    return
+                if text != "➡️ تعیین زمان ارسال":
+                    send_message(chat_id, "ابتدا ارسال آزمایشی یا تعیین زمان را انتخاب کنید.")
+                    return
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_TIMING"})
+                keyboard = {"keyboard": [[{"text": "⚡ ارسال فوری"}, {"text": "🕒 زمان‌بندی ارسال"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, "زمان ارسال را مشخص کنید.", keyboard)
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_TIMING":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                if text == "🕒 زمان‌بندی ارسال":
+                    user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_SCHEDULE"})
+                    send_message(chat_id, "تاریخ و ساعت شمسی را وارد کنید.\nنمونه: ۱۴۰۵/۰۶/۰۳ ۰۹:۳۰", get_cancel_keyboard())
+                    return
+                if text != "⚡ ارسال فوری":
+                    send_message(chat_id, "یکی از دو روش ارسال را انتخاب کنید.")
+                    return
+                scheduled_at = get_iran_time()
+                draft = user_state.get('campaign_draft') or {}
+                recipients = user_state.get('campaign_recipients') or []
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_CONFIRM", "campaign_scheduled_at": scheduled_at, "campaign_expires_at": time.time() + 600})
+                keyboard = {"keyboard": [[{"text": "✅ تأیید نهایی پیام"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, format_campaign_preview(draft, recipients, scheduled_at), keyboard)
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_SCHEDULE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "ایجاد پیام لغو شد.", get_messaging_center_keyboard())
+                    return
+                scheduled_at = parse_campaign_schedule(text)
+                if not scheduled_at:
+                    send_message(chat_id, "❌ تاریخ باید معتبر و در آینده باشد؛ نمونه: ۱۴۰۵/۰۶/۰۳ ۰۹:۳۰", get_cancel_keyboard())
+                    return
+                draft = user_state.get('campaign_draft') or {}
+                recipients = user_state.get('campaign_recipients') or []
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_CONFIRM", "campaign_scheduled_at": scheduled_at, "campaign_expires_at": time.time() + 600})
+                keyboard = {"keyboard": [[{"text": "✅ تأیید نهایی پیام"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, format_campaign_preview(draft, recipients, scheduled_at), keyboard)
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_CONFIRM":
+                if text == "🔙 انصراف" or text != "✅ تأیید نهایی پیام":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "پیام لغو شد و چیزی ارسال نشد.", get_messaging_center_keyboard())
+                    return
+                if time.time() > user_state.get('campaign_expires_at', 0):
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None})
+                    send_message(chat_id, "⌛ مهلت تأیید تمام شد؛ پیام را دوباره ایجاد کنید.", get_messaging_center_keyboard())
+                    return
+                draft = user_state.get('campaign_draft') or {}
+                scheduled_at = user_state.get('campaign_scheduled_at')
+                user_states.update(chat_id, {"state": "LOGGED_IN", "campaign_draft": None, "campaign_recipients": None})
+                ok, result_text, result = create_message_campaign(draft, user_db_id, scheduled_at)
+                if not ok:
+                    send_message(chat_id, f"❌ {result_text}", get_messaging_center_keyboard())
+                    return
+                log_user_activity(user_db_id, 'campaign_create', f"campaign={result['uuid']} recipients={result['count']}")
+                if scheduled_at <= get_iran_time() + timedelta(seconds=5):
+                    executor.submit(process_message_campaign, result['id'])
+                send_message(chat_id, f"✅ پیام ثبت شد.\n🆔 رسید: `{result['uuid']}`\n👥 مخاطبان: {result['count']}\n\nنتیجه ارسال در تاریخچه قابل مشاهده است.", get_messaging_center_keyboard())
+                return
+
+            if text == "📝 پیش‌نویس‌ها":
+                rows = [row for row in get_campaign_history(30) if row[3] == 'draft']
+                if not rows:
+                    send_message(chat_id, "📝 پیش‌نویسی وجود ندارد.", get_messaging_center_keyboard())
+                    return
+                msg = "📝 **پیش‌نویس‌ها**\n\n" + "\n\n".join(
+                    f"#{row[0]} | {row[9]}\nرسید: `{row[1]}`" for row in rows
+                )
+                msg += "\n\nشماره پیش‌نویسی را که می‌خواهید ارسال کنید وارد نمایید."
+                user_states.update(chat_id, {"state": "WAITING_FOR_DRAFT_ID"})
+                send_message(chat_id, msg, get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_DRAFT_ID":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_messaging_center_keyboard())
+                    return
+                try:
+                    campaign_id = int(normalize_digits(text).lstrip('#'))
+                except ValueError:
+                    send_message(chat_id, "❌ شماره پیش‌نویس معتبر نیست.", get_cancel_keyboard())
+                    return
+                user_states.update(chat_id, {"state": "WAITING_FOR_DRAFT_TIMING", "draft_campaign_id": campaign_id})
+                keyboard = {"keyboard": [[{"text": "⚡ ارسال فوری"}, {"text": "🕒 زمان‌بندی ارسال"}], [{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+                send_message(chat_id, "زمان ارسال پیش‌نویس را مشخص کنید.", keyboard)
+                return
+
+            if current_state == "WAITING_FOR_DRAFT_TIMING":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_messaging_center_keyboard())
+                    return
+                if text == "🕒 زمان‌بندی ارسال":
+                    user_states.update(chat_id, {"state": "WAITING_FOR_DRAFT_SCHEDULE"})
+                    send_message(chat_id, "تاریخ و ساعت شمسی را وارد کنید؛ نمونه: ۱۴۰۵/۰۶/۰۳ ۰۹:۳۰", get_cancel_keyboard())
+                    return
+                if text != "⚡ ارسال فوری":
+                    send_message(chat_id, "یکی از روش‌های ارسال را انتخاب کنید.")
+                    return
+                scheduled_at = get_iran_time()
+                campaign_id = user_state.get('draft_campaign_id')
+                ok, result_text, result = schedule_draft_campaign(campaign_id, scheduled_at, user_db_id)
+                user_states.update(chat_id, {"state": "LOGGED_IN", "draft_campaign_id": None})
+                if ok:
+                    executor.submit(process_message_campaign, campaign_id)
+                send_message(chat_id, ("✅ " if ok else "❌ ") + result_text, get_messaging_center_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_DRAFT_SCHEDULE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "draft_campaign_id": None})
+                    send_message(chat_id, "عملیات لغو شد.", get_messaging_center_keyboard())
+                    return
+                scheduled_at = parse_campaign_schedule(text)
+                if not scheduled_at:
+                    send_message(chat_id, "❌ تاریخ باید معتبر و در آینده باشد.", get_cancel_keyboard())
+                    return
+                campaign_id = user_state.get('draft_campaign_id')
+                ok, result_text, result = schedule_draft_campaign(campaign_id, scheduled_at, user_db_id)
+                user_states.update(chat_id, {"state": "LOGGED_IN", "draft_campaign_id": None})
+                send_message(chat_id, ("✅ " if ok else "❌ ") + result_text, get_messaging_center_keyboard())
+                return
+
+            if text == "📜 تاریخچه پیام‌ها":
+                rows = get_campaign_history(12)
+                labels = {'occasion': '🎉', 'announcement': '📢', 'urgent': '🚨'}
+                status_labels = {'scheduled': 'زمان‌بندی', 'sending': 'درحال ارسال', 'completed': 'کامل', 'partial': 'ناقص', 'cancelled': 'لغوشده', 'draft': 'پیش‌نویس'}
+                msg = "📜 **تاریخچه پیام‌ها**\n━━━━━━━━━━━━━━━━━━\n"
+                if not rows:
+                    msg += "هنوز پیامی ثبت نشده است."
+                for row in rows:
+                    cid, cuid, kind, status, total, sent, failed, scheduled, created, excerpt = row
+                    msg += f"\n#{cid} {labels.get(kind,'📣')} {status_labels.get(status,status)} | ✅{sent} ❌{failed} از {total}\n{excerpt}\nرسید: `{cuid}`\n"
+                send_message(chat_id, msg, get_messaging_center_keyboard())
+                return
+
+            if text == "⛔ لغو پیام زمان‌بندی‌شده":
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_CANCEL_ID"})
+                send_message(chat_id, "شماره پیام زمان‌بندی‌شده را از تاریخچه وارد کنید؛ مثال: ۱۲", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_CANCEL_ID":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "لغو عملیات انجام شد.", get_messaging_center_keyboard())
+                    return
+                try:
+                    campaign_id = int(normalize_digits(text).lstrip('#'))
+                except ValueError:
+                    send_message(chat_id, "❌ شماره پیام معتبر نیست.", get_cancel_keyboard())
+                    return
+                ok, result_text = cancel_scheduled_campaign(campaign_id, user_db_id)
+                user_states.update(chat_id, {"state": "LOGGED_IN"})
+                send_message(chat_id, ("✅ " if ok else "❌ ") + result_text, get_messaging_center_keyboard())
+                return
+
+            if text == "🔁 ارسال مجدد ناموفق‌ها":
+                user_states.update(chat_id, {"state": "WAITING_FOR_CAMPAIGN_RETRY_ID"})
+                send_message(chat_id, "شماره پیام ناقص را از تاریخچه وارد کنید؛ فقط گیرندگان ناموفق دوباره پیام می‌گیرند.", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_CAMPAIGN_RETRY_ID":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "عملیات لغو شد.", get_messaging_center_keyboard())
+                    return
+                try:
+                    campaign_id = int(normalize_digits(text).lstrip('#'))
+                except ValueError:
+                    send_message(chat_id, "❌ شماره پیام معتبر نیست.", get_cancel_keyboard())
+                    return
+                ok, result_text = retry_failed_campaign(campaign_id, user_db_id)
+                user_states.update(chat_id, {"state": "LOGGED_IN"})
+                if ok:
+                    executor.submit(process_message_campaign, campaign_id)
+                send_message(chat_id, ("✅ " if ok else "❌ ") + result_text, get_messaging_center_keyboard())
+                return
+
             if text == "🔁 مدیریت جابه‌جایی معاونان":
                 send_message(
                     chat_id,
