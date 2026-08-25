@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۲.۰ (مرکز پیام‌رسانی و جابه‌جایی امن معاونان)
+# bot.py - نسخه ۹.۳.۰ (ثبت هوشمند آمار تصویری و مرکز پیام‌رسانی)
 # ============================================================
 import os
 import time
@@ -40,9 +40,19 @@ import binascii
 import hmac
 import uuid
 import base64
+import difflib
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from zoneinfo import ZoneInfo  # Python 3.9+
+
+try:
+    import cv2
+    import easyocr
+    IMAGE_OCR_AVAILABLE = True
+except Exception:
+    cv2 = None
+    easyocr = None
+    IMAGE_OCR_AVAILABLE = False
 
 try:
     import plotly.graph_objects as go
@@ -94,6 +104,10 @@ RESTORE_IDENTITY_FIELDS = {
 }
 MAX_CAMPAIGN_TEXT_LENGTH = 3500
 MAX_CAMPAIGN_MEDIA_BYTES = 5 * 1024 * 1024
+MAX_ACTUAL_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_ACTUAL_IMAGE_PIXELS = 20_000_000
+_ocr_reader = None
+_ocr_reader_lock = threading.Lock()
 
 # ============================================================
 # تنظیمات لاگین
@@ -603,9 +617,11 @@ def create_all_tables_if_not_exists():
                 CREATE TABLE IF NOT EXISTS branches (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(255) NOT NULL UNIQUE,
+                    branch_code VARCHAR(10),
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("ALTER TABLE branches ADD COLUMN IF NOT EXISTS branch_code VARCHAR(10)")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -819,6 +835,16 @@ def create_all_tables_if_not_exists():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_shamsi ON collections(shamsi_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram ON users(telegram_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_users_employee ON users(employee_number);")
+            cur.execute("""
+                DO $branch_code_index$
+                BEGIN
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname='idx_branches_branch_code')
+                       AND NOT EXISTS (SELECT branch_code FROM branches WHERE branch_code IS NOT NULL GROUP BY branch_code HAVING COUNT(*)>1) THEN
+                        CREATE UNIQUE INDEX idx_branches_branch_code ON branches(branch_code) WHERE branch_code IS NOT NULL;
+                    END IF;
+                END
+                $branch_code_index$;
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_branch_targets_branch ON branch_targets(branch_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_branch_targets_active ON branch_targets(is_active);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_recorded_by ON collections(recorded_by);")
@@ -861,6 +887,20 @@ def create_all_tables_if_not_exists():
                       WHERE dba.branch_id=u.branch_id AND dba.effective_to IS NULL
                   )
                 ON CONFLICT DO NOTHING
+            """)
+            cur.execute("""
+                UPDATE branches b SET branch_code=v.code
+                FROM (VALUES
+                    ('مرکزی زنجان','20578'),('جمهوری','20784'),('میدان استقلال','20602'),
+                    ('میدان پایین','20610'),('سعدی جنوبی','20628'),('سبزه میدان','20594'),
+                    ('اسلام آباد','20651'),('خرمشهر','20644'),('بعثت','20636'),
+                    ('سعدی شمالی','20685'),('سلطانیه','20834'),('آببر','20776'),
+                    ('کوچمشکی','20842'),('دندی','20777'),('مرکزی ابهر','22053'),
+                    ('هیدج','22103'),('صايين قلعه','22111'),('میدان معلم ابهر','22061'),
+                    ('خدابنده','20201'),('خرمدره','20250')
+                ) AS v(name,code)
+                WHERE b.name=v.name AND b.branch_code IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM branches existing WHERE existing.branch_code=v.code)
             """)
             conn.commit()
             logger.info("✅ All tables and indexes created/verified successfully.")
@@ -3595,6 +3635,10 @@ def generate_management_report(report_key):
                         ("انتصاب فعال تکراری برای شعبه","""SELECT COUNT(*) FROM (
                             SELECT branch_id FROM deputy_branch_assignments WHERE effective_to IS NULL
                             GROUP BY branch_id HAVING COUNT(*)>1) x"""),
+                        ("شعبه بدون کد رسمی","SELECT COUNT(*) FROM branches WHERE branch_code IS NULL"),
+                        ("کد رسمی تکراری شعبه","""SELECT COUNT(*) FROM (
+                            SELECT branch_code FROM branches WHERE branch_code IS NOT NULL
+                            GROUP BY branch_code HAVING COUNT(*)>1) x"""),
                         ("وصول منفی","SELECT COUNT(*) FROM collections WHERE deputy_amount<0 OR others_amount<0"),
                         ("وصول بدون ثبت‌کننده","SELECT COUNT(*) FROM collections WHERE recorded_by IS NULL"),
                         ("هدف فعال تکراری","SELECT COUNT(*) FROM (SELECT branch_id FROM branch_targets WHERE is_active GROUP BY branch_id HAVING COUNT(*)>1)x"),
@@ -3619,6 +3663,262 @@ def generate_management_report(report_key):
 # ============================================================
 # توابع آمار واقعی
 # ============================================================
+def get_branches_with_codes():
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id,name,branch_code FROM branches WHERE branch_code IS NOT NULL ORDER BY name")
+            return cur.fetchall()
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def _get_ocr_reader():
+    global _ocr_reader
+    if not IMAGE_OCR_AVAILABLE:
+        raise RuntimeError("کتابخانه‌های EasyOCR و OpenCV نصب نیستند")
+    if _ocr_reader is None:
+        with _ocr_reader_lock:
+            if _ocr_reader is None:
+                model_dir = os.getenv('EASYOCR_MODEL_DIR') or None
+                kwargs = {'gpu': False, 'verbose': False}
+                if model_dir:
+                    kwargs['model_storage_directory'] = model_dir
+                _ocr_reader = easyocr.Reader(['fa', 'en'], **kwargs)
+    return _ocr_reader
+
+def _merge_close_coordinates(values, tolerance=5):
+    merged = []
+    for value in sorted(values):
+        if not merged or value - merged[-1] > tolerance:
+            merged.append(value)
+        else:
+            merged[-1] = int(round((merged[-1] + value) / 2))
+    return merged
+
+def _ocr_numeric_cell(reader, image):
+    if image is None or image.size == 0:
+        return '', 0.0
+    enlarged = cv2.resize(image, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY) if len(enlarged.shape) == 3 else enlarged
+    gray = cv2.bilateralFilter(gray, 5, 45, 45)
+    results = reader.readtext(
+        gray, detail=1, paragraph=False,
+        allowlist='0123456789۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩-−–—,٬،.'
+    )
+    if not results:
+        return '', 0.0
+    ordered = sorted(results, key=lambda item: min(point[0] for point in item[0]))
+    text_value = ''.join(str(item[1]) for item in ordered)
+    confidence = min(float(item[2]) for item in ordered)
+    return text_value, confidence
+
+def _normalize_ocr_code(value):
+    normalized = normalize_digits(value or '')
+    return ''.join(re.findall(r'\d', normalized))
+
+def _parse_ocr_amount(value):
+    if value is None:
+        return None
+    raw = normalize_digits(str(value).replace('٬', '').replace('٫', '.'))
+    negative = any(sign in str(value) for sign in ('-', '−', '–', '—'))
+    digits = ''.join(re.findall(r'\d', raw))
+    if not digits:
+        return None
+    amount = int(digits)
+    return -amount if negative and amount else amount
+
+def extract_actual_stats_from_image(image_bytes):
+    """Extract branch-code and 'amount versus previous day' without persisting the image."""
+    if not image_bytes or len(image_bytes) > MAX_ACTUAL_IMAGE_BYTES:
+        return False, "حجم تصویر معتبر نیست یا بیش از ۱۲ مگابایت است.", None
+    if not IMAGE_OCR_AVAILABLE:
+        return False, "موتور OCR نصب نیست؛ بسته‌های easyocr و opencv-python-headless باید نصب شوند.", None
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    del image_array
+    if image is None:
+        return False, "فایل ارسالی تصویر معتبری نیست.", None
+    height, width = image.shape[:2]
+    if height * width > MAX_ACTUAL_IMAGE_PIXELS or width < 900 or height < 600:
+        del image
+        return False, "ابعاد تصویر مناسب نیست؛ تصویر کامل و خوانا ارسال کنید.", None
+    branches = get_branches_with_codes()
+    known = {str(code): (branch_id, name) for branch_id, name, code in branches}
+    if not known:
+        del image
+        return False, "برای شعب کد رسمی ثبت نشده است.", None
+    coded_ids = {branch_id for branch_id, _, _ in branches}
+    uncoded = [name for branch_id, name in get_all_branches() if branch_id not in coded_ids]
+    if uncoded:
+        del image
+        return False, "برای این شعب کد رسمی ثبت نشده است: " + "، ".join(uncoded), None
+    try:
+        reader = _get_ocr_reader()
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        horizontal = cv2.morphologyEx(
+            binary, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(80, width // 4), 1))
+        )
+        horizontal_ys = []
+        for contour in cv2.findContours(horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            _, y, line_width, line_height = cv2.boundingRect(contour)
+            if line_width >= width * 0.65 and line_height <= max(30, height * 0.04):
+                horizontal_ys.append(y + line_height // 2)
+        horizontal_ys = _merge_close_coordinates(horizontal_ys, max(4, height // 300))
+
+        vertical = cv2.morphologyEx(
+            binary, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(80, height // 5)))
+        )
+        vertical_xs = []
+        for contour in cv2.findContours(vertical, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            x, _, line_width, line_height = cv2.boundingRect(contour)
+            if line_height >= height * 0.55 and line_width <= max(30, width * 0.025):
+                vertical_xs.append(x + line_width // 2)
+        vertical_xs = _merge_close_coordinates(vertical_xs, max(4, width // 350))
+        if len(horizontal_ys) < 15 or len(vertical_xs) < 8:
+            return False, "خطوط جدول به‌درستی تشخیص داده نشد؛ تصویر صاف‌تر و واضح‌تر ارسال کنید.", None
+
+        def nearest_x(ratio):
+            return min(vertical_xs, key=lambda coordinate: abs(coordinate - width * ratio))
+        amount_left, amount_right = sorted((nearest_x(0.11), nearest_x(0.19)))
+        code_left, code_right = sorted((nearest_x(0.85), nearest_x(0.92)))
+        if amount_right - amount_left < width * 0.04 or code_right - code_left < width * 0.025:
+            return False, "ستون کد شعبه یا مبلغ نسبت به روز قبل تشخیص داده نشد.", None
+
+        extracted = {}
+        unmatched_rows = 0
+        for top, bottom in zip(horizontal_ys, horizontal_ys[1:]):
+            row_height = bottom - top
+            if row_height < height * 0.018 or row_height > height * 0.065:
+                continue
+            padding_y = max(2, row_height // 12)
+            code_crop = image[top + padding_y:bottom - padding_y, code_left + 3:code_right - 3]
+            raw_code, code_confidence = _ocr_numeric_cell(reader, code_crop)
+            detected_code = _normalize_ocr_code(raw_code)
+            matched_code = detected_code if detected_code in known else None
+            fuzzy = False
+            if not matched_code and len(detected_code) in (4, 5, 6):
+                candidates = difflib.get_close_matches(detected_code, list(known), n=1, cutoff=0.78)
+                if candidates:
+                    matched_code, fuzzy = candidates[0], True
+            if not matched_code:
+                if detected_code:
+                    unmatched_rows += 1
+                continue
+            amount_crop = image[top + padding_y:bottom - padding_y, amount_left + 3:amount_right - 3]
+            raw_amount, amount_confidence = _ocr_numeric_cell(reader, amount_crop)
+            amount = _parse_ocr_amount(raw_amount)
+            if amount is None:
+                unmatched_rows += 1
+                continue
+            branch_id, branch_name = known[matched_code]
+            confidence = min(code_confidence, amount_confidence)
+            if fuzzy:
+                confidence = min(confidence, 0.69)
+            candidate = {
+                'branch_id': branch_id, 'branch_name': branch_name, 'branch_code': matched_code,
+                'amount': amount, 'confidence': round(confidence, 3),
+                'raw_code': raw_code, 'raw_amount': raw_amount, 'corrected': False,
+            }
+            previous = extracted.get(matched_code)
+            if previous is None or candidate['confidence'] > previous['confidence']:
+                extracted[matched_code] = candidate
+        rows = sorted(extracted.values(), key=lambda item: item['branch_name'])
+        missing = [
+            {'branch_id': branch_id, 'branch_name': name, 'branch_code': code}
+            for code, (branch_id, name) in known.items() if code not in extracted
+        ]
+        return True, "استخراج انجام شد.", {
+            'rows': rows, 'missing': missing, 'unmatched_rows': unmatched_rows,
+            'total_coded_branches': len(known), 'engine': 'EasyOCR-fa',
+        }
+    except Exception as exc:
+        logger.exception("Actual statistics OCR failed")
+        return False, f"استخراج تصویر انجام نشد: {safe_log_value(exc, 180)}", None
+    finally:
+        # آرایه تصویر فقط در RAM بود و در این نقطه آزاد می‌شود؛ هیچ فایل دائمی ساخته نشده است.
+        del image
+
+def format_actual_ocr_preview(result, shamsi_date):
+    rows = result.get('rows', [])
+    lines = [
+        "📷 **پیش‌نمایش آمار استخراج‌شده**",
+        f"📅 تاریخ ثبت: {get_shamsi_date_formatted(shamsi_date)}",
+        f"✅ شناسایی‌شده: {len(rows)} از {result.get('total_coded_branches', 0)} شعبه",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+    for row in rows:
+        marker = '✅' if row.get('corrected') or row.get('confidence', 0) >= 0.80 else '⚠️'
+        lines.append(
+            f"{marker} {row['branch_name']} ({row['branch_code']}): {row['amount']:+,} میلیون ریال "
+            f"| اطمینان {row.get('confidence', 0) * 100:.0f}٪"
+        )
+    missing = result.get('missing', [])
+    if missing:
+        lines.append("\n❌ **شعب تشخیص‌داده‌نشده:**")
+        lines.extend(f"• {item['branch_name']} ({item['branch_code']})" for item in missing)
+    lines.append("\nبرای اصلاح بنویسید: `کدشعبه=مبلغ`؛ مثال: `20628=-136`")
+    return '\n'.join(lines)
+
+def save_actual_stats_bulk(rows, shamsi_date, user_id, overwrite_existing=False):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            branch_ids = [int(row['branch_id']) for row in rows]
+            cur.execute("SELECT branch_id FROM actual_stats WHERE shamsi_date=%s AND branch_id=ANY(%s) FOR UPDATE", (shamsi_date, branch_ids))
+            existing_ids = [row[0] for row in cur.fetchall()]
+            if existing_ids and not overwrite_existing:
+                conn.rollback()
+                return False, "existing", existing_ids
+            values = [
+                (int(row['branch_id']), shamsi_date, int(row['amount']) * 1_000_000, user_id, get_iran_time())
+                for row in rows
+            ]
+            if overwrite_existing:
+                statement = """INSERT INTO actual_stats (branch_id,shamsi_date,total_actual,recorded_by,created_at)
+                    VALUES %s ON CONFLICT (branch_id,shamsi_date) DO UPDATE SET
+                    total_actual=EXCLUDED.total_actual,recorded_by=EXCLUDED.recorded_by,updated_at=CURRENT_TIMESTAMP"""
+            else:
+                statement = """INSERT INTO actual_stats (branch_id,shamsi_date,total_actual,recorded_by,created_at)
+                    VALUES %s"""
+            execute_values(cur, statement, values, page_size=100)
+        conn.commit()
+        return True, "saved", len(rows)
+    except Exception as exc:
+        if conn:
+            conn.rollback()
+        logger.exception("Bulk actual statistics save failed")
+        return False, safe_log_value(exc, 180), None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def process_actual_stats_image(chat_id, user_id, shamsi_date, image_bytes):
+    try:
+        success, message, result = extract_actual_stats_from_image(image_bytes)
+    finally:
+        # آخرین مرجع بایت‌های تصویر نیز حذف می‌شود؛ فقط اعداد استخراج‌شده در state می‌مانند.
+        image_bytes = None
+    if not success:
+        user_states.update(chat_id, {'state': 'LOGGED_IN', 'actual_ocr_result': None})
+        send_message(chat_id, f"❌ {message}\nهیچ داده‌ای ثبت نشد.", get_super_admin_keyboard())
+        return
+    user_states.update(chat_id, {
+        'state': 'WAITING_FOR_ACTUAL_OCR_REVIEW', 'actual_ocr_result': result,
+        'actual_ocr_date': shamsi_date, 'actual_ocr_expires_at': time.time() + 1800,
+    })
+    keyboard = {
+        'keyboard': [[{'text': '✅ تأیید و ثبت آمار استخراج‌شده'}],
+                     [{'text': '✏️ اصلاح اعداد'}], [{'text': '🔙 انصراف'}]],
+        'resize_keyboard': True,
+    }
+    send_message(chat_id, format_actual_ocr_preview(result, shamsi_date), keyboard)
+
 def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
     conn = None
     try:
@@ -5162,7 +5462,7 @@ def download_bale_media(file_id, max_bytes=MAX_CAMPAIGN_MEDIA_BYTES):
         declared_size = int(response.headers.get('Content-Length') or 0)
         if declared_size > max_bytes:
             response.close()
-            return False, "حجم تصویر بیشتر از ۵ مگابایت است.", None
+            return False, f"حجم تصویر بیشتر از {max_bytes // (1024 * 1024)} مگابایت است.", None
         chunks, total = [], 0
         for chunk in response.iter_content(64 * 1024):
             if not chunk:
@@ -5170,7 +5470,7 @@ def download_bale_media(file_id, max_bytes=MAX_CAMPAIGN_MEDIA_BYTES):
             total += len(chunk)
             if total > max_bytes:
                 response.close()
-                return False, "حجم تصویر بیشتر از ۵ مگابایت است.", None
+                return False, f"حجم تصویر بیشتر از {max_bytes // (1024 * 1024)} مگابایت است.", None
             chunks.append(chunk)
         response.close()
         return True, "", b''.join(chunks)
@@ -5542,6 +5842,7 @@ def get_super_admin_keyboard():
             [{"text": "📈 پیش‌بینی عملکرد"}, {"text": "📊 نمودار استان"}],
             [{"text": "📊 نمودار شعبه"}, {"text": "📊 نمودار تحلیلی"}],
             [{"text": "📊 مقایسه انطباق"}, {"text": "📊 ثبت آمار واقعی"}],
+            [{"text": "📷 ثبت هوشمند آمار از تصویر"}],
             [{"text": "📝 ثبت مشکل"}, {"text": "🔧 وضعیت ربات"}],
             [{"text": "ℹ️ درباره توسعه‌دهنده"}, {"text": "🔙 خروج"}],
             [{"text": "❓ راهنما"}],
@@ -6177,12 +6478,15 @@ def handle_message(message):
                 pass
             if current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')):
                 pass
+            if current_state == "WAITING_FOR_ACTUAL_OCR_IMAGE" and (message.get('document') or message.get('photo')):
+                pass
             if current_state in ["WAITING_FOR_NOTE", "WAITING_FOR_NOTE_FOR_COLLECTION"]:
                 send_message(chat_id, "❌ لطفاً یک متن وارد کنید.")
                 return
             elif not ((current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document'))
                       or (current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')))):
-                return
+                if not (current_state == "WAITING_FOR_ACTUAL_OCR_IMAGE" and (message.get('document') or message.get('photo'))):
+                    return
 
         if not get_bot_status() and not is_super_admin_user(chat_id):
             send_maintenance_message(chat_id)
@@ -6937,6 +7241,7 @@ def handle_message(message):
                 "   • ارسال گزارش هفتگی و ماهانه\n"
                 "   • فعال/غیرفعال کردن قابلیت‌ها\n"
                 "   • ثبت آمار واقعی وصول (هر شعبه یک عدد)\n"
+                "   • ثبت هوشمند مبلغ نسبت به روز قبل از تصویر، با اصلاح و تأیید نهایی\n"
                 "   • مشاهده نمودارهای تحلیلی و انطباق\n"
                 "   • **مدیریت اهداف وصولی:**\n"
                 "      - تعیین هدف برای هر شعبه (مبلغ و تاریخ)\n"
@@ -6969,7 +7274,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۹.۲.۰ (مرکز پیام‌رسانی و جابه‌جایی امن معاونان)\n"
+                "📅 نسخه: ۹.۳.۰ (ثبت هوشمند آمار تصویری و مرکز پیام‌رسانی)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_keyboard(role, is_super_admin)
@@ -8105,6 +8410,189 @@ def handle_message(message):
                     return
                 user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_DATE"})
                 send_message(chat_id, "📅 لطفاً **تاریخ** مورد نظر برای ثبت آمار واقعی را به فرمت YYYY/MM/DD وارد کنید:\n\n(مثلاً 1403/01/15)", get_cancel_keyboard())
+                return
+
+            if text == "📷 ثبت هوشمند آمار از تصویر":
+                if not get_actual_stats_status():
+                    send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_super_admin_keyboard())
+                    return
+                if not IMAGE_OCR_AVAILABLE:
+                    send_message(chat_id, "❌ موتور OCR آماده نیست. وابستگی‌های فایل requirements.txt را نصب کنید.", get_super_admin_keyboard())
+                    return
+                user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_OCR_DATE", "actual_ocr_result": None})
+                send_message(
+                    chat_id,
+                    "📅 تاریخ گزارش را به فرمت YYYY/MM/DD وارد کنید.\n\n"
+                    "این تاریخ قبل از ثبت نهایی دوباره در پیش‌نمایش نمایش داده می‌شود.",
+                    get_cancel_keyboard()
+                )
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_OCR_DATE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                    send_message(chat_id, "عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                shamsi_date = normalize_digits(text)
+                if not validate_shamsi_date(shamsi_date):
+                    send_message(chat_id, "❌ تاریخ معتبر نیست؛ نمونه: ۱۴۰۵/۰۶/۰۲", get_cancel_keyboard())
+                    return
+                user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_OCR_IMAGE", "actual_ocr_date": shamsi_date})
+                send_message(
+                    chat_id,
+                    "📷 تصویر **کامل، صاف و خوانای جدول** را ارسال کنید.\n\n"
+                    "ربات فقط کد شعبه و مبلغ «نسبت به روز قبل» را می‌خواند. "
+                    "تصویر در دیتابیس ذخیره نمی‌شود و پس از پردازش از حافظه آزاد خواهد شد.",
+                    get_cancel_keyboard()
+                )
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_OCR_IMAGE":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                    send_message(chat_id, "عملیات لغو شد و هیچ داده‌ای ثبت نشد.", get_super_admin_keyboard())
+                    return
+                document = message.get('document') or {}
+                photos = message.get('photo') or []
+                if document:
+                    file_id = document.get('file_id')
+                    mime_type = document.get('mime_type') or ''
+                elif photos:
+                    file_id = photos[-1].get('file_id')
+                    mime_type = 'image/jpeg'
+                else:
+                    send_message(chat_id, "❌ لطفاً تصویر را به‌صورت عکس یا سند تصویری ارسال کنید.", get_cancel_keyboard())
+                    return
+                if document and not mime_type.startswith('image/'):
+                    send_message(chat_id, "❌ فایل ارسالی باید تصویر باشد.", get_cancel_keyboard())
+                    return
+                ok, error_text, image_bytes = download_bale_media(file_id, MAX_ACTUAL_IMAGE_BYTES)
+                if not ok:
+                    send_message(chat_id, f"❌ {error_text}", get_cancel_keyboard())
+                    return
+                shamsi_date = user_state.get('actual_ocr_date')
+                user_states.update(chat_id, {"state": "PROCESSING_ACTUAL_OCR"})
+                send_message(chat_id, "⏳ تصویر دریافت شد؛ در حال استخراج کد شعب و مبالغ هستم...", get_cancel_keyboard())
+                executor.submit(process_actual_stats_image, chat_id, user_db_id, shamsi_date, image_bytes)
+                image_bytes = None
+                return
+
+            if current_state == "PROCESSING_ACTUAL_OCR":
+                send_message(chat_id, "⏳ پردازش هنوز در حال انجام است؛ لطفاً منتظر نمایش پیش‌نمایش بمانید.", get_cancel_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_OCR_REVIEW":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                    send_message(chat_id, "عملیات لغو شد و هیچ داده‌ای ثبت نشد.", get_super_admin_keyboard())
+                    return
+                if time.time() > user_state.get('actual_ocr_expires_at', 0):
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                    send_message(chat_id, "⌛ مهلت بررسی تمام شد؛ تصویر را دوباره ارسال کنید.", get_super_admin_keyboard())
+                    return
+                if text == "✏️ اصلاح اعداد":
+                    user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_OCR_CORRECTION"})
+                    send_message(
+                        chat_id,
+                        "یک یا چند اصلاح را هرکدام در یک خط وارد کنید:\n"
+                        "`کدشعبه=مبلغ`\n\nمثال:\n`20628=-136`\n`22103=-45`",
+                        get_cancel_keyboard()
+                    )
+                    return
+                if text != "✅ تأیید و ثبت آمار استخراج‌شده":
+                    send_message(chat_id, "ابتدا نتیجه را اصلاح کنید یا دکمه تأیید نهایی را بزنید.")
+                    return
+                result = user_state.get('actual_ocr_result') or {}
+                if result.get('missing'):
+                    send_message(chat_id, "❌ تا زمانی که شعب تشخیص‌داده‌نشده با گزینه اصلاح تکمیل نشوند، ثبت نهایی مجاز نیست.")
+                    return
+                rows = result.get('rows') or []
+                shamsi_date = user_state.get('actual_ocr_date')
+                success, save_status, details = save_actual_stats_bulk(rows, shamsi_date, user_db_id, False)
+                if not success and save_status == 'existing':
+                    user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_OCR_OVERWRITE"})
+                    keyboard = {
+                        'keyboard': [[{'text': '⚠️ تأیید بازنویسی آمار موجود'}], [{'text': '🔙 انصراف'}]],
+                        'resize_keyboard': True,
+                    }
+                    send_message(
+                        chat_id,
+                        f"⚠️ برای {len(details)} شعبه در تاریخ انتخاب‌شده آمار وجود دارد.\n"
+                        "فقط با تأیید صریح شما مقادیر همان تاریخ جایگزین می‌شوند.",
+                        keyboard
+                    )
+                    return
+                user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                if success:
+                    log_user_activity(user_db_id, 'actual_stats_ocr', f"date={shamsi_date} count={details} overwrite=false")
+                    send_message(chat_id, f"✅ آمار {details} شعبه پس از تأیید شما ثبت شد.", get_super_admin_keyboard())
+                else:
+                    send_message(chat_id, f"❌ ثبت انجام نشد: {save_status}", get_super_admin_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_OCR_CORRECTION":
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_OCR_REVIEW"})
+                    result = user_state.get('actual_ocr_result') or {}
+                    review_keyboard = {
+                        'keyboard': [[{'text': '✅ تأیید و ثبت آمار استخراج‌شده'}],
+                                     [{'text': '✏️ اصلاح اعداد'}], [{'text': '🔙 انصراف'}]],
+                        'resize_keyboard': True,
+                    }
+                    send_message(chat_id, format_actual_ocr_preview(result, user_state.get('actual_ocr_date')), review_keyboard)
+                    return
+                branches_by_code = {str(code): (branch_id, name) for branch_id, name, code in get_branches_with_codes()}
+                corrections = {}
+                try:
+                    for line in text.splitlines():
+                        if not line.strip():
+                            continue
+                        code_text, amount_text = re.split(r'[=:]', line, maxsplit=1)
+                        code = _normalize_ocr_code(code_text)
+                        amount = parse_number(amount_text.strip().replace('−', '-').replace('–', '-').replace('—', '-'))
+                        if code not in branches_by_code or amount is None:
+                            raise ValueError
+                        corrections[code] = amount
+                except (ValueError, TypeError):
+                    send_message(chat_id, "❌ فرمت یا کد شعبه معتبر نیست؛ نمونه صحیح: `20628=-136`", get_cancel_keyboard())
+                    return
+                result = dict(user_state.get('actual_ocr_result') or {})
+                row_map = {row['branch_code']: dict(row) for row in result.get('rows', [])}
+                for code, amount in corrections.items():
+                    branch_id, branch_name = branches_by_code[code]
+                    row_map[code] = {
+                        'branch_id': branch_id, 'branch_name': branch_name, 'branch_code': code,
+                        'amount': amount, 'confidence': 1.0, 'raw_code': code,
+                        'raw_amount': str(amount), 'corrected': True,
+                    }
+                result['rows'] = sorted(row_map.values(), key=lambda item: item['branch_name'])
+                result['missing'] = [
+                    {'branch_id': branch_id, 'branch_name': name, 'branch_code': code}
+                    for code, (branch_id, name) in branches_by_code.items() if code not in row_map
+                ]
+                user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_OCR_REVIEW", "actual_ocr_result": result})
+                keyboard = {
+                    'keyboard': [[{'text': '✅ تأیید و ثبت آمار استخراج‌شده'}],
+                                 [{'text': '✏️ اصلاح اعداد'}], [{'text': '🔙 انصراف'}]],
+                    'resize_keyboard': True,
+                }
+                send_message(chat_id, format_actual_ocr_preview(result, user_state.get('actual_ocr_date')), keyboard)
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_OCR_OVERWRITE":
+                if text != "⚠️ تأیید بازنویسی آمار موجود":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                    send_message(chat_id, "عملیات لغو شد و آمار قبلی تغییر نکرد.", get_super_admin_keyboard())
+                    return
+                result = user_state.get('actual_ocr_result') or {}
+                shamsi_date = user_state.get('actual_ocr_date')
+                success, save_status, details = save_actual_stats_bulk(result.get('rows') or [], shamsi_date, user_db_id, True)
+                user_states.update(chat_id, {"state": "LOGGED_IN", "actual_ocr_result": None})
+                if success:
+                    log_user_activity(user_db_id, 'actual_stats_ocr', f"date={shamsi_date} count={details} overwrite=true")
+                    send_message(chat_id, f"✅ با تأیید صریح شما آمار {details} شعبه ثبت/جایگزین شد.", get_super_admin_keyboard())
+                else:
+                    send_message(chat_id, f"❌ ثبت انجام نشد: {save_status}", get_super_admin_keyboard())
                 return
 
             # ===== گزارش‌های جدید سوپرادمین =====
