@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۳.۱ (پیام تبریک در رسید انتصاب معاون جدید)
+# bot.py - نسخه ۹.۴.۰ (ثبت امن آمار واقعی از فایل Excel)
 # ============================================================
 import os
 import time
@@ -40,9 +40,18 @@ import binascii
 import hmac
 import uuid
 import base64
+import tempfile
+from decimal import Decimal, InvalidOperation
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from zoneinfo import ZoneInfo  # Python 3.9+
+
+try:
+    from openpyxl import load_workbook
+    OPENPYXL_AVAILABLE = True
+except Exception:
+    load_workbook = None
+    OPENPYXL_AVAILABLE = False
 
 try:
     import plotly.graph_objects as go
@@ -65,7 +74,7 @@ EDIT_DEADLINE_MINUTE = 59
 SCORE_DEADLINE_HOUR = 16   # ۱۶:۳۰
 SCORE_DEADLINE_MINUTE = 30
 MAX_AMOUNT_MILLIONS = 4_000_000_000_000
-BACKUP_FORMAT_VERSION = 4
+BACKUP_FORMAT_VERSION = 5
 BACKUP_SECRET = os.getenv("SUPER_ADMIN_PASSWORD", "")
 MAX_BACKUP_COMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_BYTES", 25 * 1024 * 1024))
 MAX_BACKUP_UNCOMPRESSED_BYTES = int(os.getenv("MAX_BACKUP_UNCOMPRESSED_BYTES", 200 * 1024 * 1024))
@@ -73,7 +82,8 @@ ALLOW_UNSIGNED_LEGACY_BACKUP = os.getenv("ALLOW_UNSIGNED_LEGACY_BACKUP", "false"
 BACKUP_TABLES = (
     'branches', 'users', 'collections', 'notes', 'user_activity_log',
     'settings', 'holidays', 'problems', 'scores', 'feature_settings',
-    'actual_stats', 'branch_targets', 'deputy_transfer_operations',
+    'actual_stats', 'actual_stats_import_operations', 'actual_stats_audit_log',
+    'branch_targets', 'deputy_transfer_operations',
     'deputy_replacement_operations', 'deputy_branch_assignments',
     'message_campaigns', 'message_deliveries'
 )
@@ -87,6 +97,8 @@ RESTORE_IDENTITY_FIELDS = {
     'problems': ('user_id', 'created_at'),
     'scores': ('collection_id',),
     'actual_stats': ('branch_id', 'shamsi_date'),
+    'actual_stats_import_operations': ('operation_uuid',),
+    'actual_stats_audit_log': ('operation_id', 'branch_id'),
     'branch_targets': ('branch_id', 'target_date', 'created_at'),
     'deputy_transfer_operations': ('operation_uuid',),
     'deputy_replacement_operations': ('operation_uuid',),
@@ -96,6 +108,33 @@ RESTORE_IDENTITY_FIELDS = {
 }
 MAX_CAMPAIGN_TEXT_LENGTH = 3500
 MAX_CAMPAIGN_MEDIA_BYTES = 5 * 1024 * 1024
+ACTUAL_EXCEL_TEMP_PREFIX = 'zanjan_actual_stats_'
+ACTUAL_EXCEL_CONFIRM_TTL_SECONDS = 30 * 60
+
+# کدهای رسمی شعب مطابق ستون «کد شعبه» در فایل گزارش سازمانی.
+# مقداردهی دیتابیس فقط برای خانه‌های خالی انجام می‌شود و کد موجود را بازنویسی نمی‌کند.
+OFFICIAL_BRANCH_CODES = {
+    'مرکزی زنجان': '20578',
+    'جمهوری': '20784',
+    'میدان استقلال': '20602',
+    'میدان پایین': '20610',
+    'سعدی جنوبی': '20628',
+    'سبزه میدان': '20594',
+    'اسلام آباد': '20651',
+    'خرمشهر': '20644',
+    'بعثت': '20636',
+    'سعدی شمالی': '20685',
+    'سلطانیه': '20834',
+    'آببر': '20776',
+    'کوچمشکی': '20442',
+    'دندی': '20227',
+    'مرکزی ابهر': '22053',
+    'هیدج': '22103',
+    'صايين قلعه': '22111',
+    'میدان معلم ابهر': '22061',
+    'خدابنده': '22071',
+    'خرمدره': '20250',
+}
 
 # ============================================================
 # تنظیمات لاگین
@@ -605,9 +644,27 @@ def create_all_tables_if_not_exists():
                 CREATE TABLE IF NOT EXISTS branches (
                     id SERIAL PRIMARY KEY,
                     name VARCHAR(255) NOT NULL UNIQUE,
+                    official_code VARCHAR(20),
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("ALTER TABLE branches ADD COLUMN IF NOT EXISTS official_code VARCHAR(20)")
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_branches_official_code_unique
+                ON branches(official_code) WHERE official_code IS NOT NULL
+            """)
+            branch_code_values = list(OFFICIAL_BRANCH_CODES.items())
+            execute_values(cur, """
+                UPDATE branches AS b
+                SET official_code = v.official_code
+                FROM (VALUES %s) AS v(branch_name, official_code)
+                WHERE b.name = v.branch_name
+                  AND b.official_code IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM branches other
+                      WHERE other.official_code = v.official_code
+                  )
+            """, branch_code_values)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id SERIAL PRIMARY KEY,
@@ -715,6 +772,40 @@ def create_all_tables_if_not_exists():
                     CONSTRAINT unique_branch_actual_date UNIQUE (branch_id, shamsi_date)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS actual_stats_import_operations (
+                    id BIGSERIAL PRIMARY KEY,
+                    operation_uuid VARCHAR(36) NOT NULL UNIQUE,
+                    shamsi_date VARCHAR(10) NOT NULL,
+                    source_file_name VARCHAR(255) NOT NULL,
+                    source_sha256 VARCHAR(64) NOT NULL,
+                    extracted_count INTEGER NOT NULL,
+                    corrected_count INTEGER NOT NULL DEFAULT 0,
+                    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (shamsi_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$'),
+                    CHECK (source_sha256 ~ '^[0-9a-f]{64}$'),
+                    CHECK (extracted_count >= 0),
+                    CHECK (corrected_count >= 0)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS actual_stats_audit_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    actual_stats_id INTEGER NOT NULL REFERENCES actual_stats(id) ON DELETE RESTRICT,
+                    operation_id BIGINT REFERENCES actual_stats_import_operations(id) ON DELETE RESTRICT,
+                    branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE RESTRICT,
+                    shamsi_date VARCHAR(10) NOT NULL,
+                    old_total_actual BIGINT,
+                    extracted_total_actual BIGINT,
+                    new_total_actual BIGINT NOT NULL,
+                    source VARCHAR(20) NOT NULL CHECK (source IN ('manual', 'excel')),
+                    changed_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (shamsi_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$')
+                )
+            """)
+            cur.execute("ALTER TABLE actual_stats_audit_log ADD COLUMN IF NOT EXISTS extracted_total_actual BIGINT")
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS branch_targets (
                     id SERIAL PRIMARY KEY,
@@ -865,6 +956,13 @@ def create_all_tables_if_not_exists():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_collections_recorded_by ON collections(recorded_by);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_scores_collection ON scores(collection_id);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_actual_stats_branch_date ON actual_stats(branch_id, shamsi_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_actual_stats_import_date ON actual_stats_import_operations(shamsi_date, created_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_actual_stats_audit_branch_date ON actual_stats_audit_log(branch_id, shamsi_date, created_at);")
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_actual_stats_audit_operation_branch
+                ON actual_stats_audit_log(operation_id, branch_id)
+                WHERE operation_id IS NOT NULL
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_assignments_deputy_dates ON deputy_branch_assignments(deputy_id, effective_from, effective_to);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_assignments_branch_dates ON deputy_branch_assignments(branch_id, effective_from, effective_to);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_deputy_replacements_branch_date ON deputy_replacement_operations(branch_id, effective_date);")
@@ -1420,6 +1518,27 @@ def get_all_branches():
             return result
     except Exception as e:
         logger.error(f"get_all_branches: {e}")
+        if conn:
+            conn.rollback()
+        return []
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def get_branches_with_official_codes():
+    """Return the authoritative branch-code map used by organization Excel files."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, name, official_code
+                FROM branches
+                ORDER BY name
+            """)
+            return cur.fetchall()
+    except Exception as e:
+        logger.error("get_branches_with_official_codes: %s", safe_log_value(e))
         if conn:
             conn.rollback()
         return []
@@ -3671,20 +3790,398 @@ def save_actual_stats(branch_id, shamsi_date, total_actual, user_id):
         total_actual_rial = total_actual * 1_000_000
         with conn.cursor() as cur:
             cur.execute("""
+                SELECT id, total_actual FROM actual_stats
+                WHERE branch_id=%s AND shamsi_date=%s
+                FOR UPDATE
+            """, (branch_id, shamsi_date))
+            previous = cur.fetchone()
+            cur.execute("""
                 INSERT INTO actual_stats (branch_id, shamsi_date, total_actual, recorded_by, created_at)
                 VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (branch_id, shamsi_date) DO UPDATE SET
                     total_actual = EXCLUDED.total_actual,
                     recorded_by = EXCLUDED.recorded_by,
                     updated_at = CURRENT_TIMESTAMP
+                RETURNING id
             """, (branch_id, shamsi_date, total_actual_rial, user_id, get_iran_time()))
+            actual_stats_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO actual_stats_audit_log
+                    (actual_stats_id, branch_id, shamsi_date, old_total_actual,
+                     new_total_actual, source, changed_by)
+                VALUES (%s, %s, %s, %s, %s, 'manual', %s)
+            """, (actual_stats_id, branch_id, shamsi_date,
+                  previous[1] if previous else None, total_actual_rial, user_id))
             conn.commit()
             return True, "ثبت شد"
     except Exception as e:
-        logger.error(f"save_actual_stats error: {e}")
+        logger.error("save_actual_stats error: %s", safe_log_value(e))
         if conn:
             conn.rollback()
-        return False, f"خطا: {e}"
+        return False, "ثبت آمار انجام نشد؛ لطفاً دوباره تلاش کنید."
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def _normalize_excel_header(value):
+    if value is None:
+        return ''
+    text = str(value).translate(DIGIT_MAP)
+    text = text.replace('ي', 'ی').replace('ى', 'ی').replace('ك', 'ک')
+    text = text.replace('\u200c', '').replace('\u200f', '').replace('\u200e', '')
+    return re.sub(r'[\sـ:؛،,\-_]+', '', text).strip().lower()
+
+def _normalize_excel_code(value):
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not value.is_integer():
+            return None
+        return str(int(value))
+    text = str(value).translate(DIGIT_MAP).strip()
+    text = re.sub(r'[\s,،٬\u200c\u200e\u200f]+', '', text)
+    if re.fullmatch(r'\d+\.0+', text):
+        text = text.split('.', 1)[0]
+    return text if re.fullmatch(r'\d+', text) else None
+
+def _parse_excel_actual_amount(value):
+    """Return (integer million-rial value, was_blank); blanks intentionally become zero."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0, True
+    if isinstance(value, bool):
+        raise ValueError("boolean amount")
+    if isinstance(value, (int, float, Decimal)):
+        text = str(value)
+    else:
+        text = str(value).strip().translate(DIGIT_MAP)
+    text = (text.replace('−', '-').replace('–', '-').replace('—', '-')
+                .replace('﹣', '-').replace('－', '-').replace('＋', '+'))
+    negative_parentheses = text.startswith('(') and text.endswith(')')
+    if negative_parentheses:
+        text = text[1:-1]
+    text = re.sub(r'[\s,،٬\u200c\u200e\u200f]+', '', text)
+    if text.endswith('-'):
+        text = '-' + text[:-1]
+    if negative_parentheses and not text.startswith('-'):
+        text = '-' + text
+    if text.startswith('+'):
+        text = text[1:]
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise ValueError("invalid numeric amount")
+    if not amount.is_finite():
+        raise ValueError("amount must be finite")
+    # دقیقاً مطابق parse_number در ثبت دستی، بخش اعشاری به سمت صفر حذف می‌شود.
+    amount_int = int(amount)
+    if abs(amount_int) > MAX_AMOUNT_MILLIONS:
+        raise ValueError("amount outside permitted database range")
+    return amount_int, False
+
+def _merged_excel_value(ws, row, column, merged_ranges):
+    value = ws.cell(row=row, column=column).value
+    if value is not None:
+        return value
+    for merged in merged_ranges:
+        if (merged.min_row <= row <= merged.max_row and
+                merged.min_col <= column <= merged.max_col):
+            return ws.cell(row=merged.min_row, column=merged.min_col).value
+    return None
+
+def _extract_shamsi_date_from_excel(ws):
+    candidates = []
+    for row_number in range(1, min(ws.max_row or 1, 20) + 1):
+        values = []
+        for column in range(1, min(ws.max_column or 1, 100) + 1):
+            value = ws.cell(row=row_number, column=column).value
+            if value is not None:
+                values.append(str(value).translate(DIGIT_MAP))
+        row_text = ' '.join(values)
+        for match in re.findall(r'1[34]\d{2}/\d{1,2}/\d{1,2}', row_text):
+            parts = match.split('/')
+            normalized = f"{int(parts[0]):04d}/{int(parts[1]):02d}/{int(parts[2]):02d}"
+            if validate_shamsi_date(normalized):
+                candidates.append((normalized, 'منتهی' in _normalize_excel_header(row_text)))
+    preferred = [date for date, is_preferred in candidates if is_preferred]
+    if preferred:
+        return preferred[0]
+    unique_dates = list(dict.fromkeys(date for date, _ in candidates))
+    return unique_dates[0] if len(unique_dates) == 1 else None
+
+def parse_actual_stats_excel(file_path, branches):
+    """Parse only the official branch-code and day-over-day amount columns."""
+    if not OPENPYXL_AVAILABLE:
+        return False, "کتابخانه خواندن Excel روی سرور نصب نیست.", None
+    configured = {}
+    missing_code_names = []
+    for branch_id, branch_name, official_code in branches:
+        code = _normalize_excel_code(official_code)
+        if not code:
+            missing_code_names.append(branch_name)
+        elif code in configured:
+            return False, f"کد رسمی {code} برای بیش از یک شعبه ثبت شده است.", None
+        else:
+            configured[code] = (branch_id, branch_name)
+    if missing_code_names:
+        return False, "برای این شعب کد رسمی ثبت نشده است: " + "، ".join(missing_code_names), None
+    if not configured:
+        return False, "هیچ شعبه دارای کد رسمی در دیتابیس یافت نشد.", None
+
+    workbook = None
+    try:
+        workbook = load_workbook(file_path, data_only=True, read_only=False)
+        selected = None
+        for ws in workbook.worksheets:
+            header_rows = min(ws.max_row or 1, 40)
+            header_columns = min(ws.max_column or 1, 200)
+            merged_ranges = list(ws.merged_cells.ranges)
+            normalized_grid = {}
+            for row in range(1, header_rows + 1):
+                for column in range(1, header_columns + 1):
+                    normalized_grid[(row, column)] = _normalize_excel_header(
+                        _merged_excel_value(ws, row, column, merged_ranges)
+                    )
+
+            code_candidates = []
+            for (row, column), header in normalized_grid.items():
+                if header == 'کدشعبه':
+                    code_candidates.append((row, column))
+            amount_candidates = []
+            for column in range(1, header_columns + 1):
+                column_headers = [normalized_grid[(row, column)] for row in range(1, header_rows + 1)]
+                has_section = any('میزانتغییراتروزجاری' in header for header in column_headers)
+                has_day_ratio = any('نسبتبهروزقبل' in header for header in column_headers)
+                leaf_rows = [row for row in range(1, header_rows + 1)
+                             if normalized_grid[(row, column)] == 'مبلغ']
+                if has_section and has_day_ratio and leaf_rows:
+                    amount_candidates.append((max(leaf_rows), column))
+            if code_candidates and len(amount_candidates) == 1:
+                code_header_row, code_column = code_candidates[0]
+                amount_header_row, amount_column = amount_candidates[0]
+                selected = (ws, code_column, amount_column,
+                            max(code_header_row, amount_header_row) + 1)
+                break
+
+        if not selected:
+            return False, ("ستون‌های «کد شعبه» و «میزان تغییرات روز جاری ← نسبت به روز قبل ← مبلغ» "
+                           "در فایل پیدا نشدند. قالب فایل را بررسی کنید."), None
+
+        ws, code_column, amount_column, first_data_row = selected
+        report_date = _extract_shamsi_date_from_excel(ws)
+        found = {}
+        duplicates = []
+        invalid_rows = []
+        ignored_codes = []
+        blank_count = 0
+        for row_number in range(first_data_row, (ws.max_row or first_data_row) + 1):
+            code = _normalize_excel_code(ws.cell(row=row_number, column=code_column).value)
+            if not code:
+                continue
+            if code not in configured:
+                ignored_codes.append(code)
+                continue
+            if code in found:
+                duplicates.append(code)
+                continue
+            try:
+                amount, was_blank = _parse_excel_actual_amount(
+                    ws.cell(row=row_number, column=amount_column).value
+                )
+            except ValueError:
+                invalid_rows.append(f"ردیف {row_number} (کد {code})")
+                continue
+            branch_id, branch_name = configured[code]
+            found[code] = {
+                'branch_id': branch_id,
+                'branch_name': branch_name,
+                'official_code': code,
+                'amount_millions': amount,
+                'extracted_amount_millions': amount,
+                'was_blank': was_blank,
+                'corrected': False,
+            }
+            if was_blank:
+                blank_count += 1
+
+        if duplicates:
+            return False, "کد شعبه تکراری در فایل وجود دارد: " + "، ".join(sorted(set(duplicates))), None
+        if invalid_rows:
+            return False, "مبلغ نامعتبر در " + "، ".join(invalid_rows[:10]), None
+        missing_codes = [code for code in configured if code not in found]
+        if missing_codes:
+            missing_names = [f"{configured[code][1]} ({code})" for code in missing_codes]
+            return False, ("ردیف این شعب در فایل پیدا نشد؛ برای جلوگیری از ثبت ناقص عملیات متوقف شد: " +
+                           "، ".join(missing_names)), None
+
+        rows = sorted(found.values(), key=lambda item: item['branch_name'])
+        return True, "", {
+            'report_date': report_date,
+            'rows': rows,
+            'blank_count': blank_count,
+            'ignored_code_count': len(set(ignored_codes)),
+            'sheet_name': ws.title,
+        }
+    except Exception as e:
+        logger.exception("Actual stats Excel parsing failed")
+        return False, f"فایل Excel قابل خواندن نیست ({type(e).__name__}).", None
+    finally:
+        if workbook is not None:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+
+def get_existing_actual_stats_map(shamsi_date):
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT branch_id, total_actual FROM actual_stats WHERE shamsi_date=%s", (shamsi_date,))
+            return {branch_id: total_actual for branch_id, total_actual in cur.fetchall()}
+    except Exception as e:
+        logger.error("get_existing_actual_stats_map: %s", safe_log_value(e))
+        if conn:
+            conn.rollback()
+        return None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def _format_signed_millions(value):
+    return f"{value:+,}" if value else "0"
+
+def format_actual_excel_preview(draft):
+    shamsi_date = draft.get('report_date') or 'تعیین نشده'
+    existing = get_existing_actual_stats_map(shamsi_date) if validate_shamsi_date(shamsi_date) else {}
+    if existing is None:
+        existing = {}
+    lines = [
+        "📊 **پیش‌نمایش ثبت آمار واقعی از Excel**",
+        "━━━━━━━━━━━━━━━━━━",
+        f"📅 تاریخ: {shamsi_date}",
+        f"📄 فایل: {escape_markdown(draft.get('file_name', 'نامشخص'))}",
+        f"🏢 تعداد شعب: {len(draft.get('rows', []))}",
+        "",
+    ]
+    overwrite_count = 0
+    for index, row in enumerate(draft.get('rows', []), 1):
+        current_rial = existing.get(row['branch_id'])
+        if current_rial is not None:
+            overwrite_count += 1
+        marker = '✏️' if row.get('corrected') else ('♻️' if current_rial is not None else '▫️')
+        line = (f"{index}. {marker} {row['branch_name']} ({row['official_code']}): "
+                f"{_format_signed_millions(row['amount_millions'])} میلیون ریال")
+        if current_rial is not None:
+            line += f" | قبلی: {_format_signed_millions(int(Decimal(current_rial) / Decimal(1_000_000)))}"
+        lines.append(line)
+    lines.extend([
+        "",
+        f"⬜ سلول خالیِ ثبت‌شده به‌صورت صفر: {draft.get('blank_count', 0)}",
+        f"➖ کدهای غیرمرتبط/جمع حوزه که نادیده گرفته شدند: {draft.get('ignored_code_count', 0)}",
+        f"✏️ اصلاحات دستی در پیش‌نمایش: {sum(1 for row in draft.get('rows', []) if row.get('corrected'))}",
+        f"♻️ رکوردهای موجود که پس از تأیید به‌روزرسانی می‌شوند: {overwrite_count}",
+        "",
+        "تا پیش از زدن «تأیید نهایی»، هیچ داده‌ای در دیتابیس ثبت یا تغییر نمی‌کند.",
+    ])
+    return '\n'.join(lines)
+
+def save_actual_stats_batch(draft, user_id):
+    """Atomically upsert a verified Excel batch and preserve before/after values."""
+    conn = None
+    try:
+        shamsi_date = draft.get('report_date')
+        rows = draft.get('rows') or []
+        if not validate_shamsi_date(shamsi_date) or not rows:
+            return False, "اطلاعات پیش‌نمایش کامل نیست.", None
+        branch_ids = [int(row['branch_id']) for row in rows]
+        if len(branch_ids) != len(set(branch_ids)):
+            return False, "یک شعبه بیش از یک بار در پیش‌نمایش وجود دارد.", None
+        for row in rows:
+            amount = row.get('amount_millions')
+            if not isinstance(amount, int) or abs(amount) > MAX_AMOUNT_MILLIONS:
+                return False, "یکی از مبلغ‌ها نامعتبر است.", None
+
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout='10s'")
+            cur.execute("SET LOCAL statement_timeout='120s'")
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (int(shamsi_date.replace('/', '')),))
+            operation_uuid = str(draft.get('operation_uuid') or uuid.uuid4())
+            cur.execute("""
+                SELECT shamsi_date, source_sha256
+                FROM actual_stats_import_operations
+                WHERE operation_uuid=%s
+            """, (operation_uuid,))
+            already_saved = cur.fetchone()
+            if already_saved:
+                if (already_saved[0] == shamsi_date and
+                        already_saved[1] == draft.get('file_sha256', '')):
+                    conn.rollback()
+                    return True, "این پیش‌نمایش قبلاً ثبت شده است.", operation_uuid
+                raise ValueError("operation UUID collision")
+            cur.execute("""
+                SELECT id, official_code FROM branches
+                WHERE id = ANY(%s)
+                FOR UPDATE
+            """, (branch_ids,))
+            current_branches = {branch_id: _normalize_excel_code(code)
+                                for branch_id, code in cur.fetchall()}
+            if len(current_branches) != len(branch_ids):
+                raise ValueError("branch set changed before confirmation")
+            for row in rows:
+                if current_branches.get(row['branch_id']) != row['official_code']:
+                    raise ValueError("official branch code changed before confirmation")
+
+            corrected_count = sum(1 for row in rows if row.get('corrected'))
+            cur.execute("""
+                INSERT INTO actual_stats_import_operations
+                    (operation_uuid, shamsi_date, source_file_name, source_sha256,
+                     extracted_count, corrected_count, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (operation_uuid, shamsi_date, draft.get('file_name', 'report.xlsx')[:255],
+                  draft.get('file_sha256', ''), len(rows), corrected_count, user_id))
+            operation_id = cur.fetchone()[0]
+
+            for row in rows:
+                branch_id = row['branch_id']
+                new_total_rial = row['amount_millions'] * 1_000_000
+                cur.execute("""
+                    SELECT id, total_actual FROM actual_stats
+                    WHERE branch_id=%s AND shamsi_date=%s
+                    FOR UPDATE
+                """, (branch_id, shamsi_date))
+                previous = cur.fetchone()
+                cur.execute("""
+                    INSERT INTO actual_stats
+                        (branch_id, shamsi_date, total_actual, recorded_by, created_at)
+                    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (branch_id, shamsi_date) DO UPDATE SET
+                        total_actual=EXCLUDED.total_actual,
+                        recorded_by=EXCLUDED.recorded_by,
+                        updated_at=CURRENT_TIMESTAMP
+                    RETURNING id
+                """, (branch_id, shamsi_date, new_total_rial, user_id))
+                actual_stats_id = cur.fetchone()[0]
+                cur.execute("""
+                    INSERT INTO actual_stats_audit_log
+                        (actual_stats_id, operation_id, branch_id, shamsi_date,
+                         old_total_actual, extracted_total_actual, new_total_actual,
+                         source, changed_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'excel', %s)
+                """, (actual_stats_id, operation_id, branch_id, shamsi_date,
+                      previous[1] if previous else None,
+                      row.get('extracted_amount_millions', row['amount_millions']) * 1_000_000,
+                      new_total_rial, user_id))
+            conn.commit()
+            return True, "ثبت کامل انجام شد.", operation_uuid
+    except Exception:
+        logger.exception("Atomic Excel actual-stats import failed")
+        if conn:
+            conn.rollback()
+        return False, "هیچ داده‌ای ثبت نشد؛ خطای عملیات در لاگ ذخیره شد.", None
     finally:
         if conn:
             return_db_connection(conn)
@@ -5451,6 +5948,70 @@ def download_bale_media(file_id, max_bytes=MAX_CAMPAIGN_MEDIA_BYTES):
         logger.exception("Campaign media download failed")
         return False, "دریافت تصویر انجام نشد.", None
 
+def cleanup_stale_actual_excel_files(max_age_seconds=6 * 60 * 60):
+    """Delete only abandoned temp files created by this Excel-import feature."""
+    temp_dir = tempfile.gettempdir()
+    now = time_module.time()
+    try:
+        for entry in os.scandir(temp_dir):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            if not entry.name.startswith(ACTUAL_EXCEL_TEMP_PREFIX):
+                continue
+            try:
+                if now - entry.stat(follow_symlinks=False).st_mtime > max_age_seconds:
+                    os.unlink(entry.path)
+            except OSError:
+                logger.warning("Could not remove stale actual-stats temp file")
+    except OSError:
+        logger.warning("Could not scan temp directory for stale Excel files")
+
+def download_bale_excel_to_temp(file_id):
+    """Stream an Excel document to a temporary file without an application size cap."""
+    cleanup_stale_actual_excel_files()
+    temp_path = None
+    response = None
+    try:
+        metadata = get_http_session().get(
+            f"{BASE_URL}/getFile", params={"file_id": file_id}, timeout=30
+        )
+        if metadata.status_code != 200 or not metadata.json().get('ok'):
+            return False, "اطلاعات فایل از بله دریافت نشد.", None, None
+        remote_path = metadata.json().get('result', {}).get('file_path')
+        if not remote_path:
+            return False, "مسیر فایل از بله دریافت نشد.", None, None
+
+        temp_file = tempfile.NamedTemporaryFile(
+            mode='wb', prefix=ACTUAL_EXCEL_TEMP_PREFIX, suffix='.xlsx', delete=False
+        )
+        temp_path = temp_file.name
+        digest = hashlib.sha256()
+        try:
+            response = get_http_session().get(
+                f"https://tapi.bale.ai/file/bot{BOT_TOKEN}/{remote_path}",
+                timeout=(30, 120), stream=True
+            )
+            if response.status_code != 200:
+                return False, "دریافت فایل Excel ناموفق بود.", temp_path, None
+            for chunk in response.iter_content(1024 * 1024):
+                if not chunk:
+                    continue
+                temp_file.write(chunk)
+                digest.update(chunk)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        finally:
+            temp_file.close()
+        if os.path.getsize(temp_path) == 0:
+            return False, "فایل دریافت‌شده خالی است.", temp_path, None
+        return True, "", temp_path, digest.hexdigest()
+    except Exception:
+        logger.exception("Excel document download failed")
+        return False, "دریافت فایل Excel انجام نشد.", temp_path, None
+    finally:
+        if response is not None:
+            response.close()
+
 def parse_campaign_schedule(value):
     normalized = normalize_digits(value).strip()
     match = re.fullmatch(r'(\d{4})/(\d{2})/(\d{2})\s+(\d{1,2}):(\d{2})', normalized)
@@ -5833,6 +6394,27 @@ def get_super_admin_keyboard():
 
 def get_cancel_keyboard():
     return {"keyboard": [[{"text": "🔙 انصراف"}]], "resize_keyboard": True}
+
+def get_actual_stats_method_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✍️ ثبت دستی آمار واقعی"}],
+            [{"text": "📊 ثبت آمار واقعی از Excel"}],
+            [{"text": "🔙 انصراف"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+def get_actual_excel_confirm_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "✅ تأیید نهایی و ثبت"}],
+            [{"text": "✏️ اصلاح مبلغ یک شعبه"}, {"text": "📅 اصلاح تاریخ"}],
+            [{"text": "🔄 ارسال فایل جدید"}],
+            [{"text": "🔙 انصراف"}],
+        ],
+        "resize_keyboard": True,
+    }
 
 # ============================================================
 # توابع ارسال خودکار
@@ -6364,6 +6946,7 @@ def start_scheduler():
 # ============================================================
 def main():
     global requests_session, processed_set, _latest_offset
+    cleanup_stale_actual_excel_files()
     offset = load_offset()
     _latest_offset = offset
     logger.info(f"🤖 Bot started successfully with offset: {offset}")
@@ -6450,11 +7033,14 @@ def handle_message(message):
                 pass
             if current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')):
                 pass
+            if current_state == "WAITING_FOR_ACTUAL_EXCEL_FILE" and message.get('document'):
+                pass
             if current_state in ["WAITING_FOR_NOTE", "WAITING_FOR_NOTE_FOR_COLLECTION"]:
                 send_message(chat_id, "❌ لطفاً یک متن وارد کنید.")
                 return
             elif not ((current_state == "WAITING_FOR_RESTORE_FILE" and message.get('document'))
-                      or (current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')))):
+                      or (current_state == "WAITING_FOR_CAMPAIGN_MEDIA" and (message.get('document') or message.get('photo')))
+                      or (current_state == "WAITING_FOR_ACTUAL_EXCEL_FILE" and message.get('document'))):
                 return
 
         if not get_bot_status() and not is_super_admin_user(chat_id):
@@ -8523,8 +9109,47 @@ def handle_message(message):
                 if not get_actual_stats_status():
                     send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_super_admin_keyboard())
                     return
+                user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_METHOD"})
+                send_message(
+                    chat_id,
+                    "📊 **ثبت آمار واقعی**\n\nروش ثبت را انتخاب کنید:",
+                    get_actual_stats_method_keyboard(),
+                )
+                return
+
+            if text == "✍️ ثبت دستی آمار واقعی":
+                if not get_actual_stats_status():
+                    send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_super_admin_keyboard())
+                    return
                 user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_DATE"})
                 send_message(chat_id, "📅 لطفاً **تاریخ** مورد نظر برای ثبت آمار واقعی را به فرمت YYYY/MM/DD وارد کنید:\n\n(مثلاً 1403/01/15)", get_cancel_keyboard())
+                return
+
+            if text == "📊 ثبت آمار واقعی از Excel":
+                if not get_actual_stats_status():
+                    send_message(chat_id, "🔴 ثبت آمار واقعی در حال حاضر غیرفعال است.", get_super_admin_keyboard())
+                    return
+                if not OPENPYXL_AVAILABLE:
+                    send_message(
+                        chat_id,
+                        "❌ امکان خواندن Excel روی سرور نصب نیست. ابتدا requirements.txt را نصب/به‌روزرسانی کنید.",
+                        get_super_admin_keyboard(),
+                    )
+                    return
+                coded_branches = get_branches_with_official_codes()
+                missing_codes = [name for _, name, code in coded_branches if not code]
+                if not coded_branches or missing_codes:
+                    details = "، ".join(missing_codes) if missing_codes else "دیتابیس در دسترس نیست"
+                    send_message(chat_id, f"❌ کد رسمی شعب کامل نیست: {details}", get_super_admin_keyboard())
+                    return
+                user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_EXCEL_FILE"})
+                send_message(
+                    chat_id,
+                    "📎 فایل اصلی **Excel با پسوند .xlsx** را ارسال کنید.\n\n"
+                    "ربات کد شعبه و ستون «نسبت به روز قبل ← مبلغ» را می‌خواند. "
+                    "سلول مبلغ خالی صفر در نظر گرفته می‌شود و قبل از ثبت، پیش‌نمایش کامل نمایش داده خواهد شد.",
+                    get_cancel_keyboard(),
+                )
                 return
 
             # ===== گزارش‌های جدید سوپرادمین =====
@@ -9421,6 +10046,238 @@ def handle_message(message):
                 return
 
             # ===== Stateهای سوپرادمین =====
+            if current_state == "WAITING_FOR_ACTUAL_METHOD" and is_super_admin:
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                else:
+                    send_message(chat_id, "لطفاً یکی از دو روش ثبت را انتخاب کنید.", get_actual_stats_method_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_EXCEL_FILE" and is_super_admin:
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                document = message.get('document')
+                if not document:
+                    send_message(chat_id, "❌ لطفاً فایل Excel با پسوند .xlsx ارسال کنید.", get_cancel_keyboard())
+                    return
+                raw_file_name = str(document.get('file_name') or 'report.xlsx')
+                file_name = re.sub(r'[\x00-\x1f\x7f]+', '', os.path.basename(raw_file_name))[:255]
+                if not file_name.lower().endswith('.xlsx'):
+                    send_message(chat_id, "❌ فقط فایل اصلی Excel با پسوند .xlsx پذیرفته می‌شود.", get_cancel_keyboard())
+                    return
+                file_id = document.get('file_id')
+                if not file_id:
+                    send_message(chat_id, "❌ شناسه فایل دریافت نشد؛ فایل را دوباره ارسال کنید.", get_cancel_keyboard())
+                    return
+
+                send_message(chat_id, "⏳ فایل در حال خواندن و کنترل است؛ لطفاً کمی صبر کنید.", get_cancel_keyboard())
+                temp_path = None
+                try:
+                    downloaded, download_message, temp_path, file_sha256 = download_bale_excel_to_temp(file_id)
+                    if not downloaded:
+                        send_message(chat_id, f"❌ {download_message}", get_cancel_keyboard())
+                        return
+                    branches = get_branches_with_official_codes()
+                    parsed, parse_message, result = parse_actual_stats_excel(temp_path, branches)
+                    if not parsed:
+                        send_message(chat_id, f"❌ {parse_message}\n\nهیچ داده‌ای ثبت نشد.", get_cancel_keyboard())
+                        return
+                    try:
+                        os.unlink(temp_path)
+                        temp_path = None
+                    except OSError:
+                        logger.exception("Excel was parsed but immediate temp deletion failed")
+                        send_message(
+                            chat_id,
+                            "❌ حذف فایل موقت تأیید نشد؛ برای جلوگیری از اشغال حافظه، عملیات ثبت متوقف شد.",
+                            get_cancel_keyboard(),
+                        )
+                        return
+                    draft = result
+                    draft.update({
+                        'file_name': file_name,
+                        'file_sha256': file_sha256,
+                        'operation_uuid': str(uuid.uuid4()),
+                        'expires_at': time_module.time() + ACTUAL_EXCEL_CONFIRM_TTL_SECONDS,
+                    })
+                    if not draft.get('report_date'):
+                        user_states.update(chat_id, {
+                            "state": "WAITING_FOR_ACTUAL_EXCEL_DATE",
+                            "actual_excel_draft": draft,
+                        })
+                        send_message(
+                            chat_id,
+                            "✅ اطلاعات شعب استخراج شد، اما تاریخ گزارش با اطمینان تشخیص داده نشد.\n"
+                            "لطفاً تاریخ را به فرمت YYYY/MM/DD وارد کنید:",
+                            get_cancel_keyboard(),
+                        )
+                        return
+                    user_states.update(chat_id, {
+                        "state": "WAITING_FOR_ACTUAL_EXCEL_CONFIRM",
+                        "actual_excel_draft": draft,
+                    })
+                    send_message(chat_id, format_actual_excel_preview(draft), get_actual_excel_confirm_keyboard())
+                finally:
+                    # فایل در هیچ حالتی پس از پردازش روی سرور باقی نمی‌ماند.
+                    if temp_path and os.path.isfile(temp_path):
+                        try:
+                            os.unlink(temp_path)
+                        except OSError:
+                            logger.exception("Could not delete processed Excel temp file")
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_EXCEL_DATE" and is_super_admin:
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_excel_draft": None})
+                    send_message(chat_id, "❌ عملیات لغو شد.", get_super_admin_keyboard())
+                    return
+                shamsi_date = normalize_digits(text)
+                if not validate_shamsi_date(shamsi_date):
+                    send_message(chat_id, "❌ تاریخ نامعتبر است؛ به فرمت YYYY/MM/DD وارد کنید.", get_cancel_keyboard())
+                    return
+                draft = user_state.get('actual_excel_draft')
+                if not isinstance(draft, dict):
+                    user_states.update(chat_id, {"state": "LOGGED_IN"})
+                    send_message(chat_id, "❌ پیش‌نمایش منقضی شده است؛ فایل را دوباره ارسال کنید.", get_super_admin_keyboard())
+                    return
+                draft['report_date'] = shamsi_date
+                draft['expires_at'] = time_module.time() + ACTUAL_EXCEL_CONFIRM_TTL_SECONDS
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_ACTUAL_EXCEL_CONFIRM",
+                    "actual_excel_draft": draft,
+                })
+                send_message(chat_id, format_actual_excel_preview(draft), get_actual_excel_confirm_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_EXCEL_CONFIRM" and is_super_admin:
+                draft = user_state.get('actual_excel_draft')
+                if not isinstance(draft, dict) or time_module.time() > draft.get('expires_at', 0):
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_excel_draft": None})
+                    send_message(chat_id, "⌛ پیش‌نمایش منقضی شد؛ برای امنیت، فایل را دوباره ارسال کنید.", get_super_admin_keyboard())
+                    return
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_excel_draft": None})
+                    send_message(chat_id, "❌ عملیات لغو شد و هیچ داده‌ای ثبت نشد.", get_super_admin_keyboard())
+                    return
+                if text == "🔄 ارسال فایل جدید":
+                    user_states.update(chat_id, {"state": "WAITING_FOR_ACTUAL_EXCEL_FILE", "actual_excel_draft": None})
+                    send_message(chat_id, "📎 فایل جدید .xlsx را ارسال کنید.", get_cancel_keyboard())
+                    return
+                if text == "📅 اصلاح تاریخ":
+                    user_states.update(chat_id, {
+                        "state": "WAITING_FOR_ACTUAL_EXCEL_DATE",
+                        "actual_excel_draft": draft,
+                    })
+                    send_message(chat_id, "📅 تاریخ صحیح را به فرمت YYYY/MM/DD وارد کنید:", get_cancel_keyboard())
+                    return
+                if text == "✏️ اصلاح مبلغ یک شعبه":
+                    rows = draft.get('rows', [])
+                    branch_list = '\n'.join(
+                        f"{index}. {row['branch_name']} ({row['official_code']})"
+                        for index, row in enumerate(rows, 1)
+                    )
+                    user_states.update(chat_id, {
+                        "state": "WAITING_FOR_ACTUAL_EXCEL_EDIT_BRANCH",
+                        "actual_excel_draft": draft,
+                    })
+                    send_message(
+                        chat_id,
+                        "✏️ شماره شعبه‌ای را که باید اصلاح شود وارد کنید:\n\n" + branch_list,
+                        get_cancel_keyboard(),
+                    )
+                    return
+                if text == "✅ تأیید نهایی و ثبت":
+                    user_states.update(chat_id, {
+                        "state": "ACTUAL_EXCEL_COMMITTING",
+                        "actual_excel_draft": draft,
+                    })
+                    success, save_message, receipt_uuid = save_actual_stats_batch(draft, user_db_id)
+                    if success:
+                        log_user_activity(
+                            user_db_id,
+                            "import_actual_stats_excel",
+                            f"ثبت Excel آمار واقعی تاریخ {draft['report_date']}، "
+                            f"{len(draft.get('rows', []))} شعبه، رسید {receipt_uuid}",
+                        )
+                        user_states.update(chat_id, {"state": "LOGGED_IN", "actual_excel_draft": None})
+                        send_message(
+                            chat_id,
+                            "✅ **ثبت نهایی با موفقیت انجام شد.**\n\n"
+                            f"📅 تاریخ: {draft['report_date']}\n"
+                            f"🏢 تعداد شعب: {len(draft.get('rows', []))}\n"
+                            f"🧾 شماره رسید: `{receipt_uuid}`\n\n"
+                            "فایل Excel پیش‌تر از حافظه موقت سرور حذف شده است.",
+                            get_super_admin_keyboard(),
+                        )
+                    else:
+                        user_states.update(chat_id, {
+                            "state": "WAITING_FOR_ACTUAL_EXCEL_CONFIRM",
+                            "actual_excel_draft": draft,
+                        })
+                        send_message(chat_id, f"❌ {save_message}", get_actual_excel_confirm_keyboard())
+                    return
+                send_message(chat_id, "لطفاً یکی از گزینه‌های پیش‌نمایش را انتخاب کنید.", get_actual_excel_confirm_keyboard())
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_EXCEL_EDIT_BRANCH" and is_super_admin:
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_excel_draft": None})
+                    send_message(chat_id, "❌ عملیات لغو شد و هیچ داده‌ای ثبت نشد.", get_super_admin_keyboard())
+                    return
+                draft = user_state.get('actual_excel_draft')
+                selection = parse_number(text)
+                rows = draft.get('rows', []) if isinstance(draft, dict) else []
+                if selection is None or selection < 1 or selection > len(rows):
+                    send_message(chat_id, "❌ شماره شعبه معتبر نیست.", get_cancel_keyboard())
+                    return
+                edit_index = selection - 1
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_ACTUAL_EXCEL_EDIT_VALUE",
+                    "actual_excel_draft": draft,
+                    "actual_excel_edit_index": edit_index,
+                })
+                send_message(
+                    chat_id,
+                    f"مبلغ صحیح شعبه **{rows[edit_index]['branch_name']}** را به میلیون ریال وارد کنید.\n"
+                    "عدد منفی یا مثبت پذیرفته می‌شود؛ مثال: `4700-`",
+                    get_cancel_keyboard(),
+                )
+                return
+
+            if current_state == "WAITING_FOR_ACTUAL_EXCEL_EDIT_VALUE" and is_super_admin:
+                if text == "🔙 انصراف":
+                    user_states.update(chat_id, {"state": "LOGGED_IN", "actual_excel_draft": None})
+                    send_message(chat_id, "❌ عملیات لغو شد و هیچ داده‌ای ثبت نشد.", get_super_admin_keyboard())
+                    return
+                draft = user_state.get('actual_excel_draft')
+                edit_index = user_state.get('actual_excel_edit_index')
+                corrected_value = parse_number(text)
+                rows = draft.get('rows', []) if isinstance(draft, dict) else []
+                if (corrected_value is None or abs(corrected_value) > MAX_AMOUNT_MILLIONS or
+                        not isinstance(edit_index, int) or edit_index < 0 or edit_index >= len(rows)):
+                    send_message(chat_id, "❌ مبلغ معتبر نیست؛ یک عدد صحیح وارد کنید.", get_cancel_keyboard())
+                    return
+                if rows[edit_index].get('was_blank'):
+                    draft['blank_count'] = max(0, draft.get('blank_count', 0) - 1)
+                rows[edit_index]['amount_millions'] = corrected_value
+                rows[edit_index]['was_blank'] = False
+                rows[edit_index]['corrected'] = True
+                draft['expires_at'] = time_module.time() + ACTUAL_EXCEL_CONFIRM_TTL_SECONDS
+                user_states.update(chat_id, {
+                    "state": "WAITING_FOR_ACTUAL_EXCEL_CONFIRM",
+                    "actual_excel_draft": draft,
+                    "actual_excel_edit_index": None,
+                })
+                send_message(chat_id, format_actual_excel_preview(draft), get_actual_excel_confirm_keyboard())
+                return
+
+            if current_state == "ACTUAL_EXCEL_COMMITTING" and is_super_admin:
+                send_message(chat_id, "⏳ ثبت نهایی در حال انجام است؛ لطفاً منتظر بمانید.")
+                return
+
             if current_state == "WAITING_FOR_ACTUAL_DATE" and is_super_admin:
                 if text == "🔙 انصراف":
                     user_states.update(chat_id, {"state": "LOGGED_IN"})
