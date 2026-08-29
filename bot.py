@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۴.۰ (ثبت امن آمار واقعی از فایل Excel)
+# bot.py - نسخه ۹.۴.۱ (پذیرش کد جایگزین فقط در ورود آمار واقعی از Excel)
 # ============================================================
 import os
 import time
@@ -134,6 +134,15 @@ OFFICIAL_BRANCH_CODES = {
     'میدان معلم ابهر': '22061',
     'خدابنده': '22071',
     'خرمدره': '20250',
+}
+
+# این نام‌های مستعار فقط هنگام خواندن فایل Excel آمار واقعی استفاده می‌شوند.
+# کد اصلی شعبه در دیتابیس، گزارش‌ها و سایر بخش‌های ربات تغییر نمی‌کند.
+ACTUAL_EXCEL_CODE_ALIASES = {
+    '20842': '20442',  # کوچمشکی
+    '20727': '20227',  # دندی
+    '20701': '22071',  # خدابنده
+    '20750': '20250',  # خرمدره
 }
 
 # ============================================================
@@ -3929,6 +3938,22 @@ def parse_actual_stats_excel(file_path, branches):
     if not configured:
         return False, "هیچ شعبه دارای کد رسمی در دیتابیس یافت نشد.", None
 
+    # علاوه بر کد اصلی دیتابیس، فقط در این مسیر کدهای جایگزین فایل پذیرفته می‌شوند.
+    accepted_codes = {
+        code: (branch_id, branch_name, code)
+        for code, (branch_id, branch_name) in configured.items()
+    }
+    for alias_code, canonical_code in ACTUAL_EXCEL_CODE_ALIASES.items():
+        alias = _normalize_excel_code(alias_code)
+        canonical = _normalize_excel_code(canonical_code)
+        if canonical not in configured:
+            continue
+        branch_id, branch_name = configured[canonical]
+        existing = accepted_codes.get(alias)
+        if existing and existing[0] != branch_id:
+            return False, f"کد جایگزین {alias} با کد اصلی شعبه دیگری تداخل دارد.", None
+        accepted_codes[alias] = (branch_id, branch_name, canonical)
+
     workbook = None
     try:
         workbook = load_workbook(file_path, data_only=True, read_only=False)
@@ -3979,11 +4004,14 @@ def parse_actual_stats_excel(file_path, branches):
             code = _normalize_excel_code(ws.cell(row=row_number, column=code_column).value)
             if not code:
                 continue
-            if code not in configured:
+            if code not in accepted_codes:
                 ignored_codes.append(code)
                 continue
-            if code in found:
-                duplicates.append(code)
+            branch_id, branch_name, canonical_code = accepted_codes[code]
+            if branch_id in found:
+                duplicates.append(
+                    f"{branch_name} ({found[branch_id]['source_code']} و {code})"
+                )
                 continue
             try:
                 amount, was_blank = _parse_excel_actual_amount(
@@ -3992,11 +4020,11 @@ def parse_actual_stats_excel(file_path, branches):
             except ValueError:
                 invalid_rows.append(f"ردیف {row_number} (کد {code})")
                 continue
-            branch_id, branch_name = configured[code]
-            found[code] = {
+            found[branch_id] = {
                 'branch_id': branch_id,
                 'branch_name': branch_name,
-                'official_code': code,
+                'official_code': canonical_code,
+                'source_code': code,
                 'amount_millions': amount,
                 'extracted_amount_millions': amount,
                 'was_blank': was_blank,
@@ -4006,10 +4034,13 @@ def parse_actual_stats_excel(file_path, branches):
                 blank_count += 1
 
         if duplicates:
-            return False, "کد شعبه تکراری در فایل وجود دارد: " + "، ".join(sorted(set(duplicates))), None
+            return False, "یک شعبه با دو کد در فایل تکرار شده است: " + "، ".join(sorted(set(duplicates))), None
         if invalid_rows:
             return False, "مبلغ نامعتبر در " + "، ".join(invalid_rows[:10]), None
-        missing_codes = [code for code in configured if code not in found]
+        missing_codes = [
+            code for code, (branch_id, _) in configured.items()
+            if branch_id not in found
+        ]
         if missing_codes:
             missing_names = [f"{configured[code][1]} ({code})" for code in missing_codes]
             return False, ("ردیف این شعب در فایل پیدا نشد؛ برای جلوگیری از ثبت ناقص عملیات متوقف شد: " +
@@ -4071,7 +4102,11 @@ def format_actual_excel_preview(draft):
         if current_rial is not None:
             overwrite_count += 1
         marker = '✏️' if row.get('corrected') else ('♻️' if current_rial is not None else '▫️')
-        line = (f"{index}. {marker} {row['branch_name']} ({row['official_code']}): "
+        source_code = row.get('source_code', row['official_code'])
+        code_text = row['official_code']
+        if source_code != row['official_code']:
+            code_text = f"کد فایل {source_code} ← کد اصلی {row['official_code']}"
+        line = (f"{index}. {marker} {row['branch_name']} ({code_text}): "
                 f"{_format_signed_millions(row['amount_millions'])} میلیون ریال")
         if current_rial is not None:
             line += f" | قبلی: {_format_signed_millions(int(Decimal(current_rial) / Decimal(1_000_000)))}"
