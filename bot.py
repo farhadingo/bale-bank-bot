@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۴.۱ (پذیرش کد جایگزین فقط در ورود آمار واقعی از Excel)
+# bot.py - نسخه ۹.۴.۲ (گردکردن مبلغ Excel مطابق عدد نمایشی فایل)
 # ============================================================
 import os
 import time
@@ -41,7 +41,7 @@ import hmac
 import uuid
 import base64
 import tempfile
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from zoneinfo import ZoneInfo  # Python 3.9+
@@ -3883,8 +3883,9 @@ def _parse_excel_actual_amount(value):
         raise ValueError("invalid numeric amount")
     if not amount.is_finite():
         raise ValueError("amount must be finite")
-    # دقیقاً مطابق parse_number در ثبت دستی، بخش اعشاری به سمت صفر حذف می‌شود.
-    amount_int = int(amount)
+    # ستون مبلغ در فایل با قالب عدد صحیح نمایش داده می‌شود؛ مقدار خام اعشاری
+    # باید دقیقاً مانند Excel به نزدیک‌ترین میلیون ریال گرد شود.
+    amount_int = int(amount.quantize(Decimal('1'), rounding=ROUND_HALF_UP))
     if abs(amount_int) > MAX_AMOUNT_MILLIONS:
         raise ValueError("amount outside permitted database range")
     return amount_int, False
