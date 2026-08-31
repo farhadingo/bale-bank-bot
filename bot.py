@@ -1,5 +1,5 @@
 # ============================================================
-# bot.py - نسخه ۹.۴.۲ (گردکردن مبلغ Excel مطابق عدد نمایشی فایل)
+# bot.py - نسخه ۹.۴.۳ (اتصال اتمیک و قابل‌اعتماد حساب بله هنگام ورود)
 # ============================================================
 import os
 import time
@@ -110,6 +110,9 @@ MAX_CAMPAIGN_TEXT_LENGTH = 3500
 MAX_CAMPAIGN_MEDIA_BYTES = 5 * 1024 * 1024
 ACTUAL_EXCEL_TEMP_PREFIX = 'zanjan_actual_stats_'
 ACTUAL_EXCEL_CONFIRM_TTL_SECONDS = 30 * 60
+# تمام تغییرات اتصال حساب بله به‌صورت کوتاه سریالی می‌شوند تا ورودهای هم‌زمان
+# نتوانند محدودیت یکتایی telegram_id را دور بزنند یا نشست کاذب بسازند.
+AUTH_BIND_ADVISORY_LOCK_KEY = -9_453_100_001
 
 # کدهای رسمی شعب مطابق ستون «کد شعبه» در فایل گزارش سازمانی.
 # مقداردهی دیتابیس فقط برای خانه‌های خالی انجام می‌شود و کد موجود را بازنویسی نمی‌کند.
@@ -224,7 +227,7 @@ def run_flask():
 # ============================================================
 def create_session():
     session = requests.Session()
-    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/9.1.0'})
+    session.headers.update({'Connection': 'keep-alive', 'User-Agent': 'Bale-Bank-Bot/9.4.3'})
     retry_strategy = Retry(
         total=5, backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -1555,7 +1558,7 @@ def get_branches_with_official_codes():
         if conn:
             return_db_connection(conn)
 
-def find_user_by_employee_number(emp_num):
+def find_user_by_employee_number(emp_num, with_status=False):
     emp_num = normalize_digits(emp_num)
     conn = None
     try:
@@ -1567,32 +1570,112 @@ def find_user_by_employee_number(emp_num):
                 LEFT JOIN branches b ON u.branch_id = b.id
                 WHERE u.employee_number = %s AND u.is_active = TRUE
             """, (emp_num,))
-            return cur.fetchone()
+            user = cur.fetchone()
+            return (user, True) if with_status else user
     except Exception as e:
-        logger.error(f"find_user_by_employee_number: {e}")
+        logger.exception("find_user_by_employee_number failed: %s", safe_log_value(e))
         if conn:
             conn.rollback()
-        return None
+        return (None, False) if with_status else None
+    finally:
+        if conn:
+            return_db_connection(conn)
+
+def bind_user_telegram_id(user_db_id, chat_id):
+    """اتصال اتمیک یک حساب فعال به گفت‌وگوی بله و بازخوانی نتیجه قطعی.
+
+    شماره کارمندی همچنان روش احراز هویت کاربران عادی است. اگر همین گفت‌وگو
+    قبلاً به حساب دیگری متصل بوده باشد، فقط شناسه ورود آن حساب آزاد می‌شود؛
+    هیچ کاربر، وصول، هدف، یادداشت یا سابقه‌ای حذف یا جابه‌جا نمی‌شود.
+    """
+    try:
+        user_db_id = int(user_db_id)
+        chat_id = int(chat_id)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Invalid identifiers supplied for account binding")
+        return False, None, "شناسه حساب یا گفت‌وگو معتبر نیست.", {}
+    if user_db_id <= 0 or not -(2 ** 63) <= chat_id < 2 ** 63:
+        logger.warning("Out-of-range identifiers supplied for account binding")
+        return False, None, "شناسه حساب یا گفت‌وگو معتبر نیست.", {}
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            # یک قفل مشترک کوتاه، ترتیب قفل‌گذاری ورودهای هم‌زمان را قطعی می‌کند.
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (AUTH_BIND_ADVISORY_LOCK_KEY,))
+            cur.execute("""
+                SELECT u.id, u.employee_number, u.full_name, u.role, u.title,
+                       u.branch_id, b.name, u.is_super_admin, u.telegram_id
+                FROM users u
+                LEFT JOIN branches b ON b.id = u.branch_id
+                WHERE u.id = %s AND u.is_active = TRUE
+                FOR UPDATE OF u
+            """, (user_db_id,))
+            target = cur.fetchone()
+            if not target:
+                conn.rollback()
+                return False, None, "حساب کاربری فعال نیست یا دیگر وجود ندارد.", {}
+
+            previous_chat_id = target[8]
+            cur.execute("""
+                SELECT id, is_active
+                FROM users
+                WHERE telegram_id = %s AND id <> %s
+                FOR UPDATE
+            """, (chat_id, user_db_id))
+            released_accounts = cur.fetchall()
+            now = get_iran_time()
+            if released_accounts:
+                cur.execute("""
+                    UPDATE users
+                    SET telegram_id = NULL, updated_at = %s
+                    WHERE telegram_id = %s AND id <> %s
+                """, (now, chat_id, user_db_id))
+                if cur.rowcount != len(released_accounts):
+                    raise RuntimeError("تعداد حساب‌های آزادشده با نتیجه قفل‌شده هماهنگ نیست")
+
+            cur.execute("""
+                UPDATE users
+                SET telegram_id = %s, updated_at = %s
+                WHERE id = %s AND is_active = TRUE
+            """, (chat_id, now, user_db_id))
+            if cur.rowcount != 1:
+                raise RuntimeError("اتصال حساب فعال ثبت نشد")
+
+            # پیام ورود موفق فقط پس از بازخوانی نتیجه از خود دیتابیس صادر می‌شود.
+            cur.execute("""
+                SELECT u.id, u.employee_number, u.full_name, u.role, u.title,
+                       u.branch_id, b.name, u.is_super_admin
+                FROM users u
+                LEFT JOIN branches b ON b.id = u.branch_id
+                WHERE u.id = %s AND u.telegram_id = %s AND u.is_active = TRUE
+            """, (user_db_id, chat_id))
+            verified_user = cur.fetchone()
+            if not verified_user:
+                raise RuntimeError("بازخوانی اتصال حساب پس از ثبت ناموفق بود")
+            conn.commit()
+            metadata = {
+                "previous_chat_id": previous_chat_id,
+                "released_account_ids": [row[0] for row in released_accounts],
+                "released_active_count": sum(1 for row in released_accounts if row[1]),
+            }
+            return True, verified_user, "اتصال حساب با موفقیت ثبت شد.", metadata
+    except Exception as e:
+        logger.exception("bind_user_telegram_id failed: %s", safe_log_value(e))
+        if conn:
+            conn.rollback()
+        return False, None, "اتصال حساب به بله ثبت نشد؛ لطفاً دوباره تلاش کنید.", {}
     finally:
         if conn:
             return_db_connection(conn)
 
 def update_user_telegram_id(user_db_id, chat_id):
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET telegram_id = %s WHERE id = %s", (chat_id, user_db_id))
-            conn.commit()
-    except Exception as e:
-        logger.error(f"update_user_telegram_id: {e}")
-        if conn:
-            conn.rollback()
-    finally:
-        if conn:
-            return_db_connection(conn)
+    """پوسته سازگار با کدهای قدیمی؛ موفقیت واقعی را به‌صورت boolean برمی‌گرداند."""
+    success, _, _, _ = bind_user_telegram_id(user_db_id, chat_id)
+    return success
 
-def find_user_by_telegram_id(chat_id):
+def find_user_by_telegram_id(chat_id, with_status=False):
     conn = None
     try:
         conn = get_db_connection()
@@ -1603,12 +1686,13 @@ def find_user_by_telegram_id(chat_id):
                 LEFT JOIN branches b ON u.branch_id = b.id
                 WHERE u.telegram_id = %s AND u.is_active = TRUE
             """, (chat_id,))
-            return cur.fetchone()
+            user = cur.fetchone()
+            return (user, True) if with_status else user
     except Exception as e:
-        logger.error(f"find_user_by_telegram_id: {e}")
+        logger.exception("find_user_by_telegram_id failed: %s", safe_log_value(e))
         if conn:
             conn.rollback()
-        return None
+        return (None, False) if with_status else None
     finally:
         if conn:
             return_db_connection(conn)
@@ -5096,7 +5180,7 @@ def execute_new_deputy_replacement(branch_id, expected_old_deputy_id,
             if cur.rowcount != 1:
                 raise ValueError("بستن انتصاب معاون قبلی کامل نشد")
             cur.execute("""UPDATE users
-                           SET branch_id=NULL,is_active=FALSE,updated_at=%s
+                           SET branch_id=NULL,is_active=FALSE,telegram_id=NULL,updated_at=%s
                            WHERE id=%s AND role='deputy' AND is_active=TRUE AND branch_id=%s""",
                         (get_iran_time(), old_deputy_id, branch_id))
             if cur.rowcount != 1:
@@ -7098,7 +7182,13 @@ def handle_message(message):
             if not re.match(r'^[0-9]+$', normalized_text):
                 send_message(chat_id, "❌ لطفاً شماره کارمندی را فقط با **اعداد** وارد کنید.\nمثال: ۱۲۳۴۵۶")
                 return
-            emp_user = find_user_by_employee_number(normalized_text)
+            emp_user, employee_lookup_ok = find_user_by_employee_number(normalized_text, with_status=True)
+            if not employee_lookup_ok:
+                send_message(
+                    chat_id,
+                    "⚠️ بررسی شماره کارمندی موقتاً انجام نشد. لطفاً چند لحظه دیگر همان شماره را دوباره ارسال کنید."
+                )
+                return
             if emp_user:
                 db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = emp_user
                 if is_super_admin:
@@ -7118,9 +7208,29 @@ def handle_message(message):
                     send_message(chat_id, "🔐 شما یک کاربر سوپرادمین هستید. لطفاً رمز عبور خود را وارد کنید:", remove_keyboard=True)
                     return
                 else:
-                    update_user_telegram_id(db_id, chat_id)
+                    bind_ok, bound_user, bind_message, bind_meta = bind_user_telegram_id(db_id, chat_id)
+                    if not bind_ok:
+                        user_states.set(chat_id, {"state": "WAITING_FOR_EMP_NUM"})
+                        send_message(
+                            chat_id,
+                            f"❌ ورود کامل نشد: {bind_message}\n\n"
+                            "هیچ دسترسی ناقصی ایجاد نشده است. لطفاً شماره کارمندی را دوباره ارسال کنید.",
+                            remove_keyboard=True
+                        )
+                        return
+                    db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = bound_user
+                    previous_chat_id = bind_meta.get("previous_chat_id")
+                    if previous_chat_id is not None and previous_chat_id != chat_id:
+                        user_states.delete(previous_chat_id)
+                    if bind_meta.get("released_account_ids"):
+                        logger.warning(
+                            "Bale chat binding reassigned during employee login: target_user=%s released_users=%s active_released=%s",
+                            db_id,
+                            bind_meta["released_account_ids"],
+                            bind_meta.get("released_active_count", 0),
+                        )
                     log_user_activity(db_id, "login", f"ورود از chat_id: {chat_id}")
-                    user_states.update(chat_id, {
+                    user_states.set(chat_id, {
                         "state": "LOGGED_IN",
                         "user_data": {
                             "db_id": db_id,
@@ -7163,9 +7273,39 @@ def handle_message(message):
                 temp_data = user_state.get("temp_user_data")
                 if temp_data:
                     db_id = temp_data["db_id"]
-                    update_user_telegram_id(db_id, chat_id)
+                    bind_ok, bound_user, bind_message, bind_meta = bind_user_telegram_id(db_id, chat_id)
+                    if not bind_ok:
+                        user_states.set(chat_id, {"state": "LOGGED_OUT"})
+                        send_message(
+                            chat_id,
+                            f"❌ ورود کامل نشد: {bind_message}\n\n"
+                            "رمز پذیرفته شد، اما اتصال حساب در دیتابیس قطعی نشد؛ لطفاً ورود را دوباره آغاز کنید.",
+                            remove_keyboard=True
+                        )
+                        return
+                    db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = bound_user
+                    temp_data = {
+                        "db_id": db_id,
+                        "emp_num": emp_num,
+                        "name": name,
+                        "role": role,
+                        "title": title,
+                        "branch_id": branch_id,
+                        "branch_name": branch_name,
+                        "is_super_admin": is_super_admin,
+                    }
+                    previous_chat_id = bind_meta.get("previous_chat_id")
+                    if previous_chat_id is not None and previous_chat_id != chat_id:
+                        user_states.delete(previous_chat_id)
+                    if bind_meta.get("released_account_ids"):
+                        logger.warning(
+                            "Bale chat binding reassigned during super-admin login: target_user=%s released_users=%s active_released=%s",
+                            db_id,
+                            bind_meta["released_account_ids"],
+                            bind_meta.get("released_active_count", 0),
+                        )
                     log_user_activity(db_id, "login", "ورود سوپرادمین")
-                    user_states.update(chat_id, {
+                    user_states.set(chat_id, {
                         "state": "LOGGED_IN",
                         "user_data": temp_data
                     })
@@ -7198,10 +7338,23 @@ def handle_message(message):
 
         # نقش و شعبه در هر پیام از دیتابیس تازه‌خوانی می‌شود تا تغییر سطح دسترسی
         # بلافاصله اعمال شود؛ شیوه احراز هویت موجود تغییری نکرده است.
-        user = find_user_by_telegram_id(chat_id)
+        user, auth_lookup_ok = find_user_by_telegram_id(chat_id, with_status=True)
+        if not auth_lookup_ok:
+            # خطای موقت دیتابیس نباید به‌عنوان انقضای نشست تعبیر شود یا وضعیت
+            # معتبر موجود در حافظه را پاک کند.
+            send_message(
+                chat_id,
+                "⚠️ بررسی اتصال حساب موقتاً انجام نشد. نشست شما حذف نشده است؛ لطفاً چند لحظه دیگر دوباره تلاش کنید."
+            )
+            return
         if not user:
             user_states.set(chat_id, {"state": "LOGGED_OUT"})
-            send_message(chat_id, "⚠️ نشست شما منقض شده است. لطفاً شماره کارمندی خود را وارد کنید.", remove_keyboard=True)
+            send_message(
+                chat_id,
+                "اتصال این گفت‌وگو به حساب کاربری تغییر کرده یا غیرفعال شده است. "
+                "لطفاً شماره کارمندی خود را دوباره وارد کنید.",
+                remove_keyboard=True
+            )
             return
         db_id, emp_num, name, role, title, branch_id, branch_name, is_super_admin = user
         user_data = {
@@ -7865,7 +8018,7 @@ def handle_message(message):
                 "با حمایت‌های **آقای هادی بیگدلی**\n"
                 "معاونت محترم وقت اعتباری منطقه\n\n"
                 "در تابستان سال ۱۴۰۵ توسعه یافته است.\n\n"
-                "📅 نسخه: ۹.۲.۰ (مرکز پیام‌رسانی و جابه‌جایی امن معاونان)\n"
+                "📅 نسخه: ۹.۴.۳ (ورود پایدار، گزارش‌ها و مدیریت امن معاونان)\n"
                 "📧 پشتیبانی: farhad.s.hosseini@gmail.com"
             )
             keyboard = get_keyboard(role, is_super_admin)
